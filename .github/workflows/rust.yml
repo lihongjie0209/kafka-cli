@@ -1,0 +1,121 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ matrix.rust }}
+    
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Install librdkafka (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y librdkafka-dev
+    
+    - name: Install librdkafka (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install librdkafka
+    
+    - name: Install librdkafka (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        vcpkg install librdkafka:x64-windows
+        echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    
+    - name: Check formatting
+      run: cargo fmt -- --check
+      continue-on-error: true
+    
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+      continue-on-error: true
+    
+    - name: Build
+      run: cargo build --verbose --release
+    
+    - name: Run unit tests
+      run: cargo test --lib --verbose
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kafka-cli-${{ matrix.os }}
+        path: |
+          target/release/kafka-cli
+          target/release/kafka-cli.exe
+        if-no-files-found: ignore
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install librdkafka
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y librdkafka-dev
+    
+    - name: Start Kafka
+      run: |
+        cd docker/single-node
+        docker-compose up -d
+        cd ../..
+        sleep 15
+    
+    - name: Build
+      run: cargo build --release
+    
+    - name: Run integration tests
+      run: cargo test --test integration_test -- --test-threads=1
+      env:
+        RUST_LOG: info
+    
+    - name: Stop Kafka
+      if: always()
+      run: |
+        cd docker/single-node
+        docker-compose down
