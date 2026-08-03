@@ -123,6 +123,25 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("\"partition\": 1")
     );
+    let described_topic: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "topics",
+            "describe",
+            "--topic",
+            "integration-events",
+        ],
+    ))
+    .expect("topic description JSON");
+    let topic_id = described_topic["data"][0]["topic_id"]
+        .as_str()
+        .expect("topic ID");
+    assert!(
+        success(&bootstrap, &["topics", "describe", "--topic-id", topic_id])
+            .contains("integration-events")
+    );
     success(
         &bootstrap,
         &[
@@ -512,6 +531,19 @@ fn all_command_families_work_against_kafka_4_3_1() {
         success(
             &bootstrap,
             &["offsets", "--topic-partitions", "integration-events:0-2",]
+        )
+        .contains("integration-events")
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "offsets",
+                "--topic",
+                "integration-events",
+                "--time",
+                "max-timestamp",
+            ]
         )
         .contains("integration-events")
     );

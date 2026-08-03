@@ -93,6 +93,13 @@ impl Drop for ScramAlteration {
     }
 }
 
+struct TopicCollection(*mut sys::rd_kafka_TopicCollection_t);
+impl Drop for TopicCollection {
+    fn drop(&mut self) {
+        unsafe { sys::rd_kafka_TopicCollection_destroy(self.0) };
+    }
+}
+
 /// ACL resource types supported by librdkafka.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AclResourceType {
@@ -196,6 +203,32 @@ pub enum ScramCredentialAlteration {
     },
 }
 
+/// Topic name and Kafka topic UUID returned by librdkafka.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TopicIdentity {
+    pub name: String,
+    pub id: String,
+    pub is_internal: bool,
+}
+
+/// Offset lookup mode accepted by librdkafka's `ListOffsets` API.
+#[derive(Debug, Clone, Copy)]
+pub enum ListOffsetSpec {
+    Earliest,
+    Latest,
+    MaxTimestamp,
+    Timestamp(i64),
+}
+
+/// Offset and timestamp returned for one topic partition.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListOffsetEntry {
+    pub topic: String,
+    pub partition: i32,
+    pub offset: i64,
+    pub timestamp: i64,
+}
+
 /// A committed consumer-group offset returned by librdkafka.
 #[derive(Debug)]
 pub struct GroupOffsetEntry {
@@ -255,6 +288,170 @@ fn poll(queue: &Queue, timeout_ms: i32) -> Result<Event> {
         return Err(Error::Config(message));
     }
     Ok(event)
+}
+
+/// Resolves offsets through librdkafka's `ListOffsets` Admin API.
+pub fn list_offsets(
+    client: *mut sys::rd_kafka_t,
+    targets: &[(String, i32)],
+    spec: ListOffsetSpec,
+    timeout_ms: i32,
+) -> Result<Vec<ListOffsetEntry>> {
+    let capacity =
+        i32::try_from(targets.len()).map_err(|_| Error::Usage("too many offset targets".into()))?;
+    let list = unsafe { sys::rd_kafka_topic_partition_list_new(capacity) };
+    if list.is_null() {
+        return Err(Error::Config(
+            "failed to allocate ListOffsets partition list".into(),
+        ));
+    }
+    let list = PartitionList(list);
+    let requested_offset = match spec {
+        ListOffsetSpec::Earliest => {
+            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_EARLIEST as i32)
+        }
+        ListOffsetSpec::Latest => {
+            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_LATEST as i32)
+        }
+        ListOffsetSpec::MaxTimestamp => {
+            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_MAX_TIMESTAMP as i32)
+        }
+        ListOffsetSpec::Timestamp(timestamp) => timestamp,
+    };
+    for (topic, partition) in targets {
+        let topic = CString::new(topic.as_str())
+            .map_err(|_| Error::Usage("topic name contains a NUL byte".into()))?;
+        let element =
+            unsafe { sys::rd_kafka_topic_partition_list_add(list.0, topic.as_ptr(), *partition) };
+        if element.is_null() {
+            return Err(Error::Config(
+                "failed to add a ListOffsets partition".into(),
+            ));
+        }
+        unsafe { (*element).offset = requested_offset };
+    }
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_LISTOFFSETS,
+        timeout_ms,
+    )?;
+    unsafe { sys::rd_kafka_ListOffsets(client, list.0, options.0, queue.0) };
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_ListOffsets_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid ListOffsets response".into(),
+        ));
+    }
+    let mut count = 0;
+    let infos = unsafe { sys::rd_kafka_ListOffsets_result_infos(result, &raw mut count) };
+    if count > 0 && infos.is_null() {
+        return Err(Error::Config(
+            "broker returned a null ListOffsets result array".into(),
+        ));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let info = unsafe { *infos.add(index) };
+        if info.is_null() {
+            return Err(Error::Config(
+                "broker returned a null ListOffsets result".into(),
+            ));
+        }
+        let partition = unsafe { sys::rd_kafka_ListOffsetsResultInfo_topic_partition(info) };
+        if partition.is_null() {
+            return Err(Error::Config(
+                "broker returned a null ListOffsets topic partition".into(),
+            ));
+        }
+        if unsafe { (*partition).err } != sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+            return Err(Error::Config(unsafe {
+                c_string(sys::rd_kafka_err2str((*partition).err))
+            }));
+        }
+        rows.push(ListOffsetEntry {
+            topic: unsafe { c_string((*partition).topic) },
+            partition: unsafe { (*partition).partition },
+            offset: unsafe { (*partition).offset },
+            timestamp: unsafe { sys::rd_kafka_ListOffsetsResultInfo_timestamp(info) },
+        });
+    }
+    Ok(rows)
+}
+
+/// Describes topic identities through librdkafka's `DescribeTopics` Admin API.
+pub fn describe_topic_identities(
+    client: *mut sys::rd_kafka_t,
+    topics: &[String],
+    timeout_ms: i32,
+) -> Result<Vec<TopicIdentity>> {
+    let topics = topics
+        .iter()
+        .map(|topic| {
+            CString::new(topic.as_str())
+                .map_err(|_| Error::Usage("topic name contains a NUL byte".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut names = topics
+        .iter()
+        .map(|topic| topic.as_ptr())
+        .collect::<Vec<_>>();
+    let collection =
+        unsafe { sys::rd_kafka_TopicCollection_of_topic_names(names.as_mut_ptr(), names.len()) };
+    if collection.is_null() {
+        return Err(Error::Config(
+            "librdkafka failed to create a topic collection".into(),
+        ));
+    }
+    let collection = TopicCollection(collection);
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_DESCRIBETOPICS,
+        timeout_ms,
+    )?;
+    unsafe { sys::rd_kafka_DescribeTopics(client, collection.0, options.0, queue.0) };
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_DescribeTopics_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid DescribeTopics response".into(),
+        ));
+    }
+    let mut count = 0;
+    let descriptions =
+        unsafe { sys::rd_kafka_DescribeTopics_result_topics(result, &raw mut count) };
+    if count > 0 && descriptions.is_null() {
+        return Err(Error::Config(
+            "broker returned a null topic-description array".into(),
+        ));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let description = unsafe { *descriptions.add(index) };
+        if description.is_null() {
+            return Err(Error::Config(
+                "broker returned a null topic description".into(),
+            ));
+        }
+        let error = unsafe { sys::rd_kafka_TopicDescription_error(description) };
+        if native_error_failed(error) {
+            return Err(Error::Config(unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            }));
+        }
+        let uuid = unsafe { sys::rd_kafka_TopicDescription_topic_id(description) };
+        if uuid.is_null() {
+            return Err(Error::Config("broker returned a null topic ID".into()));
+        }
+        rows.push(TopicIdentity {
+            name: unsafe { c_string(sys::rd_kafka_TopicDescription_name(description)) },
+            id: unsafe { c_string(sys::rd_kafka_Uuid_base64str(uuid)) },
+            is_internal: unsafe { sys::rd_kafka_TopicDescription_is_internal(description) } != 0,
+        });
+    }
+    Ok(rows)
 }
 
 /// Describes SCRAM credential metadata for the selected users.

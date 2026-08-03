@@ -103,6 +103,10 @@ fn start_kafka_3_6(home: &Path, fixture: &TempDir) -> (Broker, String) {
 
 #[test]
 #[ignore = "requires KAFKA_36_HOME pointing to Apache Kafka 3.6.2"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one broker fixture verifies the Kafka 3.6 compatibility boundary"
+)]
 fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
     let home = std::env::var_os("KAFKA_36_HOME")
         .map(PathBuf::from)
@@ -128,6 +132,39 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .assert()
         .success()
         .stdout(predicate::str::contains("kafka-36-events"));
+    let described_topic = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "--output",
+            "json",
+            "topics",
+            "describe",
+            "--topic",
+            "kafka-36-events",
+        ])
+        .output()
+        .expect("describe Kafka 3.6 topic");
+    assert!(described_topic.status.success());
+    let described_topic: serde_json::Value =
+        serde_json::from_slice(&described_topic.stdout).expect("topic JSON");
+    let topic_id = described_topic["data"][0]["topic_id"]
+        .as_str()
+        .expect("Kafka 3.6 topic ID");
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "topics",
+            "describe",
+            "--topic-id",
+            topic_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kafka-36-events"));
     Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args(["--bootstrap-server", &bootstrap, "api-versions"])
@@ -137,6 +174,20 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
     Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args(["--bootstrap-server", &bootstrap, "log-dirs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("kafka-36-events"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "offsets",
+            "--topic",
+            "kafka-36-events",
+            "--time",
+            "max-timestamp",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("kafka-36-events"));

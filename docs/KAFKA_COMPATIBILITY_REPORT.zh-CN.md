@@ -34,7 +34,7 @@
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/group/partition/offset/from-beginning/max-messages；未复刻 formatter/deserializer 全部选项 |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、describe、delete、delete-offsets、reset-offsets；缺少批量与导入导出模式 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group，以及 librdkafka SCRAM user credential；缺少其他 entity type |
-| `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | topic 正则、partition 模式、earliest/latest/timestamp、排除内部主题 |
+| `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；缺少 throttle 高级参数 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件、预览、执行 |
@@ -72,11 +72,11 @@
 - alter 增加 partition 数量、手工 assignment、`--if-exists`。
 - delete 的正则选择和 `--if-exists`。
 - describe 过滤：under-replicated、unavailable、under-min-ISR、at-min-ISR、topics-with-overrides、exclude-internal。
+- describe 通过 librdkafka `DescribeTopics` 返回 topic UUID，支持按 `--topic-id` 选择。
 - unavailable 判定会核对 leader 是否仍在 live broker 集合中。
 
 缺少或有差异：
 
-- 未支持 `--topic-id` describe。
 - 未支持 `--partition-size-limit-per-response`。
 - 原版未指定 replication factor 时可使用集群默认值；本项目当前默认值为 1，语义不同。
 - 原版废弃的 `--delete-config` 未提供。
@@ -125,9 +125,9 @@
 
 ### 4.6 Get Offsets
 
-已支持：topic 正则、`topic:partition`、闭区间与开放区间 partition 范围、多个 pattern、exclude-internal、earliest、latest、Unix 毫秒 timestamp。
+已支持：topic 正则、`topic:partition`、闭区间与开放区间 partition 范围、多个 pattern、exclude-internal、earliest/`-2`、latest/`-1`、max-timestamp/`-3`、Unix 毫秒 timestamp。所有查询统一通过 librdkafka `ListOffsets` Admin API，结果包含 offset 与 broker 返回的 timestamp。
 
-缺少：Kafka 新版本 `--time` 的 `max-timestamp`、`earliest-local`、`latest-tiered` 等特殊时间关键字。输出采用统一表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
+缺少：librdkafka 2.12 尚未提供 Kafka 新版本的 earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` OffsetSpec。输出采用统一表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
 
 ### 4.7 ACLs
 
@@ -203,7 +203,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：50 个通过。
+- Rust 单元测试与普通 CLI 测试：52 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -243,9 +243,9 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 1. Configs 增加 user、client、IP、broker-logger、client-metrics 和 default entity。
 2. Consumer Groups 增加 all-groups、all-topics、from-file、export、dry-run 和完整 member assignment 解码。
 3. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
-4. Get Offsets 增加 max-timestamp、earliest-local、latest-tiered。
+4. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
 5. Leader Election 增加 JSON 文件批量输入。
-6. Topics 支持 topic ID，并使未指定 replication factor 时遵循集群默认值。
+6. Topics 在未指定 replication factor 时遵循集群默认值。
 
 ### P2：扩大原版工具覆盖面
 
@@ -264,3 +264,5 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | ACL Create/Describe/Delete | 从手写 Kafka 协议迁移到 librdkafka Admin FFI；不支持的 Delegation Token 资源改为明确报错 | Clippy、48 个普通测试、Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
 | 2026-08-03 | User SCRAM credential | 新增 `configs` users entity 的 SCRAM-SHA-256/512 describe、upsert、delete；CI 集成测试改用 bundled OpenSSL librdkafka | Clippy、50 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
 | 2026-08-03 | Cluster endpoints | `cluster list-endpoints` 从独立协议客户端迁移到 librdkafka metadata API | 既有 Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成覆盖 |
+| 2026-08-03 | Topic ID describe | 使用 librdkafka `DescribeTopics` 获取 topic UUID；describe 新增 `--topic-id`，表格和 JSON 输出携带 topic ID | Clippy、50 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 名称/ID 闭环集成测试通过 |
+| 2026-08-03 | Get Offsets ListOffsets | earliest、latest、timestamp 全部迁移至 librdkafka `ListOffsets`，新增 max-timestamp 及 `-1/-2/-3` 原版别名，输出 timestamp | Clippy、52 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |

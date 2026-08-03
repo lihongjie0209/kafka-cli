@@ -146,6 +146,7 @@ struct TopicSummary {
 #[derive(Debug, Serialize)]
 struct PartitionSummary {
     topic: String,
+    topic_id: String,
     partition: i32,
     leader: i32,
     replicas: Vec<i32>,
@@ -169,6 +170,11 @@ async fn topics(
 ) -> Result<()> {
     match action {
         TopicAction::List(selector) => {
+            if selector.topic_id.is_some() {
+                return Err(Error::Usage(
+                    "--topic-id is only supported by topics describe".into(),
+                ));
+            }
             let consumer = base_consumer(config)?;
             let metadata = consumer.fetch_metadata(None, timeout)?;
             let topics = select_topics(&metadata, &selector)?
@@ -188,13 +194,37 @@ async fn topics(
         }
         TopicAction::Describe(selector) => {
             let consumer = base_consumer(config)?;
-            let selected_topic_names = {
+            let candidate_topic_names = {
                 let metadata = consumer.fetch_metadata(None, timeout)?;
                 select_topics(&metadata, &selector)?
                     .into_iter()
                     .map(|topic| topic.name().to_owned())
                     .collect::<Vec<_>>()
             };
+            let topic_identities = if candidate_topic_names.is_empty() {
+                Vec::new()
+            } else {
+                let client = admin(config)?;
+                ffi::describe_topic_identities(
+                    client.inner().native_ptr(),
+                    &candidate_topic_names,
+                    duration_ms(timeout)?,
+                )?
+            };
+            let topic_ids = topic_identities
+                .into_iter()
+                .filter(|identity| {
+                    selector
+                        .topic_id
+                        .as_ref()
+                        .is_none_or(|topic_id| topic_id == &identity.id)
+                })
+                .map(|identity| (identity.name, identity.id))
+                .collect::<BTreeMap<_, _>>();
+            if selector.topic_id.is_some() && topic_ids.is_empty() {
+                return Err(Error::Usage("no topic matched --topic-id".into()));
+            }
+            let selected_topic_names = topic_ids.keys().cloned().collect::<Vec<_>>();
             let topic_configs = if selector.under_min_isr_partitions
                 || selector.at_min_isr_partitions
                 || selector.topics_with_overrides
@@ -249,7 +279,6 @@ async fn topics(
                 });
             }
             let metadata = consumer.fetch_metadata(None, timeout)?;
-            let selected_topics = select_topics(&metadata, &selector)?;
             let min_isr = topic_configs
                 .iter()
                 .filter_map(|resource| {
@@ -272,8 +301,9 @@ async fn topics(
                 .collect::<BTreeSet<_>>();
             let selector = &selector;
             let live_brokers = &live_brokers;
-            let rows = selected_topics
+            let rows = select_topics(&metadata, selector)?
                 .into_iter()
+                .filter(|topic| topic_ids.contains_key(topic.name()))
                 .flat_map(|topic| {
                     let configured_min_isr = min_isr.get(topic.name()).copied();
                     topic
@@ -290,6 +320,7 @@ async fn topics(
                         })
                         .map(|partition| PartitionSummary {
                             topic: topic.name().to_owned(),
+                            topic_id: topic_ids.get(topic.name()).cloned().unwrap_or_default(),
                             partition: partition.id(),
                             leader: partition.leader(),
                             replicas: partition.replicas().to_vec(),
@@ -299,10 +330,18 @@ async fn topics(
                 .collect::<Vec<_>>();
             output::write_value(format, "topics.describe", &rows, |rows| {
                 output::table(
-                    ["TOPIC", "PARTITION", "LEADER", "REPLICAS", "ISR"],
+                    [
+                        "TOPIC",
+                        "TOPIC_ID",
+                        "PARTITION",
+                        "LEADER",
+                        "REPLICAS",
+                        "ISR",
+                    ],
                     rows.iter().map(|row| {
                         [
                             row.topic.clone(),
+                            row.topic_id.clone(),
                             row.partition.to_string(),
                             row.leader.to_string(),
                             csv_numbers(&row.replicas),
@@ -434,6 +473,11 @@ async fn topics(
             }
         }
         TopicAction::Delete(args) => {
+            if args.selector.topic_id.is_some() {
+                return Err(Error::Usage(
+                    "--topic-id is only supported by topics describe".into(),
+                ));
+            }
             let expression = args
                 .selector
                 .topic
@@ -442,6 +486,7 @@ async fn topics(
             let metadata = consumer.fetch_metadata(None, timeout)?;
             let selector = TopicSelector {
                 topic: Some(expression),
+                topic_id: None,
                 exclude_internal: args.selector.exclude_internal,
                 under_replicated_partitions: false,
                 unavailable_partitions: false,
@@ -1437,13 +1482,6 @@ const fn scram_mechanism_name(value: ffi::ScramMechanism) -> &'static str {
     }
 }
 
-#[derive(Serialize)]
-struct OffsetRow {
-    topic: String,
-    partition: i32,
-    offset: i64,
-}
-
 fn offsets(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
@@ -1496,46 +1534,34 @@ fn offsets(
             "no topic-partitions matched the supplied filters".into(),
         ));
     }
-    let timestamp_offsets = if let Some(timestamp) = args.timestamp {
+    let spec = if let Some(timestamp) = args.timestamp {
         if timestamp < 0 {
             return Err(Error::Usage("--timestamp must be non-negative".into()));
         }
-        let mut timestamps = TopicPartitionList::new();
-        for (topic, partition) in &targets {
-            timestamps.add_partition_offset(topic, *partition, Offset::Offset(timestamp))?;
-        }
-        Some(consumer.offsets_for_times(timestamps, timeout)?)
+        ffi::ListOffsetSpec::Timestamp(timestamp)
     } else {
-        None
+        match args.time {
+            OffsetTime::Earliest => ffi::ListOffsetSpec::Earliest,
+            OffsetTime::Latest => ffi::ListOffsetSpec::Latest,
+            OffsetTime::MaxTimestamp => ffi::ListOffsetSpec::MaxTimestamp,
+        }
     };
-    let mut rows = Vec::new();
-    for (topic, partition) in targets {
-        let offset = if let Some(timestamp_offsets) = &timestamp_offsets {
-            timestamp_offsets
-                .find_partition(&topic, partition)
-                .and_then(|element| element.offset().to_raw())
-                .unwrap_or(-1)
-        } else {
-            let (low, high) = consumer.fetch_watermarks(&topic, partition, timeout)?;
-            match args.time {
-                OffsetTime::Earliest => low,
-                OffsetTime::Latest => high,
-            }
-        };
-        rows.push(OffsetRow {
-            topic,
-            partition,
-            offset,
-        });
-    }
+    let client = admin(config)?;
+    let rows = ffi::list_offsets(
+        client.inner().native_ptr(),
+        &targets,
+        spec,
+        duration_ms(timeout)?,
+    )?;
     output::write_value(format, "offsets", &rows, |rows| {
         output::table(
-            ["TOPIC", "PARTITION", "OFFSET"],
+            ["TOPIC", "PARTITION", "OFFSET", "TIMESTAMP"],
             rows.iter().map(|row| {
                 [
                     row.topic.clone(),
                     row.partition.to_string(),
                     row.offset.to_string(),
+                    row.timestamp.to_string(),
                 ]
             }),
         )
@@ -3138,6 +3164,7 @@ mod tests {
     fn topic_selector() -> TopicSelector {
         TopicSelector {
             topic: None,
+            topic_id: None,
             exclude_internal: false,
             under_replicated_partitions: false,
             unavailable_partitions: false,

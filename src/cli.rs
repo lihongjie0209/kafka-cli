@@ -168,8 +168,11 @@ pub enum TopicAction {
 )]
 pub struct TopicSelector {
     /// Topic name or regular expression. Omit to select all topics.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "topic_id")]
     pub topic: Option<String>,
+    /// Kafka topic UUID. Supported by the describe action.
+    #[arg(long)]
+    pub topic_id: Option<String>,
     /// Exclude Kafka internal topics.
     #[arg(long)]
     pub exclude_internal: bool,
@@ -397,7 +400,13 @@ pub struct OffsetsArgs {
     pub partitions: Option<String>,
     #[arg(long)]
     pub exclude_internal_topics: bool,
-    #[arg(long, value_enum, default_value_t, conflicts_with = "timestamp")]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        conflicts_with = "timestamp",
+        allow_hyphen_values = true
+    )]
     pub time: OffsetTime,
     /// Return the first offset whose record timestamp is at least this Unix millisecond value.
     #[arg(long)]
@@ -406,9 +415,13 @@ pub struct OffsetsArgs {
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum OffsetTime {
+    #[value(alias = "-2")]
     Earliest,
     #[default]
+    #[value(alias = "-1")]
     Latest,
+    #[value(name = "max-timestamp", alias = "-3")]
+    MaxTimestamp,
 }
 
 #[derive(Debug, Args)]
@@ -625,6 +638,22 @@ mod tests {
         "events"
     );
     parses_command_family!(offsets_family_parses, "offsets", "--topic", "events");
+    parses_command_family!(
+        offsets_max_timestamp_parses,
+        "offsets",
+        "--topic",
+        "events",
+        "--time",
+        "max-timestamp"
+    );
+    parses_command_family!(
+        offsets_numeric_time_alias_parses,
+        "offsets",
+        "--topic",
+        "events",
+        "--time",
+        "-3"
+    );
     parses_command_family!(acls_family_parses, "acls", "list");
     parses_command_family!(reassign_family_parses, "reassign", "list");
     parses_command_family!(
