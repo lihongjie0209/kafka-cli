@@ -225,7 +225,28 @@ pub enum ListOffsetSpec {
     Earliest,
     Latest,
     MaxTimestamp,
+    EarliestLocal,
+    LatestTiered,
+    EarliestPendingUpload,
     Timestamp(i64),
+}
+
+fn list_offset_spec_value(spec: ListOffsetSpec) -> i64 {
+    match spec {
+        ListOffsetSpec::Earliest => {
+            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_EARLIEST as i32)
+        }
+        ListOffsetSpec::Latest => {
+            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_LATEST as i32)
+        }
+        ListOffsetSpec::MaxTimestamp => {
+            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_MAX_TIMESTAMP as i32)
+        }
+        ListOffsetSpec::EarliestLocal => -4,
+        ListOffsetSpec::LatestTiered => -5,
+        ListOffsetSpec::EarliestPendingUpload => -6,
+        ListOffsetSpec::Timestamp(timestamp) => timestamp,
+    }
 }
 
 /// Offset and timestamp returned for one topic partition.
@@ -233,8 +254,9 @@ pub enum ListOffsetSpec {
 pub struct ListOffsetEntry {
     pub topic: String,
     pub partition: i32,
-    pub offset: i64,
-    pub timestamp: i64,
+    pub offset: Option<i64>,
+    pub timestamp: Option<i64>,
+    pub error: Option<String>,
 }
 
 /// Consumer-group states supported by librdkafka list filtering.
@@ -776,18 +798,7 @@ pub fn list_offsets(
         ));
     }
     let list = PartitionList(list);
-    let requested_offset = match spec {
-        ListOffsetSpec::Earliest => {
-            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_EARLIEST as i32)
-        }
-        ListOffsetSpec::Latest => {
-            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_LATEST as i32)
-        }
-        ListOffsetSpec::MaxTimestamp => {
-            i64::from(sys::rd_kafka_OffsetSpec_t::RD_KAFKA_OFFSET_SPEC_MAX_TIMESTAMP as i32)
-        }
-        ListOffsetSpec::Timestamp(timestamp) => timestamp,
-    };
+    let requested_offset = list_offset_spec_value(spec);
     for (topic, partition) in targets {
         let topic = CString::new(topic.as_str())
             .map_err(|_| Error::Usage("topic name contains a NUL byte".into()))?;
@@ -835,18 +846,35 @@ pub fn list_offsets(
                 "broker returned a null ListOffsets topic partition".into(),
             ));
         }
+        let topic = unsafe { c_string((*partition).topic) };
+        let partition_id = unsafe { (*partition).partition };
         if unsafe { (*partition).err } != sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
-            return Err(Error::Config(unsafe {
-                c_string(sys::rd_kafka_err2str((*partition).err))
-            }));
+            rows.push(ListOffsetEntry {
+                topic,
+                partition: partition_id,
+                offset: None,
+                timestamp: None,
+                error: Some(unsafe { c_string(sys::rd_kafka_err2str((*partition).err)) }),
+            });
+            continue;
+        }
+        let offset = unsafe { (*partition).offset };
+        if offset == -1 {
+            continue;
         }
         rows.push(ListOffsetEntry {
-            topic: unsafe { c_string((*partition).topic) },
-            partition: unsafe { (*partition).partition },
-            offset: unsafe { (*partition).offset },
-            timestamp: unsafe { sys::rd_kafka_ListOffsetsResultInfo_timestamp(info) },
+            topic,
+            partition: partition_id,
+            offset: Some(offset),
+            timestamp: Some(unsafe { sys::rd_kafka_ListOffsetsResultInfo_timestamp(info) }),
+            error: None,
         });
     }
+    rows.sort_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then(left.partition.cmp(&right.partition))
+    });
     Ok(rows)
 }
 
@@ -2072,6 +2100,18 @@ mod tests {
             )
             .expect("match pattern"),
             AclPatternType::Match
+        );
+    }
+
+    #[test]
+    fn list_offset_specs_should_use_kafka_protocol_sentinels() {
+        assert_eq!(
+            [
+                list_offset_spec_value(ListOffsetSpec::EarliestLocal),
+                list_offset_spec_value(ListOffsetSpec::LatestTiered),
+                list_offset_spec_value(ListOffsetSpec::EarliestPendingUpload),
+            ],
+            [-4, -5, -6]
         );
     }
 }

@@ -693,6 +693,12 @@ pub enum OffsetTime {
     Latest,
     #[value(name = "max-timestamp", alias = "-3")]
     MaxTimestamp,
+    #[value(name = "earliest-local", alias = "-4")]
+    EarliestLocal,
+    #[value(name = "latest-tiered", alias = "-5")]
+    LatestTiered,
+    #[value(name = "earliest-pending-upload", alias = "-6")]
+    EarliestPendingUpload,
 }
 
 #[derive(Debug, Args)]
@@ -1317,6 +1323,22 @@ mod tests {
         "--all"
     );
     parses_command_family!(offsets_family_parses, "offsets", "--topic", "events");
+    #[test]
+    fn offsets_should_parse_kafka_tiered_time_aliases() {
+        for value in [
+            "earliest-local",
+            "-4",
+            "latest-tiered",
+            "-5",
+            "earliest-pending-upload",
+            "-6",
+        ] {
+            let result =
+                Cli::try_parse_from(["kafka", "offsets", "--topic", "events", "--time", value]);
+
+            assert!(result.is_ok(), "rejected --time {value}: {result:?}");
+        }
+    }
     parses_command_family!(
         offsets_max_timestamp_parses,
         "offsets",

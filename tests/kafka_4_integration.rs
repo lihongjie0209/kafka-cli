@@ -1270,6 +1270,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("integration-events")
     );
+    let trailing_rule = success(
+        &bootstrap,
+        &["offsets", "--topic-partitions", "integration-events:0,"],
+    );
+    assert!(trailing_rule.contains("integration-events"));
+    assert!(!trailing_rule.contains("manual-assignment"));
     assert!(
         success(
             &bootstrap,
@@ -1283,6 +1289,25 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("integration-events")
     );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "offsets",
+                "--topic",
+                "integration-events",
+                "--time",
+                "earliest-local",
+            ],
+        )
+        .contains("integration-events")
+    );
+    for time in ["latest-tiered", "earliest-pending-upload"] {
+        success(
+            &bootstrap,
+            &["offsets", "--topic", "integration-events", "--time", time],
+        );
+    }
 
     // ACL and destructive commands use their mandatory safe preview mode.
     success(&bootstrap, &["acls", "list"]);

@@ -3918,7 +3918,8 @@ fn offsets(
     format: OutputFormat,
     args: &crate::cli::OffsetsArgs,
 ) -> Result<()> {
-    let consumer = base_consumer(config)?;
+    let config = offsets_client_config(config);
+    let consumer = base_consumer(&config)?;
     let metadata = consumer.fetch_metadata(None, timeout)?;
     let patterns = args
         .topic_partitions
@@ -3974,9 +3975,12 @@ fn offsets(
             OffsetTime::Earliest => ffi::ListOffsetSpec::Earliest,
             OffsetTime::Latest => ffi::ListOffsetSpec::Latest,
             OffsetTime::MaxTimestamp => ffi::ListOffsetSpec::MaxTimestamp,
+            OffsetTime::EarliestLocal => ffi::ListOffsetSpec::EarliestLocal,
+            OffsetTime::LatestTiered => ffi::ListOffsetSpec::LatestTiered,
+            OffsetTime::EarliestPendingUpload => ffi::ListOffsetSpec::EarliestPendingUpload,
         }
     };
-    let client = admin(config)?;
+    let client = admin(&config)?;
     let rows = ffi::list_offsets(
         client.inner().native_ptr(),
         &targets,
@@ -3985,17 +3989,26 @@ fn offsets(
     )?;
     output::write_value(format, "offsets", &rows, |rows| {
         output::table(
-            ["TOPIC", "PARTITION", "OFFSET", "TIMESTAMP"],
+            ["TOPIC", "PARTITION", "OFFSET", "TIMESTAMP", "ERROR"],
             rows.iter().map(|row| {
                 [
                     row.topic.clone(),
                     row.partition.to_string(),
-                    row.offset.to_string(),
-                    row.timestamp.to_string(),
+                    row.offset
+                        .map_or_else(|| "N/A".into(), |value| value.to_string()),
+                    row.timestamp
+                        .map_or_else(|| "N/A".into(), |value| value.to_string()),
+                    row.error.clone().unwrap_or_default(),
                 ]
             }),
         )
     })
+}
+
+fn offsets_client_config(config: &rdkafka::ClientConfig) -> rdkafka::ClientConfig {
+    let mut config = config.clone();
+    config.set("client.id", "GetOffsetShell");
+    config
 }
 
 struct TopicPartitionPattern {
@@ -4013,8 +4026,8 @@ impl TopicPartitionPattern {
 }
 
 fn parse_topic_partition_patterns(value: &str) -> Result<Vec<TopicPartitionPattern>> {
-    value
-        .split(',')
+    split_java_list(value)
+        .into_iter()
         .map(|item| {
             let (topic, partitions) = item
                 .split_once(':')
@@ -4044,6 +4057,17 @@ fn parse_topic_partition_patterns(value: &str) -> Result<Vec<TopicPartitionPatte
             Ok(TopicPartitionPattern { topic, start, end })
         })
         .collect()
+}
+
+fn split_java_list(value: &str) -> Vec<&str> {
+    if value.is_empty() {
+        return vec![""];
+    }
+    let mut items = value.split(',').collect::<Vec<_>>();
+    while items.last() == Some(&"") {
+        items.pop();
+    }
+    items
 }
 
 fn parse_optional_partition_bound(value: &str) -> Result<Option<i32>> {
@@ -6187,10 +6211,13 @@ fn parse_replica_assignment(value: &str) -> Result<Vec<Vec<i32>>> {
 }
 
 fn parse_partitions(value: Option<&str>) -> Result<Option<Vec<i32>>> {
+    if value == Some("") {
+        return Ok(None);
+    }
     value
         .map(|value| {
-            value
-                .split(',')
+            split_java_list(value)
+                .into_iter()
                 .map(|item| {
                     item.parse::<i32>()
                         .map_err(|_| Error::Usage(format!("invalid partition: {item}")))
@@ -6378,6 +6405,35 @@ mod tests {
             parse_topic_partition_patterns("events:3-1"),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn topic_partition_pattern_should_drop_java_trailing_empty_rules() {
+        let patterns = parse_topic_partition_patterns("events:0,").expect("trailing comma");
+
+        assert!(patterns[0].matches("events", 0) && !patterns[0].matches("audit", 0));
+    }
+
+    #[test]
+    fn partition_list_should_follow_java_trailing_empty_semantics() {
+        assert_eq!(
+            (
+                parse_partitions(Some("0,")).expect("trailing comma"),
+                parse_partitions(Some("")).expect("empty list"),
+            ),
+            (Some(vec![0]), None)
+        );
+    }
+
+    #[test]
+    fn offsets_client_should_use_original_client_id() {
+        let mut config = rdkafka::ClientConfig::new();
+        config.set("client.id", "custom");
+
+        assert_eq!(
+            offsets_client_config(&config).get("client.id"),
+            Some("GetOffsetShell")
+        );
     }
 
     #[test]
