@@ -367,11 +367,13 @@ async fn topics(
             let assignment_refs = assignments
                 .as_ref()
                 .map(|items| items.iter().map(Vec::as_slice).collect::<Vec<&[i32]>>());
-            let (partition_count, replication) = assignment_refs.as_ref().map_or(
-                (
-                    args.partitions,
-                    TopicReplication::Fixed(args.replication_factor),
-                ),
+            let (partition_count, replication) = assignment_refs.as_ref().map_or_else(
+                || {
+                    (
+                        args.partitions,
+                        TopicReplication::Fixed(args.replication_factor.unwrap_or(-1)),
+                    )
+                },
                 |items| {
                     (
                         i32::try_from(items.len()).unwrap_or(i32::MAX),

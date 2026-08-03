@@ -208,8 +208,9 @@ pub struct CreateTopicArgs {
     pub topic: String,
     #[arg(long, default_value_t = 1)]
     pub partitions: i32,
-    #[arg(long, default_value_t = 1)]
-    pub replication_factor: i32,
+    /// Replication factor. Omit to use the broker's default.
+    #[arg(long)]
+    pub replication_factor: Option<i32>,
     /// Manual assignments such as 1:2,2:3 (one comma-separated entry per partition).
     #[arg(long, conflicts_with = "replication_factor")]
     pub replica_assignment: Option<String>,

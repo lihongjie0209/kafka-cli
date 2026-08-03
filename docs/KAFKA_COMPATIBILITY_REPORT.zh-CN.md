@@ -78,7 +78,7 @@
 缺少或有差异：
 
 - 未支持 `--partition-size-limit-per-response`。
-- 原版未指定 replication factor 时可使用集群默认值；本项目当前默认值为 1，语义不同。
+- 未指定 replication factor 时通过 librdkafka 的 `-1` sentinel 使用 broker 默认值。
 - 原版废弃的 `--delete-config` 未提供。
 - 表格列名和排版不是原版逐字符复制。
 
@@ -245,7 +245,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 3. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
 4. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
 5. Leader Election 增加 JSON 文件批量输入。
-6. Topics 在未指定 replication factor 时遵循集群默认值。
+6. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
 
 ### P2：扩大原版工具覆盖面
 
@@ -270,3 +270,4 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Consumer Group describe | state/members 从旧 group-list API 迁移到 librdkafka `DescribeConsumerGroups`；解码 current/target member assignment，并输出 type、assignor、coordinator | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 state/members 集成测试通过 |
 | 2026-08-03 | Consumer Group reset write | reset-offsets 从 consumer synchronous commit 迁移到 librdkafka `AlterConsumerGroupOffsets` Admin API，保留安全预览和所有 reset target 算法 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 reset/describe 闭环集成测试通过 |
 | 2026-08-03 | Describe Cluster | cluster ID 与 endpoint 查询统一迁移到 librdkafka `DescribeCluster` Admin API，新增 rack 与 controller 输出 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成测试通过 |
+| 2026-08-03 | Topic default replication factor | create 未指定 `--replication-factor` 时使用 librdkafka `-1` sentinel，交由 broker 的 default.replication.factor 决定 | Topic create 单元路径及 Kafka 3.6.2/4.3.1 集成测试 |
