@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `f94cdc4fd416066a05b3d47bd7dbe674a704f314`。
+- 本项目基准：`master`，提交 `37dd3d374a9d240ca39e3bd23be061594cc95dde`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 80 个通过 | 74 个 library unit tests + 6 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 84 个通过 | 77 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -66,7 +66,7 @@
 | `kafka-broker-api-versions.sh` | `kafka api-versions` | 已支持 | 全 broker 或指定 broker 的 API version 范围 |
 | `kafka-cluster.sh` | `kafka cluster` | 部分支持 | cluster ID、endpoints（含 fenced broker）、API versions、unregister；缺 bootstrap-controller |
 
-兼容入口可以通过软链接名称调用，支持带或不带 `.sh` 后缀。对原版使用 `--create`、`--describe` 等动作 flag 的部分脚本，会自动改写为 Rust 子命令；`kafka-cluster.sh` 接受原版 `cluster-id` 名称及 `-b/-c/-i` 短参数，同时保留 `id` 作为原生别名。
+兼容入口可以通过软链接名称调用，支持带或不带 `.sh` 后缀。对原版使用 `--create`、`--describe` 等动作 flag 的部分脚本，会自动改写为 Rust 子命令。原版 mutation 动作会同时保留“立即执行”语义，不会被静默降级为预览；`kafka-cluster.sh` 接受原版 `cluster-id` 名称及 `-b/-c/-i` 短参数，同时保留 `id` 作为原生别名。
 
 ### 3.2 尚未实现的原版脚本
 
@@ -126,7 +126,7 @@
 - committed offset、log end offset、lag 和错误列。
 - members 输出已解码的当前和 target topic-partition assignment；state 输出 group type、assignor、member count 与 coordinator。
 - describe 支持原版 `--verbose`：offset 视图增加 librdkafka 返回的 committed leader epoch，members 视图增加 current/target assignment；非 verbose members 只显示 partition 数量。librdkafka 2.12 未暴露 consumer group/member epoch，因此这些 Kafka 4 新列不会伪造。
-- delete group 支持重复 `--group` 和 `--all-groups`；delete-offsets 支持重复裸 topic 与 `topic:partition,partition`，单个 librdkafka 请求可携带跨 topic partition list；两者默认预览并通过 `--execute` 执行。
+- delete group 支持重复 `--group` 和 `--all-groups`；delete-offsets 支持重复裸 topic 与 `topic:partition,partition`，单个 librdkafka 请求可携带跨 topic partition list；原生子命令默认预览并通过 `--execute` 执行，兼容脚本的原版 `--delete`/`--delete-offsets` 动作立即执行。
 - reset offsets：支持重复 `--group`/`--topic`、`--all-groups`、`--all-topics`、原版 `topic:partition,partition` selector、`--dry-run`/`--execute`，以及 earliest、latest、absolute offset、shift-by、current、datetime、ISO-8601 duration；支持原版 `--export` 与 `--from-file` 无表头 CSV（单 group 三列、多 group 四列），导入校验选择范围、重复目标并按 log start/end 边界调整 offset；执行阶段使用 librdkafka `AlterConsumerGroupOffsets` Admin API。
 - `validate-regex` 可在不提供 bootstrap-server 时独立校验正则；兼容脚本入口的原版 `--validate-regex` 会自动改写到该子命令，结果使用表格/JSON 输出。语法由 Rust regex/librdkafka 可用集合约束，不宣称覆盖所有 Java Pattern 扩展。
 
@@ -146,7 +146,7 @@
 - broker-logger 与 client-metrics 的 describe/alter/delete；broker logger 请求路由到指定 broker，client metrics 支持省略名称枚举全部 subscription，并把写请求路由到 controller。
 - SCRAM 预览只显示 mechanism 和 iterations，不回显 password。
 - alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON，而非手工文本。
-- 预览与 `--execute`。
+- 原生子命令支持预览与 `--execute`；兼容脚本的原版 `--alter` 动作立即执行。
 
 缺少：bootstrap-controller。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity 还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
 
@@ -158,20 +158,20 @@
 
 ### 4.7 ACLs
 
-已支持：list/add/remove；Topic、Group、Cluster、Transactional ID；Literal/Prefixed/Any；allow/deny principal 与 host；常见 operations；producer、consumer、idempotent 快捷角色；预览与 `--execute`。Create、Describe 和 Delete 均通过 librdkafka Admin API 执行。
+已支持：list/add/remove；Topic、Group、Cluster、Transactional ID；Literal/Prefixed/Any；allow/deny principal 与 host；常见 operations；producer、consumer、idempotent 快捷角色。原生子命令使用预览与 `--execute`；兼容脚本 `--add` 立即执行，`--remove --force` 接受原版 force 语义。Create、Describe 和 Delete 均通过 librdkafka Admin API 执行。
 
 缺少或有差异：
 
 - 未支持 Kafka 4.4 的 `--user-principal` 资源语义。
 - librdkafka 2.12 的 ACL ResourceType 不包含 Delegation Token；使用 `--delegation-token` 时会明确返回不支持，而不会切换到另一套协议实现。
 - 未支持 bootstrap-controller。
-- 原版 remove 会交互确认或使用 `--force`；本项目采用更安全的显式 `--execute`，没有交互确认。
+- 原版 remove 会交互确认或使用 `--force`；本项目不做交互确认：原生形式使用 `--execute`，兼容入口接受 `--force`，未提供 force 时保持预览。
 - 快捷角色当前只允许 allow principal/host，不允许 deny 组合。
 - ACL FFI 使用窄范围 RAII 封装管理 Admin queue、options、event 和 native binding 生命周期。
 
 ### 4.8 Partition Reassignment
 
-已支持：generate、execute、verify、cancel、list；topics-to-move 与 reassignment JSON；broker list；rack-aware/disable-rack-aware；log directory relocation；预览与 `--execute`。execute 支持原版 `--additional` 的全局活动迁移保护、`--disallow-replication-factor-change` 的逐分区复制因子校验、`--throttle` 的 topic/broker leader/follower replication throttle，以及 `--replica-alter-log-dirs-throttle` 的 broker log-dir throttle。throttle 通过 librdkafka `IncrementalAlterConfigs` 写入，并把已有迁移和新增计划合并计算 source/destination replicas。verify 在全局 partition reassignment 与目标 log-dir move 均结束后自动清理 throttle；cancel 成功后也会清理；两者均支持 `--preserve-throttles` 跳过清理。
+已支持：generate、execute、verify、cancel、list；topics-to-move 与 reassignment JSON；broker list；rack-aware/disable-rack-aware；log directory relocation。原生子命令提供预览与 `--execute`，兼容脚本的原版 `--execute`/`--cancel` 动作立即执行。execute 支持原版 `--additional` 的全局活动迁移保护、`--disallow-replication-factor-change` 的逐分区复制因子校验、`--throttle` 的 topic/broker leader/follower replication throttle，以及 `--replica-alter-log-dirs-throttle` 的 broker log-dir throttle。throttle 通过 librdkafka `IncrementalAlterConfigs` 写入，并把已有迁移和新增计划合并计算 source/destination replicas。verify 在全局 partition reassignment 与目标 log-dir move 均结束后自动清理 throttle；cancel 成功后也会清理；两者均支持 `--preserve-throttles` 跳过清理。
 
 缺少：bootstrap-controller。生成算法目标与原版一致，但不承诺在相同输入下产生逐字节相同 assignment。
 
@@ -206,7 +206,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 | 运行时 | JVM/Scala/Java | Rust 原生二进制 |
 | Kafka 客户端 | Apache Java client | `rdkafka`/librdkafka 为主，少数路径为 `krafka` |
 | 输出 | 各脚本分别定义纯文本 | 统一 `comfy-table` 表格或稳定 JSON envelope |
-| 破坏性操作 | 不同工具行为不一致，部分交互确认 | 多数操作先预览，要求 `--execute` |
+| 破坏性操作 | 不同工具行为不一致，部分交互确认 | 原生子命令多数先预览并要求 `--execute`；兼容入口保留原版立即执行动作，ACL remove 用 `--force` |
 | 动作语法 | 常见 `--list`、`--describe` flag | 原生子命令；兼容入口会改写部分旧 flag |
 | 配置文件 | Java properties | 支持 Java-compatible properties，并映射常见 librdkafka key |
 | Java 插件 | formatter、reader、deserializer 可加载类 | 不支持加载 Java 类 |
@@ -230,7 +230,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：80 个通过。
+- Rust 单元测试与普通 CLI 测试：84 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -254,8 +254,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前实现基准 `f94cdc4` 已由 GitHub Actions 运行
-[`30831064996`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30831064996) 完整验证通过：fmt/Clippy/80 个普通测试、bundled glibc、Kafka 3.6.2、包含 broker default、quota、broker-logger、client-metrics、fenced endpoint、原版 log-dirs describe 语法与 reassignment 闭环的 Kafka 4.3.1、x86_64 musl 和 aarch64 musl。普通 CLI 测试会通过真实 `kafka-cluster.sh`、`kafka-log-dirs.sh` 符号链接启动二进制，验证原版动作调度路径。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前实现基准 `37dd3d3` 已由 GitHub Actions 运行
+[`30831515240`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30831515240) 完整验证通过：fmt/Clippy/84 个普通测试、bundled glibc、Kafka 3.6.2、包含 broker default、quota、broker-logger、client-metrics、fenced endpoint、原版 log-dirs describe 语法与 reassignment 闭环的 Kafka 4.3.1、x86_64 musl 和 aarch64 musl。普通 CLI 测试会通过真实兼容符号链接启动二进制，并验证 configs `--alter` 会进入执行路径而非输出 PREVIEW；单元测试逐项覆盖 groups/configs/ACL/reassignment 的 mutation rewrite。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -353,6 +353,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Fenced broker endpoints | `cluster list-endpoints --include-fenced-brokers` 使用 DescribeCluster v2 返回 fenced 状态；默认路径仍使用 librdkafka，表格对齐原版 STATE/ENDPOINT_TYPE 列 | 77 个普通测试、Kafka 4.3.1 实际协议请求、Kafka 3.6.2 回归及双 musl CI 全部通过 |
 | 2026-08-04 | kafka-cluster 入口语法 | cluster ID 的规范子命令改为原版 `cluster-id` 并保留 `id` 别名；补齐全局 `-b/-c` 和 unregister `-i` | 74 个单元测试、5 个 CLI 测试（含真实 `kafka-cluster.sh` symlink 启动）、Kafka 3.6.2/4.3.1 及双 musl CI 全部通过 |
 | 2026-08-04 | kafka-log-dirs 动作语法 | 接受原版必需的 `--describe` 动作 flag，同时保留原生无动作 flag 的简洁调用 | 74 个单元测试、6 个 CLI 测试（含真实 `kafka-log-dirs.sh` symlink 启动）、Kafka 4.3.1 原版语法请求、Kafka 3.6.2 及双 musl CI 全部通过 |
+| 2026-08-04 | 兼容入口 mutation 语义 | legacy rewrite 对 groups delete/delete-offsets、configs alter、ACL add、reassignment execute/cancel 自动保留立即执行；ACL remove 接受 `--force` | 77 个单元测试逐动作核对、7 个 CLI 测试（真实 configs alias 验证非 PREVIEW）、Kafka 3.6.2/4.3.1 及双 musl CI 全部通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
