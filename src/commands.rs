@@ -1717,33 +1717,29 @@ async fn configs(
             entity_type,
             entity_name,
             add,
+            add_file,
             delete,
             execute,
         } => {
-            let pairs = parse_pairs(&add)?;
+            let pairs = if let Some(path) = add_file.as_deref() {
+                let mut pairs = config::load_properties(path)?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                pairs.sort_by(|left, right| left.0.cmp(&right.0));
+                pairs
+            } else {
+                parse_pairs(&add)?
+            };
             if pairs.is_empty() && delete.is_empty() {
                 return Err(Error::Usage(
-                    "provide --add-config or --delete-config".into(),
+                    "provide --add-config, --add-config-file, or --delete-config".into(),
                 ));
             }
             if matches!(entity_type, ConfigEntityType::User) {
                 return alter_user_scram(config, timeout, &entity_name, &pairs, &delete, execute);
             }
             if !execute {
-                if !pairs.is_empty() {
-                    println!(
-                        "Would set {}",
-                        pairs
-                            .iter()
-                            .map(|(key, value)| format!("{key}={value}"))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                }
-                if !delete.is_empty() {
-                    println!("Would delete {}", delete.join(","));
-                }
-                return Ok(());
+                return config_change_preview(format, &pairs, &delete);
             }
             let admin = admin(config)?;
             crate::ffi::incremental_alter_config(
@@ -1756,6 +1752,45 @@ async fn configs(
             )
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigChangeRow<'a> {
+    operation: &'static str,
+    name: &'a str,
+    value: Option<&'a str>,
+}
+
+fn config_change_preview(
+    format: OutputFormat,
+    pairs: &[(String, String)],
+    delete: &[String],
+) -> Result<()> {
+    let rows = pairs
+        .iter()
+        .map(|(key, value)| ConfigChangeRow {
+            operation: "SET",
+            name: key,
+            value: Some(value.as_str()),
+        })
+        .chain(delete.iter().map(|key| ConfigChangeRow {
+            operation: "DELETE",
+            name: key,
+            value: None,
+        }))
+        .collect::<Vec<_>>();
+    output::write_value(format, "configs.alter.preview", &rows, |rows| {
+        output::table(
+            ["OPERATION", "NAME", "VALUE"],
+            rows.iter().map(|row| {
+                [
+                    row.operation.to_owned(),
+                    row.name.to_owned(),
+                    row.value.unwrap_or("-").to_owned(),
+                ]
+            }),
+        )
+    })
 }
 
 fn describe_user_scram(

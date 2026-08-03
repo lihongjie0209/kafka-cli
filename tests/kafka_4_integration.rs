@@ -59,6 +59,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let reassignment_file = fixture.path().join("reassignment.json");
     let election_file = fixture.path().join("election.json");
     let reset_file = fixture.path().join("reset.csv");
+    let topic_config_file = fixture.path().join("topic.properties");
     fs::write(
         &delete_file,
         r#"{"partitions":[{"topic":"integration-events","partition":0,"offset":1}]}"#,
@@ -79,6 +80,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
         r#"{"partitions":[{"topic":"integration-events","partition":0},{"topic":"manual-assignment","partition":1}]}"#,
     )
     .expect("leader-election fixture");
+    fs::write(
+        &topic_config_file,
+        "retention.ms=60000\nsegment.bytes=1048576\n",
+    )
+    .expect("topic config fixture");
 
     // topics
     success(
@@ -585,8 +591,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "topic",
             "--entity-name",
             "integration-events",
-            "--add-config",
-            "retention.ms=60000",
+            "--add-config-file",
+            topic_config_file.to_str().expect("fixture path"),
             "--execute",
         ],
     );
@@ -601,6 +607,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "integration-events",
             "--delete-config",
             "retention.ms",
+            "--delete-config",
+            "segment.bytes",
             "--execute",
         ],
     );

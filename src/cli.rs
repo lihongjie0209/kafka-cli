@@ -459,6 +459,8 @@ pub enum ConfigAction {
         entity_name: String,
         #[arg(long = "add-config")]
         add: Vec<String>,
+        #[arg(long = "add-config-file", conflicts_with = "add")]
+        add_file: Option<PathBuf>,
         #[arg(long = "delete-config")]
         delete: Vec<String>,
         #[arg(long)]
@@ -736,6 +738,17 @@ mod tests {
         "topic",
         "--entity-name",
         "events"
+    );
+    parses_command_family!(
+        configs_add_file_parses,
+        "configs",
+        "alter",
+        "--entity-type",
+        "topics",
+        "--entity-name",
+        "events",
+        "--add-config-file",
+        "topic.properties"
     );
     parses_command_family!(offsets_family_parses, "offsets", "--topic", "events");
     parses_command_family!(
