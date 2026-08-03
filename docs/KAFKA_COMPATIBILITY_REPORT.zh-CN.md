@@ -252,8 +252,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-上一个实现基准 `c36a3e9` 的 GitHub Actions 运行记录
-[`30826585429`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30826585429) 已全部通过：fmt/Clippy/单元测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。当前 reassignment 增强提交 `ec8ae4a` 的最终状态以对应 CI 运行记录为准。
+当前实现基准 `ec8ae4a` 已由 GitHub Actions 运行
+[`30827548520`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30827548520) 完整验证通过：fmt/Clippy/73 个普通测试、bundled glibc、Kafka 3.6.2、包含 reassignment throttle 设置与清理闭环的 Kafka 4.3.1、x86_64 musl 和 aarch64 musl。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
