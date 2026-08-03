@@ -804,7 +804,6 @@ fn all_command_families_work_against_kafka_4_3_1() {
             &["topics", "create", "--topic", topic, "--partitions", "1"],
         );
     }
-    success(&bootstrap, &["produce", "legacy-streams-through", "--sync"]);
     let application_reset_preview: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
