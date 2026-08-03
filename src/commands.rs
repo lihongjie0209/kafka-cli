@@ -778,13 +778,8 @@ struct LineReaderOptions {
 }
 
 fn line_reader_options(args: &crate::cli::ProduceArgs) -> Result<LineReaderOptions> {
-    let properties = parse_pairs(&args.reader_properties)?;
-    let value = |key: &str| {
-        properties
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value)
-    };
+    let properties = component_properties(args.reader_config.as_deref(), &args.reader_properties)?;
+    let value = |key: &str| properties.get(key);
     let parse_key = value("parse.key").map_or(args.parse_key, |value| bool_property(value));
     let key_separator = value("key.separator")
         .cloned()
@@ -1075,13 +1070,9 @@ struct MessageFormatterOptions {
 }
 
 fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFormatterOptions> {
-    let properties = parse_pairs(&args.formatter_properties)?;
-    let value = |key: &str| {
-        properties
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value)
-    };
+    let properties =
+        component_properties(args.formatter_config.as_deref(), &args.formatter_properties)?;
+    let value = |key: &str| properties.get(key);
     for key in [
         "key.deserializer",
         "value.deserializer",
@@ -5702,6 +5693,22 @@ fn parse_pairs(values: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn component_properties(
+    path: Option<&Path>,
+    inline: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let mut properties = path
+        .map(config::load_properties)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    for (key, value) in parse_pairs(inline)? {
+        properties.insert(key, value);
+    }
+    Ok(properties)
+}
+
 fn parse_replica_assignment(value: &str) -> Result<Vec<Vec<i32>>> {
     let assignments = value
         .split(',')
@@ -5790,6 +5797,31 @@ mod tests {
     fn parse_pairs_should_retain_equals_in_value() {
         let pairs = parse_pairs(&["password=a=b".into()]).expect("valid pair");
         assert_eq!(pairs, [("password".into(), "a=b".into())]);
+    }
+
+    #[test]
+    fn component_properties_should_load_file_then_apply_inline_overrides() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary properties file");
+        writeln!(file, "parse.key=false\nkey.separator=:").expect("write properties");
+
+        let properties = component_properties(
+            Some(file.path()),
+            &["parse.key=true".into(), "null.marker=NULL".into()],
+        )
+        .expect("component properties");
+
+        assert_eq!(
+            properties.get("parse.key").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            properties.get("key.separator").map(String::as_str),
+            Some(":")
+        );
+        assert_eq!(
+            properties.get("null.marker").map(String::as_str),
+            Some("NULL")
+        );
     }
 
     #[test]
@@ -5985,6 +6017,7 @@ mod tests {
             socket_buffer_size: None,
             json: true,
             reader_properties: Vec::new(),
+            reader_config: None,
             properties: Vec::new(),
         };
         let options = line_reader_options(&args).expect("reader options");
@@ -6030,6 +6063,7 @@ mod tests {
             socket_buffer_size: None,
             json: true,
             reader_properties: Vec::new(),
+            reader_config: None,
             properties: Vec::new(),
         };
         let options = line_reader_options(&args).expect("reader options");

@@ -75,6 +75,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let election_file = fixture.path().join("election.json");
     let reset_file = fixture.path().join("reset.csv");
     let topic_config_file = fixture.path().join("topic.properties");
+    let reader_config_file = fixture.path().join("reader.properties");
+    let formatter_config_file = fixture.path().join("formatter.properties");
     fs::write(
         &delete_file,
         r#"{"partitions":[{"topic":"integration-events","partition":0,"offset":1}]}"#,
@@ -85,6 +87,16 @@ fn all_command_families_work_against_kafka_4_3_1() {
         r#"{"topics":[{"topic":"integration-events"}],"version":1}"#,
     )
     .expect("topics fixture");
+    fs::write(
+        &reader_config_file,
+        "parse.headers=true\nheaders.delimiter=|\nparse.key=false\nkey.separator=:\nnull.marker=NULL\n",
+    )
+    .expect("reader properties fixture");
+    fs::write(
+        &formatter_config_file,
+        "print.partition=true\nprint.offset=true\nprint.headers=true\nprint.key=true\nkey.separator=:\nheaders.separator=;\nnull.literal=NULL\n",
+    )
+    .expect("formatter properties fixture");
     fs::write(
         &reassignment_file,
         r#"{"version":1,"partitions":[{"topic":"integration-events","partition":0,"replicas":[1],"log_dirs":["any"]}]}"#,
@@ -376,10 +388,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--topic",
             "integration-json",
             "--sync",
-            "--property",
-            "parse.headers=true",
-            "--property",
-            "headers.delimiter=|",
+            "--reader-config",
+            reader_config_file.to_str().expect("reader fixture path"),
             "--property",
             "parse.key=true",
             "--property",
@@ -403,20 +413,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "3",
             "--group",
             "integration-formatter",
-            "--property",
-            "print.partition=true",
-            "--property",
-            "print.offset=true",
-            "--property",
-            "print.headers=true",
-            "--property",
-            "print.key=true",
+            "--formatter-config",
+            formatter_config_file
+                .to_str()
+                .expect("formatter fixture path"),
             "--property",
             "key.separator=|",
-            "--property",
-            "headers.separator=;",
-            "--property",
-            "null.literal=NULL",
         ])
         .assert()
         .success()

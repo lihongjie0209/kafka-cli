@@ -80,6 +80,26 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
 }
 
 fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
+    let deprecated_config = match command {
+        "leader-election" => Some("--admin.config"),
+        "cluster" => Some("--config"),
+        _ => None,
+    };
+    if let Some(deprecated) = deprecated_config {
+        for argument in args.iter_mut() {
+            let Some(value) = argument.to_str() else {
+                continue;
+            };
+            if value == deprecated {
+                *argument = OsString::from("--command-config");
+            } else if let Some(path) = value
+                .strip_prefix(deprecated)
+                .and_then(|tail| tail.strip_prefix('='))
+            {
+                *argument = OsString::from(format!("--command-config={path}"));
+            }
+        }
+    }
     let candidates: &[(&str, &str, bool)] = match command {
         "topics" => &[
             ("--create", "create", false),
@@ -299,6 +319,9 @@ pub struct ProduceArgs {
     /// Default `LineMessageReader` property in key=value form.
     #[arg(long = "property")]
     pub reader_properties: Vec<String>,
+    /// Java properties file used to configure the default `LineMessageReader`.
+    #[arg(long)]
+    pub reader_config: Option<PathBuf>,
     /// Producer property in key=value form; overrides --command-config.
     #[arg(long = "command-property", visible_alias = "producer-property")]
     pub properties: Vec<String>,
@@ -342,6 +365,9 @@ pub struct ConsumeArgs {
     /// `DefaultMessageFormatter` property in key=value form.
     #[arg(long = "property", visible_alias = "formatter-property")]
     pub formatter_properties: Vec<String>,
+    /// Java properties file used to configure the default message formatter.
+    #[arg(long)]
+    pub formatter_config: Option<PathBuf>,
     /// Consumer property in key=value form; overrides --command-config.
     #[arg(long = "command-property", visible_alias = "consumer-property")]
     pub properties: Vec<String>,
@@ -835,6 +861,28 @@ mod tests {
             .position(|argument| argument == "unregister")
             .expect("unregister argument");
         assert_eq!(cluster[unregister + 1], "--execute");
+    }
+
+    #[test]
+    fn deprecated_config_options_should_map_to_command_config() {
+        for (command, deprecated, expected) in [
+            ("leader-election", "--admin.config", "--command-config"),
+            (
+                "cluster",
+                "--config=client.properties",
+                "--command-config=client.properties",
+            ),
+        ] {
+            let mut arguments = vec![
+                OsString::from("kafka-compatible"),
+                OsString::from(command),
+                OsString::from(deprecated),
+                OsString::from("client.properties"),
+            ];
+            rewrite_legacy_action(&mut arguments, command);
+            assert!(arguments.iter().any(|argument| argument == expected));
+            assert!(!arguments.iter().any(|argument| argument == deprecated));
+        }
     }
 
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");
