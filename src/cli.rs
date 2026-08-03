@@ -124,6 +124,20 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             return;
         }
     }
+    if args.iter().any(|arg| arg == "--execute") {
+        return;
+    }
+    match command {
+        "delete-records" | "leader-election" => {
+            args.insert(2, OsString::from("--execute"));
+        }
+        "cluster" => {
+            if let Some(index) = args.iter().position(|arg| arg == "unregister") {
+                args.insert(index + 1, OsString::from("--execute"));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Top-level command suite.
@@ -796,6 +810,31 @@ mod tests {
         rewrite_legacy_action(&mut arguments, "topics");
         assert_eq!(arguments[2], "describe");
         assert!(!arguments.iter().any(|argument| argument == "--execute"));
+    }
+
+    #[test]
+    fn single_action_legacy_mutations_should_execute() {
+        for command in ["delete-records", "leader-election"] {
+            let mut arguments = vec![OsString::from("kafka-compatible"), OsString::from(command)];
+            rewrite_legacy_action(&mut arguments, command);
+            assert_eq!(arguments[2], "--execute", "{command} became a preview");
+        }
+
+        let mut cluster = vec![
+            OsString::from("kafka-cluster.sh"),
+            OsString::from("cluster"),
+            OsString::from("--bootstrap-server"),
+            OsString::from("localhost:9092"),
+            OsString::from("unregister"),
+            OsString::from("--id"),
+            OsString::from("1"),
+        ];
+        rewrite_legacy_action(&mut cluster, "cluster");
+        let unregister = cluster
+            .iter()
+            .position(|argument| argument == "unregister")
+            .expect("unregister argument");
+        assert_eq!(cluster[unregister + 1], "--execute");
     }
 
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");
