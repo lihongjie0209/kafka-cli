@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `97e67a5`。
+- 本项目审计实现基准：`master`，提交 `d549140`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 21 个兼容名称，入口覆盖率为 21/44（47.7%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 按本报告的功能口径，21 个兼容入口中 11 个达到核心功能“已支持”，10 个为“部分支持”；另有 23 个原版入口未支持。因此不能把 47.7% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
@@ -42,7 +42,7 @@
 | 入口功能评级 | 11 已支持 / 10 部分支持 / 23 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
 | 已覆盖入口的一级动作 | 65 / 65 | 仅表示这 21 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 225 个通过 | 210 个 library unit tests + 15 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 226 个通过 | 211 个 library unit tests + 15 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -324,7 +324,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：225 个通过（210 个 library unit tests + 15 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：226 个通过（211 个 library unit tests + 15 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 21 个命令族，包括真实 ShareConsumer 创建与 Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -357,6 +357,8 @@ Kafka Groups 实现 `00b229f` 由 GitHub Actions [`30855676975`](https://github.
 Kafka Share Groups 实现 `109765a` 与 flexible protocol 修复 `d207762` 由 GitHub Actions [`30857219313`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30857219313) 完整验证通过：fmt/Clippy/216 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 创建真实 ShareConsumer，验证 list、state/members/offsets describe、reset-offsets、delete-offsets 与 delete 闭环；Kafka 3.6.2 验证旧 broker 空列表兼容路径。
 
 Kafka Streams Groups 实现 `1ae5e53` 及协议修复 `e425098`、`97e67a5` 由 GitHub Actions [`30859766154`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30859766154) 完整验证通过：fmt/Clippy/225 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 API 89 请求及缺失 group 的结构化错误响应，Kafka 3.6.2 验证空列表兼容路径；Kafka 4.4 v1 topology 当前由 schema 对齐 codec 测试验证，尚无真实 Streams 应用 fixture。
+
+Streams reset/delete 二次语义修复 `d549140` 由 GitHub Actions [`30860540837`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30860540837) 再次完整验证通过：226 个普通测试及其余五个 job 全绿。修复包括按 Kafka 原版允许不存在 group 生成 reset 计划、消除空 inactive group CSV panic、只在 group 删除成功后删除内部 topic、保留内部 topic 删除错误，以及移除协议解码错误中的原始 Base64 payload；Kafka 4.3.1 集成测试实际验证缺失 group 的 reset dry-run。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -498,6 +500,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | 2026-08-04 | Kafka Groups 入口 | 新增 `kafka all-groups` 和 `kafka-groups.sh`；实现全类型 list、group-type/protocol 组合过滤及 consumer/share/streams 快捷过滤，使用 ListGroups v5 保留 Share/Streams | 196 个单元测试、13 个 CLI 测试；CI `30855676975` 六个 job 全绿，Kafka 3.6.2/4.3.1 实际请求通过 |
 | 2026-08-04 | Kafka Share Groups 入口 | 新增 `kafka share-groups` 和 `kafka-share-groups.sh`；实现 list/describe/delete/reset-offsets/delete-offsets，使用 API 77/90/91/92 对齐 Kafka 4.4，并修正未知 flexible API header 边界 | 202 个单元测试、14 个 CLI 测试；CI `30857219313` 六个 job 全绿，Kafka 4.3.1 真实 ShareConsumer 与五动作闭环、Kafka 3.6.2 回归通过 |
 | 2026-08-04 | Kafka Streams Groups 入口 | 新增 `kafka streams-groups` 和 `kafka-streams-groups.sh`；实现 list/describe/delete/reset-offsets/delete-offsets，补齐 API 89 v0/v1、task assignment、offset lag、内部 topic 与 topology description | 210 个单元测试、15 个 CLI 测试；CI `30859766154` 六个 job 全绿，Kafka 4.3.1 实际验证 API 89 版本边界、Kafka 3.6.2 回归通过；真实 Streams 应用闭环待补 |
+| 2026-08-04 | Streams reset/delete 二次审计 | 缺失 group 按原版视为 inactive 并继续 reset；空 inactive CSV 不再 panic；group 删除失败时不再误删内部 topic；内部 topic 错误进入结构化结果 | 211 个单元测试、15 个 CLI 测试；CI `30860540837` 六个 job 全绿，Kafka 4.3.1 验证缺失 group reset dry-run |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
