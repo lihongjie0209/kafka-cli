@@ -514,6 +514,25 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "consume",
+            "--include",
+            "integration-jso{,1}n",
+            "--from-beginning",
+            "--max-messages",
+            "1",
+            "--timeout-ms",
+            "10000",
+            "--group",
+            "integration-posix-regex",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("first"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "produce",
             "--topic",
             "integration-json",

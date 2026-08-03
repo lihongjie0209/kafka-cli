@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 122 个通过 | 115 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 123 个通过 | 116 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -115,7 +115,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 
 ### 4.3 Console Consumer
 
-已支持：topic 或整串 `--include` 正则、group、partition、offset、from-beginning、max-messages、`--timeout-ms` 空闲退出、read_committed/read_uncommitted isolation level、skip-message-on-error、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`，兼容脚本也接受废弃的 `--consumer.config`。默认 `DefaultMessageFormatter` 的 `--formatter-config` Java properties 文件、规范 `--formatter-property` 及旧名 `--property` 支持 print.timestamp、print.partition、print.offset、print.delivery、print.epoch、print.headers、print.key、print.value、key.separator、line.separator、headers.separator、null.literal；命令行 property 覆盖文件值，并直接写出消息原始 bytes。include 使用 librdkafka 的动态正则订阅（语法以 librdkafka/POSIX 能力为准）。未显式指定 group 时会生成 `console-consumer-*` 临时 group，并在用户没有配置 `enable.auto.commit` 时默认关闭自动提交；显式 group、配置文件 `group.id` 与命令行 property 的值必须一致。手工 partition 与 group 互斥；`--offset` 必须配合 partition，接受 `earliest`、`latest` 或非负整数，未指定时与原版一致使用 latest。`--from-beginning` 与显式 offset 互斥，并拒绝冲突的 `auto.offset.reset`；CLI isolation level 覆盖 properties，未提供 CLI 值时保留 property 或使用 read_uncommitted 默认值。
+已支持：topic 或整串 `--include` 正则、group、partition、offset、from-beginning、max-messages、`--timeout-ms` 空闲退出、read_committed/read_uncommitted isolation level、skip-message-on-error、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`，兼容脚本也接受废弃的 `--consumer.config`。默认 `DefaultMessageFormatter` 的 `--formatter-config` Java properties 文件、规范 `--formatter-property` 及旧名 `--property` 支持 print.timestamp、print.partition、print.offset、print.delivery、print.epoch、print.headers、print.key、print.value、key.separator、line.separator、headers.separator、null.literal；命令行 property 覆盖文件值，并直接写出消息原始 bytes。include 使用 librdkafka 的动态 POSIX ERE 订阅，并直接由 librdkafka 编译校验，不再先用不同方言的 Rust regex 错误拒绝；它仍不等价于全部 Java Pattern 扩展。未显式指定 group 时会生成 `console-consumer-*` 临时 group，并在用户没有配置 `enable.auto.commit` 时默认关闭自动提交；显式 group、配置文件 `group.id` 与命令行 property 的值必须一致。手工 partition 与 group 互斥；`--offset` 必须配合 partition，接受 `earliest`、`latest` 或非负整数，未指定时与原版一致使用 latest。`--from-beginning` 与显式 offset 互斥，并拒绝冲突的 `auto.offset.reset`；CLI isolation level 覆盖 properties，未提供 CLI 值时保留 property 或使用 read_uncommitted 默认值。
 
 与原版一致，`--max-messages 0` 在 poll 前立即结束，`-1` 表示无限消费；负 `--timeout-ms` 表示不启用空闲超时，未指定该选项时也不会被全局管理请求的 30 秒默认值污染。producer/consumer 的废弃 property 名称仍可单独使用，但与对应的新名称同时出现时会像原版一样报错；废弃 config 文件名与 `--command-config` 也互斥。
 
@@ -236,7 +236,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：122 个通过（115 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：123 个通过（116 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -272,7 +272,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 1. API versions、unregister、reassignment/log-dir 等操作在 librdkafka 2.12 中没有公开 Admin API；继续把 `krafka` 限制在这些必要路径，并统一配置、鉴权、错误与生命周期边界。只有上游公开稳定 C API 后才迁移到 `rdkafka-sys` RAII 封装，避免调用 librdkafka 私有符号。
 2. 增加 TLS/SASL 集成测试。
 3. 增加多 broker Kafka 4 集成环境，验证 reassignment、leader election、ISR 和 rack-aware 分配。
-4. 在 CI 对两个 musl artifact 执行 `--help`/`--version` smoke test；ARM64 使用 QEMU 或原生 ARM runner。
+4. 已完成：CI 对两个 musl artifact 执行 `--help`/`--version` smoke test；ARM64 使用 QEMU user-mode emulator 实际启动。
 
 ### P1：补齐已支持脚本的主要差距
 
@@ -297,9 +297,9 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 | 优先级 | 位置 | 当前行为 | 原版/期望行为 |
 |---|---|---|---|
-| P2 | regex | Rust regex 预校验与 librdkafka POSIX topic regex 不是同一语法实现 | 应明确分离 Java Pattern 兼容校验与实际订阅语法，或避免过度承诺 |
+| P2 | groups validate-regex | 仍由 Rust regex 校验，不能覆盖全部 Java Pattern 扩展 | 后续需要 Java-compatible validator；当前输出和报告明确限定方言 |
 
-本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并、groups delete 结构化输出，以及 reassignment 的逐 partition/log-dir 错误结果。当前代码审计剩余问题是 Java Pattern、Rust regex 与 librdkafka POSIX regex 的语法边界。
+本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并、groups delete 结构化输出、reassignment 的逐 partition/log-dir 错误结果，以及 console consumer 用 Rust regex 预判 librdkafka POSIX ERE 的错误。当前正则剩余差距收窄为离线 `groups validate-regex` 尚非完整 Java Pattern validator。
 
 ### 10.2 逐入口验收结论
 
@@ -371,6 +371,8 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | Console 参数互斥与消费边界 | 废弃/current producer、consumer、reader、formatter property 组合按原版互斥；config 文件旧名与新名继续互斥；修复全局 30 秒超时误注入 consumer，并对齐 max-messages 0/-1 和负 timeout 语义 | 100 个单元测试、7 个 CLI 测试、Kafka 4.3.1 零消息退出、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Topics 参数与结果语义 | create partition/replication 均支持 broker 默认并严格互斥手工 assignment；按动作拆分参数；alter 支持正则批量；describe 补齐 ID 优先级、if-exists、配置与 replication factor，并接受 partition-size 兼容参数 | 109 个单元测试、7 个 CLI 测试、Kafka 4.3.1 broker 默认 3 partitions/正则 alter/ID/config 闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | GetOffsetShell 二次语义审计 | 对齐固定 client ID、Java 末尾空 token、逐 partition 错误和未知 offset；补齐 `-4/-5/-6` 解析，并对 librdkafka 2.12 的执行限制返回明确错误 | 115 个单元测试、7 个 CLI 测试、Kafka 3.6.2/4.3.1、bundled glibc 及双 musl CI 全部通过 |
+| 2026-08-04 | musl artifact 运行验证 | x86_64 musl 在 CI runner 原生执行 `--version`/`--help`；aarch64 musl 通过 QEMU user-mode emulator 执行相同 smoke test，不再只依赖 ELF 文件类型 | CI `30840437738` 六个 job 全绿，两种 musl artifact 均成功实际启动 |
+| 2026-08-04 | Consumer include 正则后端边界 | 移除 Rust regex 对 `--include` 的异方言预校验，订阅表达式由实际执行查询的 librdkafka POSIX ERE 引擎编译；保留整串锚定 | 116 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Rust regex 拒绝但 librdkafka 接受的量词集成用例 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

@@ -1245,9 +1245,10 @@ async fn consume(
         assignment.add_partition_offset(topic, partition, manual_offset.unwrap_or(Offset::End))?;
         consumer.assign(&assignment)?;
     } else if let Some(include) = args.include.as_deref() {
-        Regex::new(include)
-            .map_err(|error| Error::Usage(format!("invalid topic regular expression: {error}")))?;
-        let pattern = format!("^({include})$");
+        // librdkafka compiles subscription patterns as POSIX ERE. Validating with
+        // Rust's regex engine first would reject a different language than the
+        // engine that actually performs the subscription.
+        let pattern = consumer_include_pattern(include);
         consumer.subscribe(&[&pattern])?;
     } else {
         let topic = args
@@ -1291,6 +1292,10 @@ async fn consume(
         }
     }
     Ok(())
+}
+
+fn consumer_include_pattern(include: &str) -> String {
+    format!("^({include})$")
 }
 
 fn should_consume_more(max_messages: Option<i32>, received: i64) -> bool {
@@ -6450,6 +6455,14 @@ mod tests {
         let pattern = topic_pattern("events-.*").expect("valid expression");
         assert!(pattern.is_match("events-orders"));
         assert!(!pattern.is_match("archived-events-orders"));
+    }
+
+    #[test]
+    fn consumer_include_should_be_anchored_without_rust_regex_validation() {
+        assert_eq!(
+            consumer_include_pattern("integration-jso{,1}n"),
+            "^(integration-jso{,1}n)$"
+        );
     }
 
     #[test]
