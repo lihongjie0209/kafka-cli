@@ -820,7 +820,7 @@ async fn groups(
                 })
             }
         }
-        GroupAction::ResetOffsets(args) => reset_offsets(config, timeout, &args),
+        GroupAction::ResetOffsets(args) => reset_offsets(config, timeout, format, &args),
         GroupAction::DeleteOffsets {
             group,
             topic,
@@ -1179,28 +1179,20 @@ fn describe_groups(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "reset planning keeps the mutually exclusive Kafka reset strategies together"
+)]
 fn reset_offsets(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
+    format: OutputFormat,
     args: &ResetOffsetsArgs,
 ) -> Result<()> {
-    let mut config = config.clone();
-    config.set("group.id", &args.group);
-    let consumer: BaseConsumer = config.create()?;
-    let metadata = consumer.fetch_metadata(Some(&args.topic), timeout)?;
-    let topic = metadata
-        .topics()
-        .first()
-        .ok_or_else(|| Error::Usage(format!("topic {} not found", args.topic)))?;
-    let committed = if args.shift_by.is_some() || args.to_current {
-        let mut requested = TopicPartitionList::new();
-        for partition in topic.partitions() {
-            requested.add_partition(&args.topic, partition.id());
-        }
-        Some(consumer.committed_offsets(requested, timeout)?)
-    } else {
-        None
-    };
+    let groups = resolve_group_names(config, timeout, &args.group, args.all_groups)?;
+    if groups.is_empty() {
+        return Err(Error::Usage("no consumer groups matched".into()));
+    }
     let timestamp = if let Some(datetime) = args.to_datetime.as_deref() {
         Some(parse_datetime_millis(datetime)?)
     } else if let Some(duration) = args.by_duration.as_deref() {
@@ -1212,70 +1204,154 @@ fn reset_offsets(
     } else {
         None
     };
-    let timestamp_offsets = if let Some(timestamp) = timestamp {
-        let mut requested = TopicPartitionList::new();
-        for partition in topic.partitions() {
-            requested.add_partition_offset(
-                &args.topic,
-                partition.id(),
-                Offset::Offset(timestamp),
+    let mut rows = Vec::new();
+    for group in groups {
+        let mut consumer_config = config.clone();
+        consumer_config.set("group.id", &group);
+        let consumer: BaseConsumer = consumer_config.create()?;
+        let topics = if args.all_topics {
+            let admin = admin(config)?;
+            let topics = ffi::list_consumer_group_offsets(
+                admin.inner().native_ptr(),
+                &group,
+                duration_ms(timeout)?,
+            )?
+            .into_iter()
+            .map(|offset| offset.topic)
+            .collect::<BTreeSet<_>>();
+            if topics.is_empty() {
+                return Err(Error::Usage(format!(
+                    "consumer group {group} has no committed topics"
+                )));
+            }
+            topics.iter().cloned().collect::<Vec<_>>()
+        } else {
+            args.topic.clone()
+        };
+        let mut planned_offsets = Vec::new();
+        for topic_name in topics {
+            let metadata = consumer.fetch_metadata(Some(&topic_name), timeout)?;
+            let topic = metadata
+                .topics()
+                .iter()
+                .find(|topic| topic.name() == topic_name)
+                .ok_or_else(|| Error::Usage(format!("topic {topic_name} not found")))?;
+            let mut requested = TopicPartitionList::new();
+            for partition in topic.partitions() {
+                requested.add_partition(&topic_name, partition.id());
+            }
+            let committed = if args.shift_by.is_some() || args.to_current {
+                Some(consumer.committed_offsets(requested.clone(), timeout)?)
+            } else {
+                None
+            };
+            let timestamp_offsets = if let Some(timestamp) = timestamp {
+                let mut timestamp_request = TopicPartitionList::new();
+                for partition in topic.partitions() {
+                    timestamp_request.add_partition_offset(
+                        &topic_name,
+                        partition.id(),
+                        Offset::Offset(timestamp),
+                    )?;
+                }
+                Some(consumer.offsets_for_times(timestamp_request, timeout)?)
+            } else {
+                None
+            };
+            for partition in topic.partitions() {
+                let (low, high) =
+                    consumer.fetch_watermarks(&topic_name, partition.id(), timeout)?;
+                let target = reset_target(
+                    args,
+                    committed.as_ref(),
+                    timestamp_offsets.as_ref(),
+                    &topic_name,
+                    partition.id(),
+                    low,
+                    high,
+                )?;
+                rows.push(ResetOffsetRow {
+                    group: group.clone(),
+                    topic: topic_name.clone(),
+                    partition: partition.id(),
+                    new_offset: target,
+                });
+                planned_offsets.push((topic_name.clone(), partition.id(), target));
+            }
+        }
+        if args.execute {
+            let admin = admin(config)?;
+            ffi::alter_consumer_group_offsets(
+                admin.inner().native_ptr(),
+                &group,
+                &planned_offsets,
+                duration_ms(timeout)?,
             )?;
         }
-        Some(consumer.offsets_for_times(requested, timeout)?)
+    }
+    output::write_value(format, "groups.reset-offsets", &rows, |rows| {
+        output::table(
+            ["GROUP", "TOPIC", "PARTITION", "NEW_OFFSET"],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.topic.clone(),
+                    row.partition.to_string(),
+                    row.new_offset.to_string(),
+                ]
+            }),
+        )
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ResetOffsetRow {
+    group: String,
+    topic: String,
+    partition: i32,
+    new_offset: i64,
+}
+
+fn reset_target(
+    args: &ResetOffsetsArgs,
+    committed: Option<&TopicPartitionList>,
+    timestamp_offsets: Option<&TopicPartitionList>,
+    topic: &str,
+    partition: i32,
+    low: i64,
+    high: i64,
+) -> Result<i64> {
+    if args.to_earliest {
+        Ok(low)
+    } else if args.to_latest {
+        Ok(high)
+    } else if let Some(value) = args.to_offset {
+        Ok(value.clamp(low, high))
+    } else if let Some(shift) = args.shift_by {
+        let current = committed_offset(committed, topic, partition);
+        shifted_offset(current, shift, low, high, partition)
+    } else if args.to_current {
+        committed_offset(committed, topic, partition).ok_or_else(|| {
+            Error::Usage(format!(
+                "partition {topic}:{partition} has no committed offset"
+            ))
+        })
+    } else if timestamp_offsets.is_some() {
+        Ok(committed_offset(timestamp_offsets, topic, partition).unwrap_or(high))
     } else {
-        None
-    };
-    let mut planned_offsets = Vec::with_capacity(topic.partitions().len());
-    for partition in topic.partitions() {
-        let (low, high) = consumer.fetch_watermarks(&args.topic, partition.id(), timeout)?;
-        let target = if args.to_earliest {
-            low
-        } else if args.to_latest {
-            high
-        } else if let Some(value) = args.to_offset {
-            value.clamp(low, high)
-        } else if let Some(shift) = args.shift_by {
-            let current = committed
-                .as_ref()
-                .and_then(|offsets| offsets.find_partition(&args.topic, partition.id()))
-                .and_then(|partition| partition.offset().to_raw())
-                .filter(|offset| *offset >= 0);
-            shifted_offset(current, shift, low, high, partition.id())?
-        } else if args.to_current {
-            committed
-                .as_ref()
-                .and_then(|offsets| offsets.find_partition(&args.topic, partition.id()))
-                .and_then(|partition| partition.offset().to_raw())
-                .filter(|offset| *offset >= 0)
-                .ok_or_else(|| {
-                    Error::Usage(format!(
-                        "partition {} has no committed offset",
-                        partition.id()
-                    ))
-                })?
-        } else if timestamp_offsets.is_some() {
-            timestamp_offsets
-                .as_ref()
-                .and_then(|offsets| offsets.find_partition(&args.topic, partition.id()))
-                .and_then(|partition| partition.offset().to_raw())
-                .filter(|offset| *offset >= 0)
-                .unwrap_or(high)
-        } else {
-            return Err(Error::Usage("choose one reset target".into()));
-        };
-        println!("{}:{} -> {}", args.topic, partition.id(), target);
-        planned_offsets.push((args.topic.clone(), partition.id(), target));
+        Err(Error::Usage("choose one reset target".into()))
     }
-    if args.execute {
-        let admin = admin(&config)?;
-        ffi::alter_consumer_group_offsets(
-            admin.inner().native_ptr(),
-            &args.group,
-            &planned_offsets,
-            duration_ms(timeout)?,
-        )?;
-    }
-    Ok(())
+}
+
+fn committed_offset(
+    offsets: Option<&TopicPartitionList>,
+    topic: &str,
+    partition: i32,
+) -> Option<i64> {
+    offsets
+        .and_then(|offsets| offsets.find_partition(topic, partition))
+        .and_then(|partition| partition.offset().to_raw())
+        .filter(|offset| *offset >= 0)
 }
 
 fn parse_datetime_millis(value: &str) -> Result<i64> {

@@ -370,6 +370,20 @@ fn all_command_families_work_against_kafka_4_3_1() {
         described_offsets.contains("integration-events"),
         "unexpected group offsets output: {described_offsets}"
     );
+    let reset_all = success(
+        &bootstrap,
+        &[
+            "groups",
+            "reset-offsets",
+            "--all-groups",
+            "--all-topics",
+            "--to-earliest",
+            "--dry-run",
+        ],
+    );
+    assert!(reset_all.contains("GROUP"));
+    assert!(reset_all.contains("integration-suite"));
+    assert!(reset_all.contains("integration-events"));
     success(
         &bootstrap,
         &[

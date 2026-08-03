@@ -344,10 +344,22 @@ pub enum GroupAction {
     reason = "Kafka-compatible reset target flags are intentionally mutually exclusive"
 )]
 pub struct ResetOffsetsArgs {
+    #[arg(
+        long,
+        required_unless_present = "all_groups",
+        conflicts_with = "all_groups"
+    )]
+    pub group: Vec<String>,
     #[arg(long)]
-    pub group: String,
+    pub all_groups: bool,
+    #[arg(
+        long,
+        required_unless_present = "all_topics",
+        conflicts_with = "all_topics"
+    )]
+    pub topic: Vec<String>,
     #[arg(long)]
-    pub topic: String,
+    pub all_topics: bool,
     #[arg(long, conflicts_with_all = ["to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration"])]
     pub to_earliest: bool,
     #[arg(long, conflicts_with_all = ["to_earliest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration"])]
@@ -365,8 +377,11 @@ pub struct ResetOffsetsArgs {
     /// Reset by an ISO-8601 duration before now, for example PT1H30M.
     #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "to_datetime"])]
     pub by_duration: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dry_run")]
     pub execute: bool,
+    /// Preview the reset plan without changing committed offsets (the default).
+    #[arg(long, conflicts_with = "execute")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
