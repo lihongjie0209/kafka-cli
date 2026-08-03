@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `e3af5d9fdec24c09b3468bd37b4b2f5666aa0c68`。
+- 本项目基准：`master`，提交 `1dda0cfe48e09d5623522fffe3c9f654a8b2c287`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 94 个通过 | 87 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 96 个通过 | 89 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -54,7 +54,7 @@
 |---|---|---|---|
 | `kafka-topics.sh` | `kafka topics` | 已支持 | list、describe、create、alter、delete |
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 行输入、sync/async、key、JSON、headers、partition、reader config 及主要 producer 调优参数；未复刻可插拔 reader class |
-| `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config；未复刻 Java formatter/deserializer class |
+| `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config 和 StringDeserializer；未复刻任意 Java formatter/deserializer class 加载 |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；缺 bootstrap-controller |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
@@ -115,7 +115,7 @@
 
 已支持：topic 或整串 `--include` 正则、group、partition、offset、from-beginning、max-messages、`--timeout-ms` 空闲退出、read_committed/read_uncommitted isolation level、skip-message-on-error、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`，兼容脚本也接受废弃的 `--consumer.config`。默认 `DefaultMessageFormatter` 的 `--formatter-config` Java properties 文件、规范 `--formatter-property` 及旧名 `--property` 支持 print.timestamp、print.partition、print.offset、print.delivery、print.epoch、print.headers、print.key、print.value、key.separator、line.separator、headers.separator、null.literal；命令行 property 覆盖文件值，并直接写出消息原始 bytes。include 使用 librdkafka 的动态正则订阅（语法以 librdkafka/POSIX 能力为准）。未显式指定 group 时会生成 `console-consumer-*` 临时 group，并在用户没有配置 `enable.auto.commit` 时默认关闭自动提交；显式 group、配置文件 `group.id` 与命令行 property 的值必须一致。手工 partition 与 group 互斥；`--offset` 必须配合 partition，接受 `earliest`、`latest` 或非负整数，未指定时与原版一致使用 latest。`--from-beginning` 与显式 offset 互斥，并拒绝冲突的 `auto.offset.reset`；CLI isolation level 覆盖 properties，未提供 CLI 值时保留 property 或使用 read_uncommitted 默认值。
 
-原版 `--formatter org.apache.kafka.tools.consumer.DefaultMessageFormatter` 可显式传入；其他自定义 Java formatter class、key/value/headers deserializer 和 systest events 不支持。自定义 formatter 与 Java deserializer property 会明确返回 unsupported，而不是静默忽略；delivery/epoch 在 librdkafka 未暴露相应记录字段时输出原版的 `NOT_PRESENT`。其他底层 consumer 配置可通过 `--command-property` 传入。
+原版 `--formatter org.apache.kafka.tools.consumer.DefaultMessageFormatter` 可显式传入。`--key-deserializer`、`--value-deserializer` 以及 formatter property 中的 key/value/headers deserializer 已支持 Kafka `StringDeserializer`，包括 formatter property 覆盖 CLI class、UTF-8/UTF8 encoding 校验和非法 UTF-8 替换字符语义。其他自定义 Java formatter/deserializer class 和 systest events 不支持，并会明确返回 unsupported，而不是静默忽略；delivery/epoch 在 librdkafka 未暴露相应记录字段时输出原版的 `NOT_PRESENT`。其他底层 consumer 配置可通过 `--command-property` 传入。
 
 ### 4.4 Consumer Groups
 
@@ -209,7 +209,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。原生 `ka
 | 破坏性操作 | 不同工具行为不一致，部分交互确认 | 原生子命令多数先预览并要求 `--execute`；兼容入口保留原版立即执行动作，ACL remove 用 `--force` |
 | 动作语法 | 常见 `--list`、`--describe` flag | 原生子命令；兼容入口会改写部分旧 flag |
 | 配置文件 | Java properties | 支持 Java-compatible properties，并映射常见 librdkafka key |
-| Java 插件 | formatter、reader、deserializer 可加载类 | 不支持加载 Java 类 |
+| Java 插件 | formatter、reader、deserializer 可加载类 | 不加载 JVM 类；原生实现默认 reader/formatter 与 StringDeserializer |
 | 超时 | 各工具分别定义 | 全局 `--timeout-ms`，部分命令有原版语义差异 |
 
 JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理结果集和 mutation 结果均通过统一输出层生成，表格由 `comfy-table` 渲染，JSON 使用稳定 envelope。producer/consumer 的记录流、reset-offsets 的 CSV 导出，以及 consumer `--skip-message-on-error` 诊断仍有意使用 stdout/stderr 流，不属于表格结果集。项目当前不支持 YAML 输出。
@@ -232,7 +232,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：94 个通过（87 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：96 个通过（89 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -256,8 +256,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前实现基准 `e3af5d9` 已由 GitHub Actions 运行
-[`30835126268`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30835126268) 完整验证通过：fmt/Clippy/94 个普通测试、bundled glibc、Kafka 3.6.2、包含显式默认 `--line-reader`/`--formatter` class、console component properties 文件、producer 参数映射，以及 consumer 临时 group、不自动提交、命名 offset、group/partition 冲突校验和重复无 group 消费的 Kafka 4.3.1 实际闭环、x86_64 musl 和 aarch64 musl。Kafka 4 集成测试连续两次以无 group/from-beginning 消费同一消息，验证临时 group 不遗留提交状态；手工 partition 使用 `--offset earliest` 验证命名 offset。普通 CLI 测试会通过真实兼容符号链接启动二进制，并验证 configs `--alter` 会进入执行路径而非输出 PREVIEW；单元测试逐项覆盖默认 console class 接受与自定义 JVM class 拒绝、consumer 配置优先级和约束、producer 配置映射、配置文件合并、废弃配置别名、groups/configs/ACL/reassignment，以及 delete-records、leader-election、cluster unregister 的 mutation rewrite。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前实现基准 `1dda0cf` 已由 GitHub Actions 运行
+[`30835653961`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30835653961) 完整验证通过：fmt/Clippy/96 个普通测试、bundled glibc、Kafka 3.6.2、包含显式默认 `--line-reader`/`--formatter` class、key/value StringDeserializer、console component properties 文件、producer 参数映射，以及 consumer 临时 group、不自动提交、命名 offset、group/partition 冲突校验和重复无 group 消费的 Kafka 4.3.1 实际闭环、x86_64 musl 和 aarch64 musl。Kafka 4 集成测试连续两次以无 group/from-beginning 消费同一消息，验证临时 group 不遗留提交状态；手工 partition 使用 `--offset earliest` 验证命名 offset。普通 CLI 测试会通过真实兼容符号链接启动二进制，并验证 configs `--alter` 会进入执行路径而非输出 PREVIEW；单元测试逐项覆盖 StringDeserializer UTF-8 行为和配置优先级、默认 console class 接受与自定义 JVM class 拒绝、consumer 配置约束、producer 配置映射、配置文件合并、废弃配置别名、groups/configs/ACL/reassignment，以及 delete-records、leader-election、cluster unregister 的 mutation rewrite。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -361,6 +361,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-04 | Console producer 参数语义 | 修正 metadata-expiry 映射，新增 max-block 队列等待与 max-partition-memory 覆盖，compression-codec 无值默认 gzip；规范 reader/formatter property 名称并兼容 producer.config/consumer.config | 81 个单元测试、7 个 CLI 测试、Kafka 4.3.1 实际生产消费、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Console consumer 默认语义 | 无显式 group 时生成临时 group 并默认关闭自动提交；校验 group 来源一致性及 group/partition 冲突；offset 支持 earliest/latest/非负整数并要求 partition；对齐 from-beginning、auto.offset.reset 与 isolation 配置优先级 | 85 个单元测试、7 个 CLI 测试、Kafka 4.3.1 重复无 group 消费和命名 offset 闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Console component class 参数 | producer 接受原版默认 `--line-reader` 类名，consumer 接受原版默认 `--formatter` 类名；自定义 JVM class 改为可解析后明确 unsupported，不再作为未知参数失败 | 87 个单元测试、7 个 CLI 测试、Kafka 4.3.1 显式默认 class 生产消费闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
+| 2026-08-04 | Console StringDeserializer | 新增原版 key/value deserializer 参数；默认 formatter 原生支持 Kafka StringDeserializer 及 headers property，formatter property 覆盖 CLI，UTF-8 非法字节按 Java 语义替换；其他 JVM class 明确 unsupported | 89 个单元测试、7 个 CLI 测试、Kafka 4.3.1 StringDeserializer 生产消费闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
