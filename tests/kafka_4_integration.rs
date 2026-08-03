@@ -1105,11 +1105,51 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "configs",
             "alter",
             "--entity-type",
+            "ips",
+            "--entity-name",
+            "127.0.0.1",
+            "--add-config",
+            "connection_creation_rate=1001",
+            "--execute",
+        ],
+    );
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "ips",
+            "--entity-name",
+            "127.0.0.1",
+        ],
+        "1001",
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
             "broker-loggers",
             "--entity-name",
             "1",
             "--add-config",
             "kafka.server.KafkaApis=INFO",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "ips",
+            "--entity-name",
+            "127.0.0.1",
+            "--delete-config",
+            "connection_creation_rate",
             "--execute",
         ],
     );

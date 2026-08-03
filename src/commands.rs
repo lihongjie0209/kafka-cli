@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, Write},
+    net::ToSocketAddrs,
     path::Path,
     process,
     sync::atomic::{AtomicU64, Ordering},
@@ -2815,7 +2816,7 @@ async fn configs(
             all,
         } => {
             validate_config_entity_types(&entity_type)?;
-            validate_config_entity_names(&entity_type, &entity_name)?;
+            validate_config_entity_names(&entity_type, &entity_name, false)?;
             if quota_entity_types(&entity_type) {
                 return describe_quota_configs(
                     config,
@@ -2873,7 +2874,7 @@ async fn configs(
                 ));
             }
             validate_config_entity_types(&entity_type)?;
-            validate_config_entity_names(&entity_type, &entity_name)?;
+            validate_config_entity_names(&entity_type, &entity_name, true)?;
             validate_config_keys(&pairs)?;
             validate_quota_change_names(&entity_type, &pairs, &delete)?;
             if quota_entity_types(&entity_type) && !only_scram_changes(&pairs, &delete) {
@@ -2964,7 +2965,16 @@ fn validate_config_entity_types(types: &[ConfigEntityType]) -> Result<()> {
     Ok(())
 }
 
-fn validate_config_entity_names(types: &[ConfigEntityType], names: &[String]) -> Result<()> {
+fn validate_config_entity_names(
+    types: &[ConfigEntityType],
+    names: &[String],
+    altering: bool,
+) -> Result<()> {
+    if altering && names.iter().any(String::is_empty) {
+        return Err(Error::Usage(
+            "--entity-name cannot be empty with --alter; use --entity-default".into(),
+        ));
+    }
     if types.len() == 1
         && matches!(
             types[0],
@@ -2978,6 +2988,20 @@ fn validate_config_entity_names(types: &[ConfigEntityType], names: &[String]) ->
                     config_entity_type_name(types[0])
                 ))
             })?;
+        }
+    }
+    if types.len() == 1 && matches!(types[0], ConfigEntityType::Ip) {
+        for name in names.iter().filter(|name| !name.is_empty()) {
+            let mut addresses = (name.as_str(), 0).to_socket_addrs().map_err(|_| {
+                Error::Usage(format!(
+                    "the entity name for ips must be a valid IP or resolvable host: {name}"
+                ))
+            })?;
+            if addresses.next().is_none() {
+                return Err(Error::Usage(format!(
+                    "the entity name for ips must be a valid IP or resolvable host: {name}"
+                )));
+            }
         }
     }
     Ok(())
@@ -6693,9 +6717,42 @@ mod tests {
         assert!(matches!(
             validate_config_entity_names(
                 &[ConfigEntityType::BrokerLogger],
-                &["not-a-broker".into()]
+                &["not-a-broker".into()],
+                false,
             ),
             Err(Error::Usage(message)) if message.contains("integer broker ID")
+        ));
+    }
+
+    #[test]
+    fn config_ip_entity_name_should_accept_ip_literal() {
+        let result =
+            validate_config_entity_names(&[ConfigEntityType::Ip], &["127.0.0.1".into()], false);
+
+        assert!(result.is_ok(), "IP validation failed: {result:?}");
+    }
+
+    #[test]
+    fn config_ip_entity_name_should_reject_invalid_host() {
+        assert!(matches!(
+            validate_config_entity_names(
+                &[ConfigEntityType::Ip],
+                &["invalid host name with spaces".into()],
+                false,
+            ),
+            Err(Error::Usage(message)) if message.contains("valid IP or resolvable host")
+        ));
+    }
+
+    #[test]
+    fn config_alter_should_reject_empty_entity_name() {
+        assert!(matches!(
+            validate_config_entity_names(
+                &[ConfigEntityType::User],
+                &[String::new()],
+                true,
+            ),
+            Err(Error::Usage(message)) if message.contains("--entity-default")
         ));
     }
 
