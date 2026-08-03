@@ -524,7 +524,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .contains("integration-suite")
     );
     assert!(
-        success(&bootstrap, &["groups", "describe", "--all-groups"]).contains("integration-events")
+        success(&bootstrap, &["groups", "describe", "--all-groups"]).contains("integration-json")
     );
     assert!(
         success(
