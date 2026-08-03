@@ -2970,6 +2970,11 @@ fn validate_config_entity_names(
     names: &[String],
     altering: bool,
 ) -> Result<()> {
+    if !altering && types == [ConfigEntityType::BrokerLogger] && names.is_empty() {
+        return Err(Error::Usage(
+            "broker-logger describe requires --entity-name".into(),
+        ));
+    }
     if altering && names.iter().any(String::is_empty) {
         return Err(Error::Usage(
             "--entity-name cannot be empty with --alter; use --entity-default".into(),
@@ -6753,6 +6758,14 @@ mod tests {
                 true,
             ),
             Err(Error::Usage(message)) if message.contains("--entity-default")
+        ));
+    }
+
+    #[test]
+    fn config_broker_logger_describe_should_require_entity_name() {
+        assert!(matches!(
+            validate_config_entity_names(&[ConfigEntityType::BrokerLogger], &[], false),
+            Err(Error::Usage(message)) if message.contains("requires --entity-name")
         ));
     }
 
