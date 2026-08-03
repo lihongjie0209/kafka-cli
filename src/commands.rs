@@ -2896,6 +2896,10 @@ async fn protocol_config_broker(
     Ok((broker_id, format!("{}:{}", broker.host, broker.port)))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "request routing, protocol decoding, and structured output form one config operation"
+)]
 async fn describe_protocol_configs(
     bootstrap: &str,
     command_config: Option<&Path>,
@@ -2970,13 +2974,15 @@ async fn describe_protocol_configs(
             ));
         }
         rows.extend(resource.configs.into_iter().filter_map(|entry| {
-            (all || matches!(entry.config_source, 6 | 7)).then(|| ConfigDescriptionRow {
-                entity_type: config_entity_type_name(kind).into(),
-                entity_name: resource.resource_name.clone(),
-                name: entry.name,
-                value: entry.value,
-                source: entry.config_source.to_string(),
-                sensitive: entry.is_sensitive,
+            (all || protocol_dynamic_config_source(kind, entry.config_source)).then(|| {
+                ConfigDescriptionRow {
+                    entity_type: config_entity_type_name(kind).into(),
+                    entity_name: resource.resource_name.clone(),
+                    name: entry.name,
+                    value: entry.value,
+                    source: entry.config_source.to_string(),
+                    sensitive: entry.is_sensitive,
+                }
             })
         }));
     }
@@ -3002,6 +3008,15 @@ async fn describe_protocol_configs(
             }),
         )
     })
+}
+
+const fn protocol_dynamic_config_source(kind: ConfigEntityType, source: i8) -> bool {
+    matches!(
+        (kind, source),
+        (ConfigEntityType::Broker, 3)
+            | (ConfigEntityType::BrokerLogger, 6)
+            | (ConfigEntityType::ClientMetrics, 7)
+    )
 }
 
 #[expect(
