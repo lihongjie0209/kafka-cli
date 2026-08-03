@@ -273,6 +273,32 @@ fn kafka_console_share_consumer_alias_should_accept_original_options() {
 
 #[cfg(unix)]
 #[test]
+fn kafka_verifiable_share_consumer_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-verifiable-share-consumer.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create verifiable Share alias");
+
+    Command::new(alias)
+        .args([
+            "--topic",
+            "events",
+            "--group-id",
+            "workers",
+            "--acknowledgement-mode",
+            "sync",
+            "--ack-pattern",
+            "accept,reject",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--offset-reset-strategy"));
+}
+
+#[cfg(unix)]
+#[test]
 fn kafka_streams_groups_alias_should_accept_original_actions() {
     let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
     let binary = std::path::PathBuf::from(binary_command.get_program());

@@ -55,6 +55,7 @@ use crate::{
         ReassignAction, ResetOffsetsArgs, ShareConsumeArgs, ShareGroupAction,
         ShareGroupResetOffsetsArgs, StreamsApplicationResetArgs, StreamsGroupAction,
         StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
+        VerifiableAcknowledgementMode, VerifiableShareConsumerArgs,
     },
     config,
     error::{Error, Result},
@@ -156,6 +157,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 bootstrap,
                 command_config.as_deref(),
                 timeout,
+                args,
+            ))
+            .await
+        }
+        Command::VerifiableShareConsumer(args) => {
+            Box::pin(verifiable_share_consumer(
+                &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                verbose,
                 args,
             ))
             .await
@@ -1562,6 +1574,229 @@ async fn share_consume(
         println!("shutdown_complete");
     }
     run_result.map(|_| ()).and(close_result)
+}
+
+fn verifiable_event(name: &str, fields: serde_json::Value) -> serde_json::Value {
+    let mut event = serde_json::Map::new();
+    event.insert(
+        "timestamp".into(),
+        serde_json::Value::from(Utc::now().timestamp_millis()),
+    );
+    event.insert("name".into(), serde_json::Value::from(name));
+    if let serde_json::Value::Object(fields) = fields {
+        event.extend(fields);
+    }
+    serde_json::Value::Object(event)
+}
+
+fn parse_ack_pattern(value: Option<&str>) -> Result<Vec<ShareAcknowledgeType>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let pattern = value
+        .split(',')
+        .map(|item| match item.trim().to_ascii_lowercase().as_str() {
+            "accept" => Ok(ShareAcknowledgeType::Accept),
+            "release" => Ok(ShareAcknowledgeType::Release),
+            "reject" => Ok(ShareAcknowledgeType::Reject),
+            "renew" => Ok(ShareAcknowledgeType::Renew),
+            other => Err(Error::Usage(format!(
+                "invalid acknowledgement type '{other}'; expected accept, release, reject, or renew"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if pattern
+        .iter()
+        .all(|kind| *kind == ShareAcknowledgeType::Renew)
+    {
+        return Err(Error::Usage(
+            "--ack-pattern must contain at least one non-renew type".into(),
+        ));
+    }
+    Ok(pattern)
+}
+
+async fn verifiable_share_consumer(
+    rdkafka_config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    request_timeout: Duration,
+    verbose: bool,
+    args: VerifiableShareConsumerArgs,
+) -> Result<()> {
+    let pattern = parse_ack_pattern(args.ack_pattern.as_deref())?;
+    if !pattern.is_empty() && args.acknowledgement_mode == VerifiableAcknowledgementMode::Auto {
+        return Err(Error::Usage(
+            "--ack-pattern requires --acknowledgement-mode sync or async".into(),
+        ));
+    }
+    output::write_json_line(&verifiable_event("startup_complete", serde_json::json!({})))?;
+    if let Some(strategy) = args.offset_reset_strategy.as_deref() {
+        let admin = admin(rdkafka_config)?;
+        ffi::incremental_alter_config(
+            admin.inner().native_ptr(),
+            rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_GROUP,
+            &args.group_id,
+            &[("share.auto.offset.reset".into(), strategy.into())],
+            &[],
+            duration_ms(request_timeout)?,
+        )?;
+        output::write_json_line(&verifiable_event(
+            "offset_reset_strategy_set",
+            serde_json::json!({"offsetResetStrategy": strategy}),
+        ))?;
+    }
+
+    let properties = match command_config {
+        Some(path) => config::load_properties(path)?,
+        None => std::collections::HashMap::new(),
+    };
+    let mut builder = ShareConsumer::builder()
+        .bootstrap_servers(bootstrap)
+        .group_id(&args.group_id)
+        .client_id(
+            properties
+                .get("client.id")
+                .map_or("verifiable-share-consumer", String::as_str),
+        )
+        .acknowledgement_mode(if pattern.is_empty() {
+            AcknowledgementMode::Implicit
+        } else {
+            AcknowledgementMode::Explicit
+        })
+        .request_timeout(
+            share_duration_property(&properties, "request.timeout.ms")?.unwrap_or(request_timeout),
+        );
+    if let Some(auth) = config::protocol_auth(&properties)? {
+        builder = builder.auth(auth);
+    }
+    if let Some(max) = share_i32_property(&properties, "max.poll.records")?
+        .or_else(|| (args.max_messages > 0).then_some(args.max_messages))
+    {
+        builder = builder.max_poll_records(max);
+    }
+    let consumer = builder.build().await?;
+    consumer.subscribe(&[&args.topic]).await?;
+    let result = run_verifiable_share_consumer(&consumer, &args, &pattern, verbose).await;
+    let close_result = consumer.close().await.map_err(Error::from);
+    drop(consumer);
+    output::write_json_line(&verifiable_event(
+        "shutdown_complete",
+        serde_json::json!({}),
+    ))?;
+    result.and(close_result)
+}
+
+async fn run_verifiable_share_consumer(
+    consumer: &ShareConsumer,
+    args: &VerifiableShareConsumerArgs,
+    pattern: &[ShareAcknowledgeType],
+    verbose: bool,
+) -> Result<()> {
+    let mut total_acknowledged = 0_i64;
+    let mut renew_indices = BTreeMap::<(String, i32, i64), usize>::new();
+    while args.max_messages < 0 || total_acknowledged < i64::from(args.max_messages) {
+        let records = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                output::write_json_line(&verifiable_event("shutdown_requested", serde_json::json!({})))?;
+                break;
+            }
+            result = consumer.poll(Duration::from_secs(5)) => result?,
+        };
+        if records.is_empty() {
+            continue;
+        }
+        let mut partitions = BTreeMap::<(String, i32), BTreeSet<i64>>::new();
+        let mut ack_counts = BTreeMap::<String, i64>::new();
+        for record in &records {
+            partitions
+                .entry((record.topic.clone(), record.partition))
+                .or_default()
+                .insert(record.offset);
+            if verbose {
+                output::write_json_line(&verifiable_event(
+                    "record_data",
+                    serde_json::json!({
+                        "key": record.key.as_deref().map(|value| String::from_utf8_lossy(value).into_owned()),
+                        "value": record.value.as_deref().map(|value| String::from_utf8_lossy(value).into_owned()),
+                        "topic": record.topic,
+                        "partition": record.partition,
+                        "offset": record.offset,
+                    }),
+                ))?;
+            }
+            if !pattern.is_empty() {
+                let key = (record.topic.clone(), record.partition, record.offset);
+                let pattern_len = i64::try_from(pattern.len())
+                    .map_err(|_| Error::Usage("--ack-pattern is too long".into()))?;
+                let initial_index = usize::try_from(record.offset.rem_euclid(pattern_len))
+                    .map_err(|_| Error::Usage("acknowledgement pattern index overflow".into()))?;
+                let index = *renew_indices.entry(key.clone()).or_insert(initial_index);
+                let kind = pattern[index];
+                consumer.acknowledge(record, kind).await?;
+                let name = format!("{kind:?}").to_ascii_uppercase();
+                *ack_counts.entry(name).or_default() += 1;
+                if kind == ShareAcknowledgeType::Renew {
+                    renew_indices.insert(key, (index + 1) % pattern.len());
+                } else {
+                    renew_indices.remove(&key);
+                }
+            }
+        }
+        let summaries = verifiable_partition_summaries(&partitions);
+        output::write_json_line(&verifiable_event(
+            "records_consumed",
+            serde_json::json!({"count": records.len(), "partitions": summaries}),
+        ))?;
+        let commit = consumer.commit_sync().await;
+        let success = commit.is_ok();
+        let mut acknowledgement_fields = serde_json::Map::from_iter([
+            (
+                "count".into(),
+                serde_json::Value::from(if success { records.len() } else { 0 }),
+            ),
+            (
+                "partitions".into(),
+                if success {
+                    serde_json::Value::from(summaries)
+                } else {
+                    serde_json::Value::Array(Vec::new())
+                },
+            ),
+            ("success".into(), serde_json::Value::from(success)),
+        ]);
+        if let Err(error) = &commit {
+            acknowledgement_fields.insert("error".into(), error.to_string().into());
+        }
+        if !pattern.is_empty() && success {
+            acknowledgement_fields
+                .insert("ackTypeCounts".into(), serde_json::to_value(ack_counts)?);
+        }
+        output::write_json_line(&verifiable_event(
+            "offsets_acknowledged",
+            serde_json::Value::Object(acknowledgement_fields),
+        ))?;
+        commit?;
+        total_acknowledged += i64::try_from(records.len())
+            .map_err(|_| Error::Config("too many consumed records".into()))?;
+    }
+    Ok(())
+}
+
+fn verifiable_partition_summaries(
+    partitions: &BTreeMap<(String, i32), BTreeSet<i64>>,
+) -> Vec<serde_json::Value> {
+    partitions
+        .iter()
+        .map(|((topic, partition), offsets)| {
+            serde_json::json!({
+                "topic": topic,
+                "partition": partition,
+                "count": offsets.len(),
+                "offsets": offsets,
+            })
+        })
+        .collect()
 }
 
 async fn consume_share_records(
@@ -14251,6 +14486,35 @@ mod tests {
             share_i32_property(&properties, "max.poll.records"),
             Err(Error::Config(message)) if message.contains("max.poll.records")
         ));
+    }
+
+    #[test]
+    fn verifiable_share_ack_pattern_should_parse_and_reject_renew_only() {
+        assert_eq!(
+            parse_ack_pattern(Some("accept, release, reject, renew"))
+                .expect("valid acknowledgement pattern"),
+            [
+                ShareAcknowledgeType::Accept,
+                ShareAcknowledgeType::Release,
+                ShareAcknowledgeType::Reject,
+                ShareAcknowledgeType::Renew,
+            ]
+        );
+        assert!(matches!(
+            parse_ack_pattern(Some("renew,renew")),
+            Err(Error::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn verifiable_share_partition_summaries_should_be_sorted() {
+        let partitions = BTreeMap::from([
+            (("events".to_owned(), 1), BTreeSet::from([4, 2])),
+            (("events".to_owned(), 0), BTreeSet::from([3])),
+        ]);
+        let summaries = verifiable_partition_summaries(&partitions);
+        assert_eq!(summaries[0]["partition"], 0);
+        assert_eq!(summaries[1]["offsets"], serde_json::json!([2, 4]));
     }
 
     #[test]

@@ -758,6 +758,64 @@ fn all_command_families_work_against_kafka_4_3_1() {
     assert!(
         String::from_utf8_lossy(&share_output.stderr).contains("Processed a total of 1 messages")
     );
+    success(
+        &bootstrap,
+        &[
+            "topics",
+            "create",
+            "--topic",
+            "verifiable-share-events",
+            "--partitions",
+            "1",
+        ],
+    );
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
+            "verifiable-share-events",
+            "--sync",
+        ])
+        .write_stdin("verifiable-value\n")
+        .assert()
+        .success();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "verifiable-share-consumer",
+            "--topic",
+            "verifiable-share-events",
+            "--group-id",
+            "verifiable-share-integration",
+            "--max-messages",
+            "1",
+            "--verbose",
+            "--acknowledgement-mode",
+            "sync",
+            "--ack-pattern",
+            "accept",
+            "--offset-reset-strategy",
+            "earliest",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"startup_complete\""))
+        .stdout(predicate::str::contains(
+            "\"name\":\"offset_reset_strategy_set\"",
+        ))
+        .stdout(predicate::str::contains("\"name\":\"record_data\""))
+        .stdout(predicate::str::contains("verifiable-value"))
+        .stdout(predicate::str::contains("\"name\":\"records_consumed\""))
+        .stdout(predicate::str::contains(
+            "\"name\":\"offsets_acknowledged\"",
+        ))
+        .stdout(predicate::str::contains("\"ACCEPT\":1"))
+        .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""));
     assert!(
         success(
             &bootstrap,

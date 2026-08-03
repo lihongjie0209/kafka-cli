@@ -40,7 +40,8 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `consume`, `share-consume`, `groups`, `all-groups`,
+The binary exposes `topics`, `produce`, `consume`, `share-consume`,
+`verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
 `features`, `transactions`, `metadata-quorum`, and `delegation-tokens` command families. Run
@@ -73,6 +74,9 @@ explicit acknowledgements. Successful records can be accepted (default),
 released, or rejected, and formatter failures can be rejected without stopping
 the process. Its formatter and JSON modes share the regular console consumer's
 native output implementation.
+`verifiable-share-consumer` emits Kafka system-test compatible JSON Lines for
+startup, optional offset-reset configuration, records, acknowledgements and
+shutdown, including cyclic accept/release/reject/renew patterns.
 
 ## Authentication
 

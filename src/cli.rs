@@ -76,6 +76,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-console-producer" => Some("produce"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-console-share-consumer" => Some("share-consume"),
+        "kafka-verifiable-share-consumer" => Some("verifiable-share-consumer"),
         "kafka-consumer-groups" => Some("groups"),
         "kafka-groups" => Some("all-groups"),
         "kafka-share-groups" => Some("share-groups"),
@@ -298,6 +299,8 @@ pub enum Command {
     Consume(ConsumeArgs),
     /// Consume records through a Kafka Share group.
     ShareConsume(ShareConsumeArgs),
+    /// Emit Kafka system-test Share consumer events as JSON lines.
+    VerifiableShareConsumer(VerifiableShareConsumerArgs),
     /// Inspect and manage consumer groups.
     Groups(GroupsArgs),
     /// List groups of every Kafka group type.
@@ -944,6 +947,30 @@ impl ShareConsumeArgs {
             &self.properties
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum VerifiableAcknowledgementMode {
+    Auto,
+    Async,
+    Sync,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifiableShareConsumerArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long)]
+    pub group_id: String,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    pub max_messages: i32,
+    #[arg(long, value_enum, default_value_t = VerifiableAcknowledgementMode::Auto)]
+    pub acknowledgement_mode: VerifiableAcknowledgementMode,
+    /// Comma-separated accept, release, reject, or renew cycle.
+    #[arg(long)]
+    pub ack_pattern: Option<String>,
+    #[arg(long)]
+    pub offset_reset_strategy: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -2017,6 +2044,42 @@ mod tests {
                 "--release",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn verifiable_share_consumer_should_parse_original_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "verifiable-share-consumer",
+            "--topic",
+            "events",
+            "--group-id",
+            "workers",
+            "--max-messages",
+            "10",
+            "--verbose",
+            "--acknowledgement-mode",
+            "sync",
+            "--ack-pattern",
+            "accept,renew,reject",
+            "--offset-reset-strategy",
+            "by_duration:PT1H",
+        ])
+        .expect("verifiable Share consumer options");
+        let Command::VerifiableShareConsumer(args) = cli.command else {
+            panic!("expected verifiable-share-consumer command");
+        };
+        assert_eq!(args.group_id, "workers");
+        assert_eq!(args.max_messages, 10);
+        assert_eq!(cli.verbose, 1);
+        assert_eq!(
+            args.acknowledgement_mode,
+            VerifiableAcknowledgementMode::Sync
+        );
+        assert_eq!(
+            args.offset_reset_strategy.as_deref(),
+            Some("by_duration:PT1H")
         );
     }
 
