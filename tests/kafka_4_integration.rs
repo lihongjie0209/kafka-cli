@@ -587,7 +587,9 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--group",
             "integration-suite",
             "--topic",
-            "integration-events",
+            "integration-events:0",
+            "--topic",
+            "integration-json",
             "--execute",
         ],
     );

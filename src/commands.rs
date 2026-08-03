@@ -933,42 +933,89 @@ async fn groups(
             group,
             topic,
             execute,
-        } => {
-            let (topic_name, selected) = topic
-                .split_once(':')
-                .map_or((topic.as_str(), None), |(name, partitions)| {
-                    (name, Some(partitions))
-                });
-            let partitions = if let Some(selected) = selected {
-                parse_partitions(Some(selected))?.unwrap_or_default()
-            } else {
-                let metadata = base_consumer(config)?.fetch_metadata(Some(topic_name), timeout)?;
-                metadata
-                    .topics()
-                    .first()
-                    .ok_or_else(|| Error::Usage(format!("topic {topic_name} not found")))?
-                    .partitions()
-                    .iter()
-                    .map(rdkafka::metadata::MetadataPartition::id)
-                    .collect()
-            };
-            if !execute {
-                println!(
-                    "Would delete committed offsets for group {group}: {topic_name}:{}",
-                    csv_numbers(&partitions)
-                );
-                return Ok(());
-            }
-            let admin = admin(config)?;
-            crate::ffi::delete_group_offsets(
-                admin.inner().native_ptr(),
-                &group,
-                topic_name,
-                &partitions,
-                duration_ms(timeout)?,
-            )
-        }
+        } => delete_group_offsets_command(config, timeout, format, &group, &topic, execute),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteOffsetRow {
+    group: String,
+    topic: String,
+    partition: i32,
+}
+
+fn delete_group_offsets_command(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    format: OutputFormat,
+    group: &str,
+    topics: &[String],
+    execute: bool,
+) -> Result<()> {
+    let selections = resolve_topic_partition_selections(config, timeout, topics)?;
+    if !execute {
+        let rows = selections
+            .iter()
+            .flat_map(|(topic, partitions)| {
+                partitions.iter().map(|partition| DeleteOffsetRow {
+                    group: group.to_owned(),
+                    topic: topic.clone(),
+                    partition: *partition,
+                })
+            })
+            .collect::<Vec<_>>();
+        return output::write_value(format, "groups.delete-offsets.preview", &rows, |rows| {
+            output::table(
+                ["GROUP", "TOPIC", "PARTITION"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.topic.clone(),
+                        row.partition.to_string(),
+                    ]
+                }),
+            )
+        });
+    }
+    let admin = admin(config)?;
+    crate::ffi::delete_group_offsets(
+        admin.inner().native_ptr(),
+        group,
+        &selections,
+        duration_ms(timeout)?,
+    )
+}
+
+fn resolve_topic_partition_selections(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    values: &[String],
+) -> Result<Vec<(String, Vec<i32>)>> {
+    let selections = parse_reset_topics(values)?;
+    let consumer = base_consumer(config)?;
+    selections
+        .into_iter()
+        .map(|(topic, selected)| {
+            let metadata = consumer.fetch_metadata(Some(&topic), timeout)?;
+            let described = metadata
+                .topics()
+                .iter()
+                .find(|candidate| candidate.name() == topic && candidate.error().is_none())
+                .ok_or_else(|| Error::Usage(format!("topic {topic} not found")))?;
+            let existing = described
+                .partitions()
+                .iter()
+                .map(rdkafka::metadata::MetadataPartition::id)
+                .collect::<BTreeSet<_>>();
+            let partitions = selected.unwrap_or_else(|| existing.clone());
+            if let Some(missing) = partitions.difference(&existing).next() {
+                return Err(Error::Usage(format!(
+                    "partition {topic}:{missing} does not exist"
+                )));
+            }
+            Ok((topic, partitions.into_iter().collect()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]

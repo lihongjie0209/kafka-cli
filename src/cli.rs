@@ -370,8 +370,8 @@ pub enum GroupAction {
     DeleteOffsets {
         #[arg(long)]
         group: String,
-        #[arg(long)]
-        topic: String,
+        #[arg(long, required = true)]
+        topic: Vec<String>,
         #[arg(long)]
         execute: bool,
     },

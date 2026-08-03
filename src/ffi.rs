@@ -1950,23 +1950,29 @@ pub fn incremental_alter_config(
 pub fn delete_group_offsets(
     client: *mut sys::rd_kafka_t,
     group: &str,
-    topic: &str,
-    partitions: &[i32],
+    selections: &[(String, Vec<i32>)],
     timeout_ms: i32,
 ) -> Result<()> {
     let group =
         CString::new(group).map_err(|_| Error::Usage("group contains a NUL byte".into()))?;
-    let topic =
-        CString::new(topic).map_err(|_| Error::Usage("topic contains a NUL byte".into()))?;
-    let capacity =
-        i32::try_from(partitions.len()).map_err(|_| Error::Usage("too many partitions".into()))?;
+    let capacity = i32::try_from(
+        selections
+            .iter()
+            .map(|(_, values)| values.len())
+            .sum::<usize>(),
+    )
+    .map_err(|_| Error::Usage("too many partitions".into()))?;
     let list = unsafe { sys::rd_kafka_topic_partition_list_new(capacity) };
     if list.is_null() {
         return Err(Error::Config("failed to allocate partition list".into()));
     }
     let list = PartitionList(list);
-    for partition in partitions {
-        unsafe { sys::rd_kafka_topic_partition_list_add(list.0, topic.as_ptr(), *partition) };
+    for (topic, partitions) in selections {
+        let topic = CString::new(topic.as_str())
+            .map_err(|_| Error::Usage("topic contains a NUL byte".into()))?;
+        for partition in partitions {
+            unsafe { sys::rd_kafka_topic_partition_list_add(list.0, topic.as_ptr(), *partition) };
+        }
     }
     let request = unsafe { sys::rd_kafka_DeleteConsumerGroupOffsets_new(group.as_ptr(), list.0) };
     if request.is_null() {
