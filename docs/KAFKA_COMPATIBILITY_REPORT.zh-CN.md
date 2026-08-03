@@ -7,8 +7,9 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `d52e2a8637c8e9d12c960c32972acf1b08ef6cd5`。
+- 本项目审计实现基准：`master`，提交 `c60e0495b50c7b3f3ce90897cd0352023a868ed3`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 按本报告的功能口径，13 个兼容入口中 5 个达到核心功能“已支持”，8 个为“部分支持”；另有 31 个原版入口未支持。因此不能把 29.5% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
 - Connect、Share Group、Streams Group、事务、delegation token、metadata quorum、storage、性能测试、验证工具等原版工具尚未实现。
@@ -38,9 +39,10 @@
 | 维度 | 结果 | 解读 |
 |---|---:|---|
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
+| 入口功能评级 | 5 已支持 / 8 部分支持 / 31 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 140 个通过 | 133 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 143 个通过 | 136 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -151,6 +153,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 - SCRAM 预览只显示 mechanism 和 iterations，不回显 password。
 - alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON，而非手工文本。
 - `--delete-config` 按原版支持单次逗号分隔多个 key 并逐项 trim；重复实体类型、非整数 broker/broker-logger ID 以及 add-config 非法 key 字符会在任何 broker 请求前拒绝。
+- IP entity name 在 Admin 请求前按原版验证为合法 IP 或可解析主机名；alter 显式空 `--entity-name` 会拒绝并提示使用 `--entity-default`。
 - 原生子命令支持预览与 `--execute`；兼容脚本的原版 `--alter` 动作立即执行。
 
 缺少：bootstrap-controller。该模式不是把 controller 地址写进 `bootstrap.servers`：Java Admin 使用独立 controller bootstrap 模式；librdkafka 2.12 没有 `bootstrap.controllers`，而当前 krafka 初始化强制执行 broker Metadata 请求，因此两者都不能真实连接 controller listener，本项目不会提供无执行效果的占位参数。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
@@ -238,7 +241,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：140 个通过（133 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：143 个通过（136 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -262,8 +265,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前审计实现基准 `d52e2a8` 已由 GitHub Actions 运行
-[`30844224707`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30844224707) 完整验证通过：fmt/Clippy/140 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。Kafka 4.3.1 覆盖 ACL Match 查询、双 host 精确删除、三资源批量 add/list/remove、Group AlterConfigs，以及重复 add 返回 ALREADY_EXISTS 的幂等闭环。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前审计实现基准 `c60e049` 已由 GitHub Actions 运行
+[`30845027506`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30845027506) 完整验证通过：fmt/Clippy/143 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。Kafka 4.3.1 覆盖 ACL Match 查询、双 host 精确删除、三资源批量 add/list/remove、Group AlterConfigs、重复 ACL add 幂等闭环，以及命名 IP quota 的设置、查询、删除闭环。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -380,6 +383,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | AclCommand 批量资源语义复审 | topic/group/transactional-id 改为可重复资源选择；list 支持重复 principal 并在客户端精确过滤，对多个资源过滤器的重叠结果去重；资源、principal 和 host 按原版 trim/去重 | 127 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加三资源批量 add/list/remove 闭环 |
 | 2026-08-04 | AclCommand operation/resource 复审 | 直接对齐 Kafka `AclEntry.supportedOperations`；拒绝非法 resource-operation 组合和 consumer-only 的 cluster/transactional-id；TwoPhaseCommit/CreateTokens/DescribeTokens 明确标注 librdkafka 2.12 边界 | 131 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Group AlterConfigs 创建、查询、删除闭环 |
 | 2026-08-04 | AclCommand add 幂等语义复审 | 按 Kafka 原版在 CreateAcls 前逐资源查询完整 binding 集合，只提交缺失项；重复 operation/host 去重；全量已存在时不发 CreateAcls 并输出 ALREADY_EXISTS 计数 | 133 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加同一 ACL 连续执行两次的幂等闭环 |
+| 2026-08-04 | ConfigCommand entity name 复审 | IP entity 在请求前验证为合法 IP 或可解析主机名；alter 拒绝空 `--entity-name` 并要求显式使用 `--entity-default` | 136 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加命名 IP quota 设置→查询→删除闭环；CI `30845027506` 六项全绿 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
