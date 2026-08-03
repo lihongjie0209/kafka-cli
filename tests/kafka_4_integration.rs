@@ -996,6 +996,46 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "topic",
             "--entity-name",
             "integration-events",
+            "--add-config",
+            "cleanup.policy=[compact,delete],retention.ms=61000",
+            "--execute",
+        ],
+    );
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "topic",
+            "--entity-name",
+            "integration-events",
+        ],
+        "compact,delete",
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "topic",
+            "--entity-name",
+            "integration-events",
+            "--delete-config",
+            "cleanup.policy,retention.ms",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "topic",
+            "--entity-name",
+            "integration-events",
             "--add-config-file",
             topic_config_file.to_str().expect("fixture path"),
             "--execute",

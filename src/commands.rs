@@ -2871,7 +2871,7 @@ async fn configs(
                 pairs.sort_by(|left, right| left.0.cmp(&right.0));
                 pairs
             } else {
-                parse_pairs(&add)?
+                parse_config_additions(&add)?
             };
             if pairs.is_empty() && delete.is_empty() {
                 return Err(Error::Usage(
@@ -6610,6 +6610,87 @@ fn parse_pairs(values: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn parse_config_additions(values: &[String]) -> Result<Vec<(String, String)>> {
+    let mut configs = BTreeMap::new();
+    for value in values {
+        for entry in split_outside_brackets(value, ',')? {
+            let Some((key, value)) = split_once_outside_brackets(entry, '=')? else {
+                return Err(Error::Usage(
+                    "all configs must use key=value or key=[value1,value2]".into(),
+                ));
+            };
+            let key = key.trim();
+            let value = value.trim();
+            let value = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(value);
+            configs.insert(key.to_owned(), value.to_owned());
+        }
+    }
+    Ok(configs.into_iter().collect())
+}
+
+fn split_outside_brackets(value: &str, delimiter: char) -> Result<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut bracketed = false;
+    for (index, character) in value.char_indices() {
+        match character {
+            '[' if bracketed => {
+                return Err(Error::Usage(
+                    "nested config brackets are not supported".into(),
+                ));
+            }
+            '[' => bracketed = true,
+            ']' if !bracketed => {
+                return Err(Error::Usage("unmatched closing config bracket".into()));
+            }
+            ']' => bracketed = false,
+            _ if character == delimiter && !bracketed => {
+                parts.push(&value[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if bracketed {
+        return Err(Error::Usage("unclosed config bracket".into()));
+    }
+    parts.push(&value[start..]);
+    while parts.len() > 1 && parts.last().is_some_and(|part| part.is_empty()) {
+        parts.pop();
+    }
+    Ok(parts)
+}
+
+fn split_once_outside_brackets(value: &str, delimiter: char) -> Result<Option<(&str, &str)>> {
+    let mut bracketed = false;
+    for (index, character) in value.char_indices() {
+        match character {
+            '[' if bracketed => {
+                return Err(Error::Usage(
+                    "nested config brackets are not supported".into(),
+                ));
+            }
+            '[' => bracketed = true,
+            ']' if !bracketed => {
+                return Err(Error::Usage("unmatched closing config bracket".into()));
+            }
+            ']' => bracketed = false,
+            _ if character == delimiter && !bracketed => {
+                let next = index + character.len_utf8();
+                return Ok(Some((&value[..index], &value[next..])));
+            }
+            _ => {}
+        }
+    }
+    if bracketed {
+        return Err(Error::Usage("unclosed config bracket".into()));
+    }
+    Ok(None)
+}
+
 fn component_properties(
     path: Option<&Path>,
     inline: &[String],
@@ -6717,6 +6798,45 @@ mod tests {
     fn parse_pairs_should_retain_equals_in_value() {
         let pairs = parse_pairs(&["password=a=b".into()]).expect("valid pair");
         assert_eq!(pairs, [("password".into(), "a=b".into())]);
+    }
+
+    #[test]
+    fn config_additions_should_parse_grouped_comma_values() {
+        let pairs =
+            parse_config_additions(&["cleanup.policy=[compact,delete],retention.ms=1000".into()])
+                .expect("grouped config list");
+
+        assert_eq!(
+            pairs,
+            [
+                ("cleanup.policy".into(), "compact,delete".into()),
+                ("retention.ms".into(), "1000".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_additions_should_retain_equals_inside_grouped_value() {
+        let pairs = parse_config_additions(&["listener=[first=a,second=b]".into()])
+            .expect("equals in grouped config");
+
+        assert_eq!(pairs, [("listener".into(), "first=a,second=b".into())]);
+    }
+
+    #[test]
+    fn config_additions_should_reject_unclosed_bracket() {
+        assert!(matches!(
+            parse_config_additions(&["cleanup.policy=[compact,delete".into()]),
+            Err(Error::Usage(message)) if message.contains("unclosed")
+        ));
+    }
+
+    #[test]
+    fn config_additions_should_use_last_duplicate_value() {
+        let pairs = parse_config_additions(&["retention.ms=1,retention.ms=2".into()])
+            .expect("duplicate config keys");
+
+        assert_eq!(pairs, [("retention.ms".into(), "2".into())]);
     }
 
     #[test]
