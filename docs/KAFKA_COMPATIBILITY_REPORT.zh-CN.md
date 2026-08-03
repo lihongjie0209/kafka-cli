@@ -123,7 +123,7 @@
 - alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON/YAML，而非手工文本。
 - 预览与 `--execute`。
 
-缺少：普通 user quota、client、user/client 组合、IP、broker-logger、client-metrics、entity-default、bootstrap-controller。除 SCRAM credential 外，资源类型覆盖仍少于原版。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
+缺少：普通 user quota、client、user/client 组合、IP、broker-logger、client-metrics、entity-default、bootstrap-controller。除 SCRAM credential 外，资源类型覆盖仍少于原版。broker default entity 必须使用空 ConfigResource name，但 librdkafka 2.12 的 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时直接返回 NULL，因此不能通过该库表达。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
 
 ### 4.6 Get Offsets
 
