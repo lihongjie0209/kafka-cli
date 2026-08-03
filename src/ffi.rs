@@ -249,6 +249,18 @@ fn list_offset_spec_value(spec: ListOffsetSpec) -> i64 {
     }
 }
 
+fn ensure_supported_list_offset_spec(spec: ListOffsetSpec) -> Result<()> {
+    let name = match spec {
+        ListOffsetSpec::EarliestLocal => "earliest-local (-4)",
+        ListOffsetSpec::LatestTiered => "latest-tiered (-5)",
+        ListOffsetSpec::EarliestPendingUpload => "earliest-pending-upload (-6)",
+        _ => return Ok(()),
+    };
+    Err(Error::Config(format!(
+        "librdkafka 2.12 does not support the {name} ListOffsets query"
+    )))
+}
+
 /// Offset and timestamp returned for one topic partition.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ListOffsetEntry {
@@ -789,6 +801,7 @@ pub fn list_offsets(
     spec: ListOffsetSpec,
     timeout_ms: i32,
 ) -> Result<Vec<ListOffsetEntry>> {
+    ensure_supported_list_offset_spec(spec)?;
     let capacity =
         i32::try_from(targets.len()).map_err(|_| Error::Usage("too many offset targets".into()))?;
     let list = unsafe { sys::rd_kafka_topic_partition_list_new(capacity) };
@@ -2113,5 +2126,19 @@ mod tests {
             ],
             [-4, -5, -6]
         );
+    }
+
+    #[test]
+    fn tiered_list_offset_specs_should_report_librdkafka_boundary() {
+        for spec in [
+            ListOffsetSpec::EarliestLocal,
+            ListOffsetSpec::LatestTiered,
+            ListOffsetSpec::EarliestPendingUpload,
+        ] {
+            let error = ensure_supported_list_offset_spec(spec).expect_err("unsupported spec");
+            assert!(error.to_string().contains("librdkafka 2.12"));
+        }
+        ensure_supported_list_offset_spec(ListOffsetSpec::MaxTimestamp)
+            .expect("supported offset spec");
     }
 }
