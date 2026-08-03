@@ -1194,6 +1194,13 @@ fn reset_offsets(
     if groups.is_empty() {
         return Err(Error::Usage("no consumer groups matched".into()));
     }
+    if let Some(path) = args.from_file.as_deref() {
+        let rows = read_reset_plan(path, &groups, args.group.len() == 1, config, timeout)?;
+        if args.execute {
+            execute_reset_rows(config, timeout, &rows)?;
+        }
+        return write_reset_rows(format, &rows, args.export, args.group.len() == 1);
+    }
     let timestamp = if let Some(datetime) = args.to_datetime.as_deref() {
         Some(parse_datetime_millis(datetime)?)
     } else if let Some(duration) = args.by_duration.as_deref() {
@@ -1290,6 +1297,35 @@ fn reset_offsets(
             )?;
         }
     }
+    write_reset_rows(format, &rows, args.export, args.group.len() == 1)
+}
+
+fn write_reset_rows(
+    format: OutputFormat,
+    rows: &[ResetOffsetRow],
+    export: bool,
+    single_group: bool,
+) -> Result<()> {
+    if export {
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Vec::new());
+        for row in rows {
+            let result = if single_group {
+                writer.serialize((&row.topic, row.partition, row.new_offset))
+            } else {
+                writer.serialize((&row.group, &row.topic, row.partition, row.new_offset))
+            };
+            result.map_err(|error| Error::Usage(format!("cannot export reset CSV: {error}")))?;
+        }
+        let bytes = writer
+            .into_inner()
+            .map_err(|error| Error::Usage(format!("cannot finish reset CSV: {error}")))?;
+        let csv = String::from_utf8(bytes)
+            .map_err(|error| Error::Usage(format!("reset CSV is not UTF-8: {error}")))?;
+        print!("{csv}");
+        return Ok(());
+    }
     output::write_value(format, "groups.reset-offsets", &rows, |rows| {
         output::table(
             ["GROUP", "TOPIC", "PARTITION", "NEW_OFFSET"],
@@ -1311,6 +1347,112 @@ struct ResetOffsetRow {
     topic: String,
     partition: i32,
     new_offset: i64,
+}
+
+fn read_reset_plan(
+    path: &Path,
+    groups: &[String],
+    single_group: bool,
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+) -> Result<Vec<ResetOffsetRow>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(path)
+        .map_err(|error| Error::Usage(format!("cannot read reset CSV: {error}")))?;
+    let selected = groups.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let consumer = base_consumer(config)?;
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for (index, record) in reader.records().enumerate() {
+        let record = record.map_err(|error| {
+            Error::Usage(format!("invalid reset CSV line {}: {error}", index + 1))
+        })?;
+        let (group, topic, partition, requested) = if single_group && record.len() == 3 {
+            (
+                groups[0].clone(),
+                record[0].to_owned(),
+                parse_csv_number::<i32>(&record[1], index, "partition")?,
+                parse_csv_number::<i64>(&record[2], index, "offset")?,
+            )
+        } else if record.len() == 4 {
+            (
+                record[0].to_owned(),
+                record[1].to_owned(),
+                parse_csv_number::<i32>(&record[2], index, "partition")?,
+                parse_csv_number::<i64>(&record[3], index, "offset")?,
+            )
+        } else {
+            return Err(Error::Usage(format!(
+                "reset CSV line {} must contain {} columns",
+                index + 1,
+                if single_group { "3 or 4" } else { "4" }
+            )));
+        };
+        if !selected.contains(group.as_str()) {
+            return Err(Error::Usage(format!(
+                "reset CSV group {group} was not selected"
+            )));
+        }
+        if topic.is_empty() || partition < 0 || requested < 0 {
+            return Err(Error::Usage(format!(
+                "reset CSV line {} requires non-empty topic and non-negative partition/offset",
+                index + 1
+            )));
+        }
+        if !seen.insert((group.clone(), topic.clone(), partition)) {
+            return Err(Error::Usage(format!(
+                "duplicate reset CSV target {group}:{topic}:{partition}"
+            )));
+        }
+        let (low, high) = consumer.fetch_watermarks(&topic, partition, timeout)?;
+        rows.push(ResetOffsetRow {
+            group,
+            topic,
+            partition,
+            new_offset: requested.clamp(low, high),
+        });
+    }
+    if rows.is_empty() {
+        return Err(Error::Usage("reset CSV is empty".into()));
+    }
+    Ok(rows)
+}
+
+fn parse_csv_number<T>(value: &str, index: usize, name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| Error::Usage(format!("invalid {name} on reset CSV line {}", index + 1)))
+}
+
+fn execute_reset_rows(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    rows: &[ResetOffsetRow],
+) -> Result<()> {
+    let admin = admin(config)?;
+    for (group, rows) in &rows.iter().fold(
+        BTreeMap::<&str, Vec<(String, i32, i64)>>::new(),
+        |mut groups, row| {
+            groups.entry(&row.group).or_default().push((
+                row.topic.clone(),
+                row.partition,
+                row.new_offset,
+            ));
+            groups
+        },
+    ) {
+        ffi::alter_consumer_group_offsets(
+            admin.inner().native_ptr(),
+            group,
+            rows,
+            duration_ms(timeout)?,
+        )?;
+    }
+    Ok(())
 }
 
 fn reset_target(

@@ -354,29 +354,35 @@ pub struct ResetOffsetsArgs {
     pub all_groups: bool,
     #[arg(
         long,
-        required_unless_present = "all_topics",
+        required_unless_present_any = ["all_topics", "from_file"],
         conflicts_with = "all_topics"
     )]
     pub topic: Vec<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "from_file")]
     pub all_topics: bool,
-    #[arg(long, conflicts_with_all = ["to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration"])]
+    #[arg(long, conflicts_with_all = ["to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration", "from_file"])]
     pub to_earliest: bool,
-    #[arg(long, conflicts_with_all = ["to_earliest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration"])]
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration", "from_file"])]
     pub to_latest: bool,
-    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "shift_by", "to_current", "to_datetime", "by_duration"])]
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "shift_by", "to_current", "to_datetime", "by_duration", "from_file"])]
     pub to_offset: Option<i64>,
-    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_current", "to_datetime", "by_duration"])]
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_current", "to_datetime", "by_duration", "from_file"])]
     pub shift_by: Option<i64>,
     /// Keep each partition at its currently committed offset.
-    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_datetime", "by_duration"])]
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_datetime", "by_duration", "from_file"])]
     pub to_current: bool,
     /// Reset to offsets at an RFC 3339 or YYYY-MM-DDTHH:MM:SS.sss UTC datetime.
-    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "by_duration"])]
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "by_duration", "from_file"])]
     pub to_datetime: Option<String>,
     /// Reset by an ISO-8601 duration before now, for example PT1H30M.
-    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "to_datetime"])]
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "from_file"])]
     pub by_duration: Option<String>,
+    /// Import Kafka's headerless topic,partition,offset or group,topic,partition,offset CSV.
+    #[arg(long, conflicts_with_all = ["topic", "all_topics"])]
+    pub from_file: Option<PathBuf>,
+    /// Export the planned offsets using Kafka's headerless CSV format.
+    #[arg(long)]
+    pub export: bool,
     #[arg(long, conflicts_with = "dry_run")]
     pub execute: bool,
     /// Preview the reset plan without changing committed offsets (the default).
@@ -665,6 +671,16 @@ mod tests {
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");
     parses_command_family!(consume_family_parses, "consume", "--topic", "events");
     parses_command_family!(groups_family_parses, "groups", "list");
+    parses_command_family!(
+        groups_reset_from_file_parses,
+        "groups",
+        "reset-offsets",
+        "--group",
+        "payments",
+        "--from-file",
+        "reset.csv",
+        "--export"
+    );
     parses_command_family!(
         configs_family_parses,
         "configs",

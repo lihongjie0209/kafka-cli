@@ -58,6 +58,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let topics_file = fixture.path().join("topics.json");
     let reassignment_file = fixture.path().join("reassignment.json");
     let election_file = fixture.path().join("election.json");
+    let reset_file = fixture.path().join("reset.csv");
     fs::write(
         &delete_file,
         r#"{"partitions":[{"topic":"integration-events","partition":0,"offset":1}]}"#,
@@ -399,6 +400,42 @@ fn all_command_families_work_against_kafka_4_3_1() {
         described_offsets.contains("integration-events"),
         "unexpected group offsets output: {described_offsets}"
     );
+    let exported_reset = success(
+        &bootstrap,
+        &[
+            "groups",
+            "reset-offsets",
+            "--group",
+            "integration-suite",
+            "--topic",
+            "integration-events",
+            "--to-earliest",
+            "--export",
+        ],
+    );
+    assert_eq!(
+        exported_reset
+            .lines()
+            .next()
+            .expect("exported reset row")
+            .split(',')
+            .count(),
+        3
+    );
+    fs::write(&reset_file, &exported_reset).expect("reset CSV fixture");
+    let imported_reset = success(
+        &bootstrap,
+        &[
+            "groups",
+            "reset-offsets",
+            "--group",
+            "integration-suite",
+            "--from-file",
+            reset_file.to_str().expect("fixture path"),
+            "--execute",
+        ],
+    );
+    assert!(imported_reset.contains("integration-events"));
     let reset_all = success(
         &bootstrap,
         &[
