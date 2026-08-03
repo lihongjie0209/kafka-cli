@@ -39,7 +39,8 @@ compatibility.
 
 The binary exposes `topics`, `produce`, `consume`, `groups`, `configs`,
 `offsets`, `acls`, `reassign`, `delete-records`, `leader-election`, `log-dirs`,
-`api-versions`, `cluster`, `client-metrics`, `features`, and `transactions` command families. Run
+`api-versions`, `cluster`, `client-metrics`, `features`, `transactions`, and
+`metadata-quorum` command families. Run
 `kafka <command> --help` for details.
 
 Topic administration, production, consumption, group discovery/reset, topic,
