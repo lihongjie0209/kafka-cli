@@ -42,7 +42,7 @@
 | 入口功能评级 | 5 已支持 / 8 部分支持 / 31 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 162 个通过 | 155 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 163 个通过 | 156 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -167,7 +167,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 
 已支持：topic 正则、`topic:partition`、闭区间与开放区间 partition 范围、多个 pattern、exclude-internal、earliest/`-2`、latest/`-1`、max-timestamp/`-3`、Unix 毫秒 timestamp。pattern 与 partition 列表已对齐 Java `String.split` 丢弃末尾空项的语义；请求固定覆盖 `client.id=GetOffsetShell`。所有查询统一通过 librdkafka `ListOffsets` Admin API，逐 partition 错误不会中断其他结果，未知 offset `-1` 与原版一样不输出；结果包含 offset、broker timestamp 和错误列。
 
-部分支持：earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` 已按原版名称和数字别名解析，但 librdkafka 2.12.1 的公开 ListOffsets Admin API 只定义到 `-3`，且内部拒绝小于 `-3` 的 offset，因此执行时返回明确的能力错误，不虚报查询成功。输出采用统一 `comfy-table` 表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
+earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` 也已支持：librdkafka 2.12.1 的公开 ListOffsets Admin API 会拒绝小于 `-3` 的 offset，因此这三个 sentinel 使用协议客户端的 ListOffsets v11 fallback，并保留逐 partition 错误。常规 OffsetSpec 继续使用 librdkafka。输出采用统一 `comfy-table` 表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
 
 ### 4.7 ACLs
 
@@ -234,7 +234,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现。
 2. `rdkafka-sys`：只包装 `rdkafka` 尚未暴露的 librdkafka Admin API，例如 leader election、部分 group offset/config API。
-3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
+3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
 
 认证审计发现，`krafka 0.14.0` 的内部 transport 具备 SCRAM-over-TLS，但公开 `AuthConfig` API 不能从 Kafka properties 构造“SCRAM + 自定义 TLS 配置”；本项目因此不会通过访问私有字段伪装支持。当前独立协议路径明确支持 PLAINTEXT、SSL、SASL_PLAINTEXT 的 PLAIN/SCRAM 和 SASL_SSL 的 PLAIN；SASL_SSL + SCRAM 仍是已知缺口。librdkafka 路径不受此限制。
 
@@ -246,7 +246,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：162 个通过（155 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：163 个通过（156 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -288,8 +288,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 1. Configs 增加 bootstrap-controller；broker default entity 已实现并完成 Kafka 4 回归验证。
 2. Reassignment 增加 bootstrap-controller，并补多 broker 长时间迁移的限流差分测试。
-3. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
-4. 若 librdkafka 后续暴露对应 Admin option，将 Topics 已接受的 `partition-size-limit-per-response` 下推为实际单响应 partition 上限。
+3. 若 librdkafka 后续暴露对应 Admin option，将 Topics 已接受的 `partition-size-limit-per-response` 下推为实际单响应 partition 上限。
 
 ### P2：扩大原版工具覆盖面
 
@@ -320,7 +319,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | console-consumer | 单动作 | 中 | 中/高 | group、commit、offset 与配置优先级已对齐；不替代 formatter/deserializer 插件体系 |
 | consumer-groups | 完整 | 高 | 高/中 | reset、Kafka 4.4 state filter 及 verbose consumer protocol epoch 列已对齐；协议 fallback 鉴权矩阵仍需扩充 |
 | configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 bootstrap-controller |
-| get-offsets | 单动作 | 高 | 中 | 常用查询和过滤语义较完整；分层存储 OffsetSpec 可解析但受 librdkafka 2.12 执行能力限制 |
+| get-offsets | 单动作 | 高 | 高/中 | 普通及分层存储 OffsetSpec、过滤与逐 partition 错误语义均已实现；结构化输出格式不同 |
 | acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
 | reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；仍缺 controller |
 | delete-records | 单动作 | 高 | 高 | 核心功能完整；兼容脚本立即执行，原生入口保留预览保护 |
@@ -397,6 +396,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | ConsumerGroup verbose epoch | state verbose 合并 group/target assignment epoch，members verbose 合并 member/target epoch；librdkafka 继续提供 coordinator、assignment 与成员主体，协议结果只补缺失字段 | 151 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 state/members verbose 列断言；CI `30848663059` 六项全绿 |
 | 2026-08-04 | ConsumerGroup migration member | ConsumerGroupDescribe member type 映射为三态 upgraded；仅当同一 group 同时存在 classic 与 consumer protocol 成员时，verbose members 按原版增加 `UPGRADED` 列 | 153 个单元测试、7 个 CLI 测试；迁移组动态列与 unknown 边界由单元测试覆盖；CI `30849285517` 六项全绿 |
 | 2026-08-04 | Console Consumer leader epoch | DefaultMessageFormatter `print.epoch` 从固定 `NOT_PRESENT` 改为调用公开 librdkafka message leader epoch API；负 sentinel 仍映射为原版缺失值 | 155 个单元测试、7 个 CLI 测试；Kafka 4.3.1 formatter 数据闭环新增非 `NOT_PRESENT` epoch 断言；CI `30849763389` 六项全绿 |
+| 2026-08-04 | Get Offsets tiered specs | `-4/-5/-6` 从解析后能力错误升级为 ListOffsets v11 协议 fallback；普通 spec 保持 librdkafka，逐 partition error/unknown offset 语义保持一致 | 156 个单元测试、7 个 CLI 测试；Kafka 4.3.1 实际请求 earliest-local/latest-tiered/earliest-pending-upload |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
@@ -424,6 +424,6 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 以下 Kafka 原版能力在 librdkafka 2.12 中没有对应 C API，因此不属于本轮可实现集合：partition reassignment、describe/alter log dirs、API version 明细、unregister broker、client quota、broker logger/client metrics config resource、metadata quorum、feature update、transaction listing/abort、delegation token、share/streams group Admin API。项目现有少数同名功能仍由 `krafka` 实现，报告不会把它们误记为 librdkafka 路径。
 
-此外，已通过实际 Kafka 4.3.1 测试确认 broker default config 无法用 librdkafka 表达：Kafka 要求空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在空 name 时返回 NULL。Get Offsets 的 `-4/-5/-6`、consumer group epoch、Kafka 4.4 consumer-groups 的 Assigning/Reconciling state、fenced broker inclusion、Kafka 4.4 user-principal ACL resource 和 Delegation Token ACL resource 也未由当前版本暴露；其中 consumer protocol epoch 和 Assigning/Reconciling 已通过 ConsumerGroupDescribe/ListGroups v5 补齐，fenced broker inclusion 已通过独立 DescribeCluster v2 协议路径补齐。
+此外，已通过实际 Kafka 4.3.1 测试确认 broker default config 无法用 librdkafka 表达：Kafka 要求空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在空 name 时返回 NULL。Get Offsets 的 `-4/-5/-6`、consumer group epoch、Kafka 4.4 consumer-groups 的 Assigning/Reconciling state、fenced broker inclusion、Kafka 4.4 user-principal ACL resource 和 Delegation Token ACL resource 也未由当前版本暴露；其中 tiered OffsetSpec 已通过 ListOffsets v11 补齐，consumer protocol epoch 和 Assigning/Reconciling 已通过 ConsumerGroupDescribe/ListGroups v5 补齐，fenced broker inclusion 已通过独立 DescribeCluster v2 协议路径补齐。
 
 结论：以 librdkafka 2.12 的公开 Admin operation 枚举为边界，除已被增量 API 取代的旧 AlterConfigs 外，当前所有 operation 均已有实际 CLI 调用与测试路径。后续剩余差距需要升级 librdkafka、继续使用独立协议客户端，或属于 Java 插件/服务进程而非 librdkafka 客户端能力。

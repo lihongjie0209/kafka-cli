@@ -122,7 +122,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
             ))
             .await
         }
-        Command::Offsets(args) => offsets(&client_config, timeout, format, &args),
+        Command::Offsets(args) => {
+            offsets(
+                &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                &args,
+            )
+            .await
+        }
         Command::DeleteRecords(args) => {
             delete_records(
                 &client_config,
@@ -4474,8 +4484,10 @@ const fn scram_mechanism_name(value: ffi::ScramMechanism) -> &'static str {
     }
 }
 
-fn offsets(
+async fn offsets(
     config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
     args: &crate::cli::OffsetsArgs,
@@ -4542,13 +4554,17 @@ fn offsets(
             OffsetTime::EarliestPendingUpload => ffi::ListOffsetSpec::EarliestPendingUpload,
         }
     };
-    let client = admin(&config)?;
-    let rows = ffi::list_offsets(
-        client.inner().native_ptr(),
-        &targets,
-        spec,
-        duration_ms(timeout)?,
-    )?;
+    let rows = if let Some(timestamp) = tiered_offset_timestamp(spec) {
+        protocol_list_offsets(bootstrap, command_config, timeout, &targets, timestamp).await?
+    } else {
+        let client = admin(&config)?;
+        ffi::list_offsets(
+            client.inner().native_ptr(),
+            &targets,
+            spec,
+            duration_ms(timeout)?,
+        )?
+    };
     output::write_value(format, "offsets", &rows, |rows| {
         output::table(
             ["TOPIC", "PARTITION", "OFFSET", "TIMESTAMP", "ERROR"],
@@ -4565,6 +4581,61 @@ fn offsets(
             }),
         )
     })
+}
+
+const fn tiered_offset_timestamp(spec: ffi::ListOffsetSpec) -> Option<i64> {
+    match spec {
+        ffi::ListOffsetSpec::EarliestLocal => Some(-4),
+        ffi::ListOffsetSpec::LatestTiered => Some(-5),
+        ffi::ListOffsetSpec::EarliestPendingUpload => Some(-6),
+        _ => None,
+    }
+}
+
+async fn protocol_list_offsets(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    targets: &[(String, i32)],
+    timestamp: i64,
+) -> Result<Vec<ffi::ListOffsetEntry>> {
+    let mut grouped = BTreeMap::<&str, Vec<i32>>::new();
+    for (topic, partition) in targets {
+        grouped.entry(topic).or_default().push(*partition);
+    }
+    let topic_partitions = grouped
+        .iter()
+        .map(|(topic, partitions)| (*topic, partitions.as_slice()))
+        .collect::<Vec<_>>();
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let results = client
+        .list_offsets(
+            &topic_partitions,
+            krafka::admin::OffsetSpec::Timestamp(timestamp),
+        )
+        .await?;
+    drop(client);
+    let mut rows = results
+        .into_iter()
+        .filter_map(|result| {
+            if result.offset == -1 && result.error.is_none() {
+                return None;
+            }
+            Some(ffi::ListOffsetEntry {
+                topic: result.topic,
+                partition: result.partition,
+                offset: (result.offset >= 0).then_some(result.offset),
+                timestamp: (result.timestamp >= 0).then_some(result.timestamp),
+                error: result.error,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.topic
+            .cmp(&right.topic)
+            .then(left.partition.cmp(&right.partition))
+    });
+    Ok(rows)
 }
 
 fn offsets_client_config(config: &rdkafka::ClientConfig) -> rdkafka::ClientConfig {
@@ -7501,6 +7572,18 @@ mod tests {
         assert_eq!(
             offsets_client_config(&config).get("client.id"),
             Some("GetOffsetShell")
+        );
+    }
+
+    #[test]
+    fn tiered_offset_timestamp_should_match_kafka_protocol_sentinels() {
+        assert_eq!(
+            [
+                tiered_offset_timestamp(ffi::ListOffsetSpec::EarliestLocal),
+                tiered_offset_timestamp(ffi::ListOffsetSpec::LatestTiered),
+                tiered_offset_timestamp(ffi::ListOffsetSpec::EarliestPendingUpload),
+            ],
+            [Some(-4), Some(-5), Some(-6)]
         );
     }
 

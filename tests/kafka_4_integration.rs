@@ -1444,14 +1444,23 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("integration-events")
     );
-    for time in ["earliest-local", "latest-tiered", "earliest-pending-upload"] {
-        let output = kafka(
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "offsets",
+                "--topic",
+                "integration-events",
+                "--time",
+                "earliest-local",
+            ]
+        )
+        .contains("integration-events")
+    );
+    for time in ["latest-tiered", "earliest-pending-upload"] {
+        success(
             &bootstrap,
             &["offsets", "--topic", "integration-events", "--time", time],
-        );
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("librdkafka 2.12 does not support")
         );
     }
 
