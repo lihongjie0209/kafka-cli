@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `3a461c98b92577c8650ab2e4395057bc9c164891`。
+- 本项目基准：`master`，提交 `ddd0c11c4cae750d4cd57187213f672134cd3960`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 116 个通过 | 109 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 122 个通过 | 115 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -57,7 +57,7 @@
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config 和 StringDeserializer；未复刻任意 Java formatter/deserializer class 加载 |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；缺 bootstrap-controller |
-| `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
+| `kafka-get-offsets.sh` | `kafka offsets` | 部分支持 | librdkafka ListOffsets；过滤语义及常用 OffsetSpec 已对齐；`-4/-5/-6` 可解析但受 librdkafka 2.12 限制 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流/安全参数及 verify/cancel throttle 生命周期；缺 controller 模式 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件；原生入口支持预览，兼容脚本按原版立即执行 |
@@ -156,9 +156,9 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 
 ### 4.6 Get Offsets
 
-已支持：topic 正则、`topic:partition`、闭区间与开放区间 partition 范围、多个 pattern、exclude-internal、earliest/`-2`、latest/`-1`、max-timestamp/`-3`、Unix 毫秒 timestamp。所有查询统一通过 librdkafka `ListOffsets` Admin API，结果包含 offset 与 broker 返回的 timestamp。
+已支持：topic 正则、`topic:partition`、闭区间与开放区间 partition 范围、多个 pattern、exclude-internal、earliest/`-2`、latest/`-1`、max-timestamp/`-3`、Unix 毫秒 timestamp。pattern 与 partition 列表已对齐 Java `String.split` 丢弃末尾空项的语义；请求固定覆盖 `client.id=GetOffsetShell`。所有查询统一通过 librdkafka `ListOffsets` Admin API，逐 partition 错误不会中断其他结果，未知 offset `-1` 与原版一样不输出；结果包含 offset、broker timestamp 和错误列。
 
-缺少：librdkafka 2.12 尚未提供 Kafka 新版本的 earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` OffsetSpec。输出采用统一表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
+部分支持：earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` 已按原版名称和数字别名解析，但 librdkafka 2.12.1 的公开 ListOffsets Admin API 只定义到 `-3`，且内部拒绝小于 `-3` 的 offset，因此执行时返回明确的能力错误，不虚报查询成功。输出采用统一 `comfy-table` 表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
 
 ### 4.7 ACLs
 
@@ -236,7 +236,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：116 个通过（109 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：122 个通过（115 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -260,8 +260,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前实现基准 `3a461c9` 已由 GitHub Actions 运行
-[`30838874991`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30838874991) 完整验证通过：fmt/Clippy/116 个普通测试、bundled glibc、Kafka 3.6.2、包含 broker 默认 3 partitions、正则批量 alter、topic ID 优先级、describe if-exists、config/replication 输出的 Kafka 4.3.1 实际闭环、x86_64 musl 和 aarch64 musl。此前覆盖的 console 配置与边界语义均持续回归通过。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前实现基准 `ddd0c11` 已由 GitHub Actions 运行
+[`30839932685`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30839932685) 完整验证通过：fmt/Clippy/122 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。GetOffsetShell 的 client ID、Java 列表拆分、未知 offset 和 librdkafka 分层存储 OffsetSpec 能力边界均纳入回归；此前 topics、console 与配置闭环持续通过。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -310,7 +310,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | console-consumer | 单动作 | 中 | 中/高 | group、commit、offset 与配置优先级已对齐；不替代 formatter/deserializer 插件体系 |
 | consumer-groups | 完整 | 高 | 高/中 | reset 已对齐 inactive group、空 group、重复 selector 和结构化批量输出；epoch 列仍受 librdkafka 限制 |
 | configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 bootstrap-controller |
-| get-offsets | 单动作 | 高 | 中 | 查询能力较完整，缺分层存储相关 OffsetSpec |
+| get-offsets | 单动作 | 高 | 中 | 常用查询和过滤语义较完整；分层存储 OffsetSpec 可解析但受 librdkafka 2.12 执行能力限制 |
 | acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
 | reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；仍缺 controller |
 | delete-records | 单动作 | 高 | 高 | 核心功能完整；兼容脚本立即执行，原生入口保留预览保护 |
@@ -370,6 +370,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | Console producer 配置优先级与默认值 | 对齐“显式 CLI > command property/config > 原版脚本默认值”；补齐 acks、batch、retries、backoff、linger、timeout、buffer、client id 等默认值，并将 Java `buffer.memory`、`send.buffer.bytes`、`max.block.ms` 转换为 librdkafka/本地语义 | 91 个单元测试、7 个 CLI 测试、Kafka 4.3.1 property 与显式参数优先级生产闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Console 参数互斥与消费边界 | 废弃/current producer、consumer、reader、formatter property 组合按原版互斥；config 文件旧名与新名继续互斥；修复全局 30 秒超时误注入 consumer，并对齐 max-messages 0/-1 和负 timeout 语义 | 100 个单元测试、7 个 CLI 测试、Kafka 4.3.1 零消息退出、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Topics 参数与结果语义 | create partition/replication 均支持 broker 默认并严格互斥手工 assignment；按动作拆分参数；alter 支持正则批量；describe 补齐 ID 优先级、if-exists、配置与 replication factor，并接受 partition-size 兼容参数 | 109 个单元测试、7 个 CLI 测试、Kafka 4.3.1 broker 默认 3 partitions/正则 alter/ID/config 闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
+| 2026-08-04 | GetOffsetShell 二次语义审计 | 对齐固定 client ID、Java 末尾空 token、逐 partition 错误和未知 offset；补齐 `-4/-5/-6` 解析，并对 librdkafka 2.12 的执行限制返回明确错误 | 115 个单元测试、7 个 CLI 测试、Kafka 3.6.2/4.3.1、bundled glibc 及双 musl CI 全部通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
