@@ -1477,6 +1477,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
     );
     assert!(success(&bootstrap, &["cluster", "id"]).contains("CLUSTER_ID"));
     assert!(success(&bootstrap, &["cluster", "list-endpoints"]).contains("127.0.0.1"));
+    let fenced_endpoints = success(
+        &bootstrap,
+        &["cluster", "list-endpoints", "--include-fenced-brokers"],
+    );
+    assert!(fenced_endpoints.contains("STATE"));
+    assert!(fenced_endpoints.contains("unfenced"));
     let unregister_preview: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &["--output", "json", "cluster", "unregister", "--id", "999"],

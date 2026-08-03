@@ -701,7 +701,11 @@ pub struct ClusterArgs {
 #[derive(Debug, Subcommand)]
 pub enum ClusterAction {
     Id,
-    ListEndpoints,
+    ListEndpoints {
+        /// Include fenced brokers in the endpoint listing (Kafka 4.1+).
+        #[arg(long)]
+        include_fenced_brokers: bool,
+    },
     ApiVersions,
     Unregister {
         #[arg(long)]
@@ -855,4 +859,11 @@ mod tests {
     parses_command_family!(log_dirs_family_parses, "log-dirs");
     parses_command_family!(api_versions_family_parses, "api-versions");
     parses_command_family!(cluster_family_parses, "cluster", "id");
+
+    parses_command_family!(
+        cluster_fenced_endpoints_parses,
+        "cluster",
+        "list-endpoints",
+        "--include-fenced-brokers"
+    );
 }

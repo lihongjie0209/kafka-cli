@@ -11,10 +11,11 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
 use krafka::protocol::{
     AlterConfigOp, AlterableConfig, ApiKey, ConfigResourceType as ProtocolConfigResourceType,
-    Decode, DescribableLogDirTopic, DescribeConfigsRequest, DescribeConfigsResource,
-    IncrementalAlterConfigsRequest, IncrementalAlterConfigsResource, KafkaString,
-    ListPartitionReassignmentsTopic, ReassignablePartition, ReassignableTopic, TaggedFields,
-    TryEncode, VersionedDecode, VersionedEncode, versions,
+    Decode, DescribableLogDirTopic, DescribeClusterRequest, DescribeClusterResponse,
+    DescribeConfigsRequest, DescribeConfigsResource, IncrementalAlterConfigsRequest,
+    IncrementalAlterConfigsResource, KafkaString, ListPartitionReassignmentsTopic,
+    ReassignablePartition, ReassignableTopic, TaggedFields, TryEncode, VersionedDecode,
+    VersionedEncode, versions,
 };
 use rdkafka::{
     Message, Offset,
@@ -3805,22 +3806,88 @@ struct BrokerRow {
     host: String,
     port: u16,
     rack: Option<String>,
-    controller: bool,
+    fenced: bool,
+    endpoint_type: String,
 }
 
 fn broker_table(rows: &[BrokerRow]) -> String {
     output::table(
-        ["ID", "HOST", "PORT", "RACK", "CONTROLLER"],
+        ["ID", "HOST", "PORT", "RACK", "STATE", "ENDPOINT_TYPE"],
         rows.iter().map(|row| {
             [
                 row.id.to_string(),
                 row.host.clone(),
                 row.port.to_string(),
                 row.rack.as_deref().unwrap_or("-").to_owned(),
-                row.controller.to_string(),
+                if row.fenced { "fenced" } else { "unfenced" }.into(),
+                row.endpoint_type.clone(),
             ]
         }),
     )
+}
+
+async fn fenced_cluster_rows(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+) -> Result<Vec<BrokerRow>> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let cluster = client.describe_cluster().await?;
+    let broker = cluster
+        .brokers
+        .first()
+        .ok_or_else(|| Error::Config("cluster returned no reachable broker".into()))?;
+    let connection = client
+        .pool()
+        .get_connection_by_id(
+            broker.broker_id,
+            &format!("{}:{}", broker.host, broker.port),
+        )
+        .await?;
+    let version = connection
+        .negotiate_api_version(ApiKey::DescribeCluster, 2, 2)
+        .await
+        .ok_or_else(|| {
+            Error::Unsupported(
+                "broker does not support fenced broker listing (DescribeCluster v2)".into(),
+            )
+        })?;
+    let request = DescribeClusterRequest {
+        include_cluster_authorized_operations: false,
+        endpoint_type: 1,
+        include_fenced_brokers: true,
+    };
+    let mut response = connection
+        .send_request(ApiKey::DescribeCluster, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(connection);
+    drop(client);
+    let response = DescribeClusterResponse::decode_versioned(version, &mut response)?;
+    if !response.error_code.is_ok() {
+        return Err(Error::Config(
+            response
+                .error_message
+                .unwrap_or_else(|| format!("{:?}", response.error_code)),
+        ));
+    }
+    response
+        .brokers
+        .into_iter()
+        .map(|broker| {
+            Ok(BrokerRow {
+                id: broker.broker_id,
+                host: broker.host,
+                port: u16::try_from(broker.port).map_err(|_| {
+                    Error::Config(format!("broker {} returned invalid port", broker.broker_id))
+                })?,
+                rack: broker.rack,
+                fenced: broker.is_fenced,
+                endpoint_type: "broker".into(),
+            })
+        })
+        .collect()
 }
 
 async fn cluster(
@@ -3840,21 +3907,26 @@ async fn cluster(
                 output::table(["CLUSTER_ID"], [[id.clone()]])
             })
         }
-        ClusterAction::ListEndpoints => {
-            let client = admin(config)?;
-            let cluster =
-                ffi::describe_cluster(client.inner().native_ptr(), duration_ms(timeout)?)?;
-            let rows = cluster
-                .nodes
-                .into_iter()
-                .map(|broker| BrokerRow {
-                    id: broker.id,
-                    host: broker.host,
-                    port: broker.port,
-                    rack: broker.rack,
-                    controller: broker.is_controller,
-                })
-                .collect::<Vec<_>>();
+        ClusterAction::ListEndpoints {
+            include_fenced_brokers,
+        } => {
+            let rows = if *include_fenced_brokers {
+                fenced_cluster_rows(bootstrap, command_config, timeout).await?
+            } else {
+                let client = admin(config)?;
+                ffi::describe_cluster(client.inner().native_ptr(), duration_ms(timeout)?)?
+                    .nodes
+                    .into_iter()
+                    .map(|broker| BrokerRow {
+                        id: broker.id,
+                        host: broker.host,
+                        port: broker.port,
+                        rack: broker.rack,
+                        fenced: false,
+                        endpoint_type: "broker".into(),
+                    })
+                    .collect()
+            };
             output::write_value(format, "cluster.list-endpoints", &rows, |rows| {
                 broker_table(rows)
             })
