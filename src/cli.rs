@@ -286,6 +286,9 @@ pub struct AlterTopicArgs {
 pub struct ProduceArgs {
     #[arg(long)]
     pub topic: String,
+    /// Kafka reader class; only the built-in `LineMessageReader` is available natively.
+    #[arg(long, default_value = "org.apache.kafka.tools.LineMessageReader")]
+    pub line_reader: String,
     #[arg(long)]
     pub key_separator: Option<char>,
     #[arg(long)]
@@ -355,6 +358,12 @@ pub struct ConsumeArgs {
     pub include: Option<String>,
     #[arg(long)]
     pub group: Option<String>,
+    /// Kafka formatter class; only the built-in `DefaultMessageFormatter` is available natively.
+    #[arg(
+        long,
+        default_value = "org.apache.kafka.tools.consumer.DefaultMessageFormatter"
+    )]
+    pub formatter: String,
     #[arg(long, requires = "topic", conflicts_with = "group", value_parser = clap::value_parser!(i32).range(0..))]
     pub partition: Option<i32>,
     /// Numeric offset, `earliest`, or `latest`; valid only with --partition.

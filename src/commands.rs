@@ -808,6 +808,12 @@ struct LineReaderOptions {
 }
 
 fn line_reader_options(args: &crate::cli::ProduceArgs) -> Result<LineReaderOptions> {
+    if args.line_reader != "org.apache.kafka.tools.LineMessageReader" {
+        return Err(Error::Unsupported(format!(
+            "Java line reader class {} cannot be loaded by the native client",
+            args.line_reader
+        )));
+    }
     let properties = component_properties(args.reader_config.as_deref(), &args.reader_properties)?;
     let value = |key: &str| properties.get(key);
     let parse_key = value("parse.key").map_or(args.parse_key, |value| bool_property(value));
@@ -1181,6 +1187,12 @@ struct MessageFormatterOptions {
 }
 
 fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFormatterOptions> {
+    if args.formatter != "org.apache.kafka.tools.consumer.DefaultMessageFormatter" {
+        return Err(Error::Unsupported(format!(
+            "Java formatter class {} cannot be loaded by the native client",
+            args.formatter
+        )));
+    }
     let properties =
         component_properties(args.formatter_config.as_deref(), &args.formatter_properties)?;
     let value = |key: &str| properties.get(key);
@@ -6113,6 +6125,7 @@ mod tests {
     fn producer_input_should_parse_json_key_partition_and_headers() {
         let args = crate::cli::ProduceArgs {
             topic: "events".into(),
+            line_reader: "org.apache.kafka.tools.LineMessageReader".into(),
             key_separator: None,
             parse_key: false,
             compression_type: "none".into(),
@@ -6161,6 +6174,7 @@ mod tests {
     fn producer_input_should_reject_negative_json_partition() {
         let args = crate::cli::ProduceArgs {
             topic: "events".into(),
+            line_reader: "org.apache.kafka.tools.LineMessageReader".into(),
             key_separator: None,
             parse_key: false,
             compression_type: "none".into(),
@@ -6258,6 +6272,82 @@ mod tests {
         assert!(options.print_partition && options.print_headers && options.print_key);
         assert_eq!(options.key_separator, b"|");
         assert_eq!(options.null_literal, b"NULL");
+    }
+
+    #[test]
+    fn console_component_classes_should_accept_kafka_defaults() {
+        let producer = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--line-reader",
+            "org.apache.kafka.tools.LineMessageReader",
+        ])
+        .expect("producer arguments");
+        let Command::Produce(producer) = producer.command else {
+            panic!("expected produce command");
+        };
+        line_reader_options(&producer).expect("default line reader");
+
+        let consumer = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--formatter",
+            "org.apache.kafka.tools.consumer.DefaultMessageFormatter",
+        ])
+        .expect("consumer arguments");
+        let Command::Consume(consumer) = consumer.command else {
+            panic!("expected consume command");
+        };
+        message_formatter_options(&consumer).expect("default formatter");
+    }
+
+    #[test]
+    fn console_component_classes_should_reject_java_plugins_explicitly() {
+        let producer = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--line-reader",
+            "example.CustomReader",
+        ])
+        .expect("producer arguments");
+        let Command::Produce(producer) = producer.command else {
+            panic!("expected produce command");
+        };
+        assert!(matches!(
+            line_reader_options(&producer),
+            Err(Error::Unsupported(message)) if message.contains("example.CustomReader")
+        ));
+
+        let consumer = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--formatter",
+            "example.CustomFormatter",
+        ])
+        .expect("consumer arguments");
+        let Command::Consume(consumer) = consumer.command else {
+            panic!("expected consume command");
+        };
+        assert!(matches!(
+            message_formatter_options(&consumer),
+            Err(Error::Unsupported(message)) if message.contains("example.CustomFormatter")
+        ));
     }
 
     #[test]
