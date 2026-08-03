@@ -1973,6 +1973,9 @@ fn parse_group_states(value: &str) -> Result<Vec<ffi::ConsumerGroupState>> {
             "stable" => Ok(ffi::ConsumerGroupState::Stable),
             "dead" => Ok(ffi::ConsumerGroupState::Dead),
             "empty" => Ok(ffi::ConsumerGroupState::Empty),
+            "assigning" | "reconciling" => Err(Error::Unsupported(format!(
+                "librdkafka 2.12 cannot filter consumer groups by the Kafka 4.4 state {state}"
+            ))),
             _ => Err(Error::Usage(format!(
                 "unknown consumer-group state: {state}"
             ))),
@@ -7820,6 +7823,23 @@ mod tests {
                 ffi::ConsumerGroupType::Classic,
             ]
         );
+    }
+
+    #[test]
+    fn consumer_group_state_filter_should_report_librdkafka_boundary_for_assigning() {
+        assert!(matches!(
+            parse_group_states("Assigning"),
+            Err(Error::Unsupported(message))
+                if message.contains("librdkafka 2.12") && message.contains("Assigning")
+        ));
+    }
+
+    #[test]
+    fn consumer_group_state_filter_should_reject_not_ready_like_kafka_consumer_groups() {
+        assert!(matches!(
+            parse_group_states("NotReady"),
+            Err(Error::Usage(message)) if message.contains("NotReady")
+        ));
     }
 
     #[test]
