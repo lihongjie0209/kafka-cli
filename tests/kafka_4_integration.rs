@@ -991,12 +991,10 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    assert!(
-        success(
-            &bootstrap,
-            &["configs", "describe", "--entity-type", "client-metrics"],
-        )
-        .contains("integration-metrics")
+    eventually_contains(
+        &bootstrap,
+        &["configs", "describe", "--entity-type", "client-metrics"],
+        "integration-metrics",
     );
     let scram_alter: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
