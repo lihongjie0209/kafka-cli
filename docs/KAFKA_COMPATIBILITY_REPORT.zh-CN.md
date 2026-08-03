@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `42883b3f400c193b7258f0b3f90e3480dc0b4fff`。
+- 本项目审计实现基准：`master`，提交 `5fb4d39d56ef6ebdf84b2e6a320733e14c173147`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 按本报告的功能口径，13 个兼容入口中 5 个达到核心功能“已支持”，8 个为“部分支持”；另有 31 个原版入口未支持。因此不能把 29.5% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
@@ -59,7 +59,7 @@
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config 和 StringDeserializer；未复刻任意 Java formatter/deserializer class 加载 |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；缺 bootstrap-controller |
-| `kafka-get-offsets.sh` | `kafka offsets` | 部分支持 | librdkafka ListOffsets；过滤语义及常用 OffsetSpec 已对齐；`-4/-5/-6` 可解析但受 librdkafka 2.12 限制 |
+| `kafka-get-offsets.sh` | `kafka offsets` | 部分支持 | 常规 OffsetSpec 使用 librdkafka ListOffsets；分层存储 `-4/-5/-6` 使用 ListOffsets v11 协议 fallback；过滤与逐 partition 语义已对齐，输出格式不同 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流/安全参数及 verify/cancel throttle 生命周期；缺 controller 模式 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件；原生入口支持预览，兼容脚本按原版立即执行 |
@@ -270,8 +270,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前审计实现基准 `42883b3` 已由 GitHub Actions 运行
-[`30849763389`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30849763389) 完整验证通过：fmt/Clippy/162 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。Kafka 4.3.1 覆盖 ACL、Group、Config、offset 等既有闭环，并真实执行 Kafka 4 group protocol fallback 与 Console Consumer leader epoch 数据闭环；Kafka 3.6.2 回归同时通过。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前审计实现基准 `5fb4d39` 已由 GitHub Actions 运行
+[`30850201584`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30850201584) 完整验证通过：fmt/Clippy/163 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。Kafka 4.3.1 覆盖 ACL、Group、Config、offset 等既有闭环，并真实执行 Kafka 4 group protocol fallback、Console Consumer leader epoch 数据闭环，以及 earliest-local/latest-tiered/earliest-pending-upload 三种 ListOffsets v11 请求；Kafka 3.6.2 回归同时通过。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -396,7 +396,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | ConsumerGroup verbose epoch | state verbose 合并 group/target assignment epoch，members verbose 合并 member/target epoch；librdkafka 继续提供 coordinator、assignment 与成员主体，协议结果只补缺失字段 | 151 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 state/members verbose 列断言；CI `30848663059` 六项全绿 |
 | 2026-08-04 | ConsumerGroup migration member | ConsumerGroupDescribe member type 映射为三态 upgraded；仅当同一 group 同时存在 classic 与 consumer protocol 成员时，verbose members 按原版增加 `UPGRADED` 列 | 153 个单元测试、7 个 CLI 测试；迁移组动态列与 unknown 边界由单元测试覆盖；CI `30849285517` 六项全绿 |
 | 2026-08-04 | Console Consumer leader epoch | DefaultMessageFormatter `print.epoch` 从固定 `NOT_PRESENT` 改为调用公开 librdkafka message leader epoch API；负 sentinel 仍映射为原版缺失值 | 155 个单元测试、7 个 CLI 测试；Kafka 4.3.1 formatter 数据闭环新增非 `NOT_PRESENT` epoch 断言；CI `30849763389` 六项全绿 |
-| 2026-08-04 | Get Offsets tiered specs | `-4/-5/-6` 从解析后能力错误升级为 ListOffsets v11 协议 fallback；普通 spec 保持 librdkafka，逐 partition error/unknown offset 语义保持一致 | 156 个单元测试、7 个 CLI 测试；Kafka 4.3.1 实际请求 earliest-local/latest-tiered/earliest-pending-upload |
+| 2026-08-04 | Get Offsets tiered specs | `-4/-5/-6` 从解析后能力错误升级为 ListOffsets v11 协议 fallback；普通 spec 保持 librdkafka，逐 partition error/unknown offset 语义保持一致 | 156 个单元测试、7 个 CLI 测试；Kafka 4.3.1 实际请求 earliest-local/latest-tiered/earliest-pending-upload；CI `30850201584` 六项全绿 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
