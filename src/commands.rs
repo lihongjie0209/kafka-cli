@@ -2211,7 +2211,7 @@ async fn list_streams_groups(
         } else {
             parse_streams_group_states(state_filter)?
         };
-        describe_streams_groups(client, &group_ids, false)
+        describe_streams_groups(client, &group_ids, false, false)
             .await?
             .into_iter()
             .filter(|group| states.is_empty() || states.contains(&group.description.group_state))
@@ -2991,6 +2991,7 @@ async fn describe_streams_groups(
     client: &krafka::admin::AdminClient,
     group_ids: &[String],
     include_topology_description: bool,
+    allow_missing: bool,
 ) -> Result<Vec<StreamsGroupDescriptionWithCoordinator>> {
     let mut descriptions = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
@@ -3015,39 +3016,34 @@ async fn describe_streams_groups(
             })
             .await?;
         drop(connection);
-        let response_wire = STANDARD.encode(response.as_ref());
         skip_tagged_fields(&mut response).map_err(|error| {
             Error::Config(format!(
-                "StreamsGroupDescribe response header failed: {error}; payload={response_wire}"
+                "StreamsGroupDescribe response header failed: {error}"
             ))
         })?;
         let _throttle_time_ms = i32::decode(&mut response).map_err(|error| {
-            Error::Config(format!(
-                "StreamsGroupDescribe throttle failed: {error}; payload={response_wire}"
-            ))
+            Error::Config(format!("StreamsGroupDescribe throttle failed: {error}"))
         })?;
         let count = decode_compact_len(&mut response).map_err(|error| {
-            Error::Config(format!(
-                "StreamsGroupDescribe group array failed: {error}; payload={response_wire}"
-            ))
+            Error::Config(format!("StreamsGroupDescribe group array failed: {error}"))
         })?;
         if count != 1 {
             return Err(Error::Config(format!(
                 "StreamsGroupDescribe returned {count} groups for one requested group"
             )));
         }
-        let (error_code, error_message, description) =
+        let (error_code, error_message, mut description) =
             decode_streams_group_description(&mut response, version).map_err(|error| {
-                Error::Config(format!(
-                    "StreamsGroupDescribe group decode failed: {error}; payload={response_wire}"
-                ))
+                Error::Config(format!("StreamsGroupDescribe group decode failed: {error}"))
             })?;
         skip_tagged_fields(&mut response).map_err(|error| {
             Error::Config(format!(
-                "StreamsGroupDescribe response tags failed: {error}; payload={response_wire}"
+                "StreamsGroupDescribe response tags failed: {error}"
             ))
         })?;
-        if error_code != 0 {
+        if error_code == krafka::error::ErrorCode::GroupIdNotFound.to_i16() && allow_missing {
+            description.group_state = "Dead".into();
+        } else if error_code != 0 {
             return Err(Error::Config(format!(
                 "StreamsGroupDescribe failed for {group_id}: {}",
                 error_message.unwrap_or_else(|| format!("Kafka error {error_code}"))
@@ -3484,7 +3480,7 @@ async fn delete_streams_groups(
         .filter(|group| available.contains(*group))
         .cloned()
         .collect::<Vec<_>>();
-    let descriptions = describe_streams_groups(client, &existing, false).await?;
+    let descriptions = describe_streams_groups(client, &existing, false, false).await?;
     let details = descriptions
         .into_iter()
         .map(|group| (group.description.group_id.clone(), group.description))
@@ -3529,12 +3525,13 @@ async fn delete_streams_groups(
             continue;
         }
         let error = delete_one_group(client, &group).await?;
+        let group_deleted = error.is_none();
         rows.push(MutationRow {
             resource: group,
-            status: if error.is_some() { "FAILED" } else { "DELETED" }.into(),
+            status: if group_deleted { "DELETED" } else { "FAILED" }.into(),
             error,
         });
-        if !internal_topics.is_empty() {
+        if group_deleted && !internal_topics.is_empty() {
             let topics = internal_topics.into_iter().collect::<Vec<_>>();
             let topic_refs = topics.iter().map(String::as_str).collect::<Vec<_>>();
             let options = AdminOptions::new().request_timeout(Some(timeout));
@@ -3592,7 +3589,7 @@ async fn delete_streams_group_offsets(
         .collect::<BTreeSet<_>>();
     let selections = if all_input_topics {
         let group_ids = [group.to_owned()];
-        let description = describe_streams_groups(client, &group_ids, false)
+        let description = describe_streams_groups(client, &group_ids, false, false)
             .await?
             .pop()
             .ok_or_else(|| Error::Config(format!("broker omitted Streams group {group}")))?;
@@ -3720,6 +3717,9 @@ fn write_streams_reset_rows(
         )
         .map_err(|error| Error::Usage(format!("reset CSV is not UTF-8: {error}")))?;
         print!("{csv}");
+        for error in errors {
+            eprintln!("Error: {error}");
+        }
         return Ok(());
     }
     output::write_value_with_errors(
@@ -3764,7 +3764,7 @@ async fn reset_streams_group_offsets(
     if groups.is_empty() {
         return Err(Error::Usage("no Streams groups matched".into()));
     }
-    let descriptions = describe_streams_groups(client, &groups, false).await?;
+    let descriptions = describe_streams_groups(client, &groups, false, true).await?;
     let mut errors = Vec::new();
     let mut inactive = BTreeMap::new();
     for group in descriptions {
@@ -3779,7 +3779,11 @@ async fn reset_streams_group_offsets(
     }
     let inactive_ids = inactive.keys().cloned().collect::<Vec<_>>();
     if let Some(path) = args.from_file.as_deref() {
-        let rows = read_reset_plan(path, &inactive_ids, args.group.len() == 1, config, timeout)?;
+        let rows = if inactive_ids.is_empty() {
+            Vec::new()
+        } else {
+            read_reset_plan(path, &inactive_ids, args.group.len() == 1, config, timeout)?
+        };
         if args.execute {
             execute_reset_rows(config, timeout, &rows)?;
         }
@@ -3911,9 +3915,16 @@ async fn reset_streams_group_offsets(
             };
             if !topics.is_empty() {
                 let topics = topics.iter().map(String::as_str).collect::<Vec<_>>();
-                admin
+                let results = admin
                     .delete_topics(&topics, &AdminOptions::new().request_timeout(Some(timeout)))
                     .await?;
+                for result in results {
+                    if let Err((topic, code)) = result {
+                        errors.push(format!(
+                            "deleting internal topic '{topic}' failed: {code:?}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -4507,7 +4518,8 @@ async fn streams_groups(
             } else {
                 group
             };
-            let descriptions = describe_streams_groups(&client, &group_ids, topology).await?;
+            let descriptions =
+                describe_streams_groups(&client, &group_ids, topology, false).await?;
             if topology {
                 write_streams_topologies(format, descriptions)
             } else if members {
@@ -5726,8 +5738,11 @@ fn read_reset_plan(
             Error::Usage(format!("invalid reset CSV line {}: {error}", index + 1))
         })?;
         let (group, topic, partition, requested) = if single_group && record.len() == 3 {
+            let group = groups.first().ok_or_else(|| {
+                Error::Usage("reset CSV uses single-group rows but no group was selected".into())
+            })?;
             (
-                groups[0].clone(),
+                group.clone(),
                 record[0].to_owned(),
                 parse_csv_number::<i32>(&record[1], index, "partition")?,
                 parse_csv_number::<i64>(&record[2], index, "offset")?,
@@ -14324,6 +14339,19 @@ mod tests {
             read_delete_records(file.path()),
             Err(Error::Usage(message)) if message.contains("duplicate")
         ));
+    }
+
+    #[test]
+    fn reset_csv_should_return_usage_error_when_single_group_is_not_selected() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary reset CSV");
+        writeln!(file, "events,0,1").expect("write reset CSV");
+        let mut config = rdkafka::ClientConfig::new();
+        config.set("bootstrap.servers", "127.0.0.1:1");
+
+        let error = read_reset_plan(file.path(), &[], true, &config, Duration::from_millis(1))
+            .expect_err("missing selected group");
+
+        assert!(error.to_string().contains("no group was selected"));
     }
 
     #[test]

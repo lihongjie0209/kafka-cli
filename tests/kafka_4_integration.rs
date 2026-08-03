@@ -764,6 +764,26 @@ fn all_command_families_work_against_kafka_4_3_1() {
             && !missing_streams_error.contains("connection closed"),
         "unexpected StreamsGroupDescribe boundary: {missing_streams_error}"
     );
+    let missing_streams_reset: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "streams-groups",
+            "reset-offsets",
+            "--group",
+            "missing-streams-group",
+            "--input-topic",
+            "integration-events:0",
+            "--to-earliest",
+            "--dry-run",
+        ],
+    ))
+    .expect("missing Streams group reset JSON");
+    assert_eq!(
+        missing_streams_reset["data"][0]["group"],
+        "missing-streams-group"
+    );
     let all_groups = success(&bootstrap, &["all-groups", "list"]);
     assert!(all_groups.contains("integration-suite"));
     assert!(all_groups.contains("Classic"));
