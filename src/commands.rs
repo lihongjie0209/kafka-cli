@@ -4037,12 +4037,7 @@ fn parse_scram_changes(
         let body = value
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
-            .ok_or_else(|| {
-                Error::Usage(format!(
-                    "{} must use [iterations=N,password=secret]",
-                    scram_mechanism_name(mechanism)
-                ))
-            })?;
+            .unwrap_or(value);
         let properties = body
             .split(',')
             .map(|item| {
@@ -6837,6 +6832,15 @@ mod tests {
             .expect("duplicate config keys");
 
         assert_eq!(pairs, [("retention.ms".into(), "2".into())]);
+    }
+
+    #[test]
+    fn config_additions_should_feed_normalized_scram_value() {
+        let additions =
+            parse_config_additions(&["SCRAM-SHA-512=[iterations=4096,password=secret]".into()])
+                .expect("SCRAM config addition");
+
+        assert!(parse_scram_changes(&additions, &[]).is_ok());
     }
 
     #[test]
