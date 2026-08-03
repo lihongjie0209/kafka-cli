@@ -339,6 +339,16 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--members",
         ],
     );
+    assert!(
+        success(
+            &bootstrap,
+            &["groups", "describe", "--all-groups", "--state"]
+        )
+        .contains("integration-suite")
+    );
+    assert!(
+        success(&bootstrap, &["groups", "describe", "--all-groups"]).contains("integration-events")
+    );
     success(
         &bootstrap,
         &[
@@ -422,6 +432,9 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "integration-events",
             "--execute",
         ],
+    );
+    assert!(
+        success(&bootstrap, &["groups", "delete", "--all-groups"]).contains("integration-suite")
     );
     success(
         &bootstrap,

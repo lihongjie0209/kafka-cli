@@ -775,6 +775,7 @@ async fn groups(
         ),
         GroupAction::Describe {
             group,
+            all_groups,
             members,
             state,
             offsets: _,
@@ -786,9 +787,18 @@ async fn groups(
             } else {
                 GroupDescribeMode::Offsets
             };
-            describe_group_details(config, timeout, format, &group, mode)
+            let groups = resolve_group_names(config, timeout, &group, all_groups)?;
+            describe_group_details(config, timeout, format, &groups, mode)
         }
-        GroupAction::Delete { group, execute } => {
+        GroupAction::Delete {
+            group,
+            all_groups,
+            execute,
+        } => {
+            let group = resolve_group_names(config, timeout, &group, all_groups)?;
+            if group.is_empty() {
+                return Err(Error::Usage("no consumer groups matched".into()));
+            }
             if !execute {
                 println!("Would delete consumer groups: {}", group.join(","));
                 return Ok(());
@@ -890,6 +900,24 @@ fn list_groups(
     })
 }
 
+fn resolve_group_names(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    explicit: &[String],
+    all_groups: bool,
+) -> Result<Vec<String>> {
+    if !all_groups {
+        return Ok(explicit.to_vec());
+    }
+    let client = admin(config)?;
+    Ok(
+        ffi::list_consumer_groups(client.inner().native_ptr(), &[], &[], duration_ms(timeout)?)?
+            .into_iter()
+            .map(|group| group.group)
+            .collect(),
+    )
+}
+
 fn parse_group_states(value: &str) -> Result<Vec<ffi::ConsumerGroupState>> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -968,44 +996,57 @@ fn describe_group_details(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
     format: OutputFormat,
-    group: &str,
+    groups: &[String],
     mode: GroupDescribeMode,
 ) -> Result<()> {
+    if groups.is_empty() {
+        return Err(Error::Usage("no consumer groups matched".into()));
+    }
     match mode {
         GroupDescribeMode::State => {
-            return describe_groups(config, timeout, format, Some(group));
+            return describe_groups(config, timeout, format, groups);
         }
         GroupDescribeMode::Members => {
-            return describe_group_members(config, timeout, format, group);
+            return describe_group_members(config, timeout, format, groups);
         }
         GroupDescribeMode::Offsets => {}
     }
     let admin = admin(config)?;
-    let offsets = crate::ffi::list_consumer_group_offsets(
-        admin.inner().native_ptr(),
-        group,
-        duration_ms(timeout)?,
-    )?;
+    let offsets = groups
+        .iter()
+        .map(|group| {
+            crate::ffi::list_consumer_group_offsets(
+                admin.inner().native_ptr(),
+                group,
+                duration_ms(timeout)?,
+            )
+            .map(|offsets| (group, offsets))
+        })
+        .collect::<Result<Vec<_>>>()?;
     drop(admin);
     let consumer = base_consumer(config)?;
     let rows = offsets
         .into_iter()
-        .filter(|offset| offset.offset >= 0)
-        .map(|offset| {
-            let log_end_offset = consumer
-                .fetch_watermarks(&offset.topic, offset.partition, timeout)
-                .map(|(_, high)| high)
-                .ok();
-            let lag = group_offset_lag(offset.offset, log_end_offset);
-            GroupOffsetRow {
-                group: group.to_owned(),
-                topic: offset.topic,
-                partition: offset.partition,
-                committed_offset: offset.offset,
-                log_end_offset,
-                lag,
-                error: offset.error,
-            }
+        .flat_map(|(group, offsets)| {
+            offsets
+                .into_iter()
+                .filter(|offset| offset.offset >= 0)
+                .map(|offset| {
+                    let log_end_offset = consumer
+                        .fetch_watermarks(&offset.topic, offset.partition, timeout)
+                        .map(|(_, high)| high)
+                        .ok();
+                    let lag = group_offset_lag(offset.offset, log_end_offset);
+                    GroupOffsetRow {
+                        group: group.clone(),
+                        topic: offset.topic,
+                        partition: offset.partition,
+                        committed_offset: offset.offset,
+                        log_end_offset,
+                        lag,
+                        error: offset.error,
+                    }
+                })
         })
         .collect::<Vec<_>>();
     output::write_value(format, "groups.describe.offsets", &rows, |rows| {
@@ -1040,14 +1081,11 @@ fn describe_group_members(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
     format: OutputFormat,
-    group: &str,
+    groups: &[String],
 ) -> Result<()> {
     let client = admin(config)?;
-    let groups = ffi::describe_consumer_groups(
-        client.inner().native_ptr(),
-        &[group.to_owned()],
-        duration_ms(timeout)?,
-    )?;
+    let groups =
+        ffi::describe_consumer_groups(client.inner().native_ptr(), groups, duration_ms(timeout)?)?;
     let rows = groups
         .iter()
         .flat_map(|description| {
@@ -1110,15 +1148,11 @@ fn describe_groups(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
     format: OutputFormat,
-    group: Option<&str>,
+    groups: &[String],
 ) -> Result<()> {
-    let group = group.ok_or_else(|| Error::Usage("--group is required for describe".into()))?;
     let client = admin(config)?;
-    let rows = ffi::describe_consumer_groups(
-        client.inner().native_ptr(),
-        &[group.to_owned()],
-        duration_ms(timeout)?,
-    )?;
+    let rows =
+        ffi::describe_consumer_groups(client.inner().native_ptr(), groups, duration_ms(timeout)?)?;
     output::write_value(format, "groups.describe.state", &rows, |rows| {
         output::table(
             [

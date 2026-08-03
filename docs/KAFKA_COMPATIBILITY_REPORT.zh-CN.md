@@ -32,7 +32,7 @@
 | `kafka-topics.sh` | `kafka topics` | 已支持 | list、describe、create、alter、delete |
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 常用行输入、key、JSON、headers、partition；未复刻可插拔 reader 全部选项 |
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/group/partition/offset/from-beginning/max-messages；未复刻 formatter/deserializer 全部选项 |
-| `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、describe、delete、delete-offsets、reset-offsets；缺少批量与导入导出模式 |
+| `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe、批量 delete、delete-offsets、reset-offsets；缺少 reset 批量 topic 与导入导出模式 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group，以及 librdkafka SCRAM user credential；缺少其他 entity type |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
@@ -99,15 +99,15 @@
 已支持：
 
 - list 使用 librdkafka `ListConsumerGroups` Admin API，支持裸 `--state`/`--type` 展示列，以及逗号分隔的 broker-side state/type 过滤。
-- describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`；state/members 使用 librdkafka `DescribeConsumerGroups` Admin API。
+- describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`；支持重复 `--group` 和 `--all-groups`，state/members 使用 librdkafka `DescribeConsumerGroups` Admin API。
 - committed offset、log end offset、lag 和错误列。
 - members 输出已解码的当前和 target topic-partition assignment；state 输出 group type、assignor、member count 与 coordinator。
-- delete group、delete offsets，默认预览并通过 `--execute` 执行。
+- delete group 支持重复 `--group` 和 `--all-groups`；delete group/delete offsets 默认预览并通过 `--execute` 执行。
 - reset offsets：earliest、latest、absolute offset、shift-by、current、datetime、ISO-8601 duration；执行阶段使用 librdkafka `AlterConsumerGroupOffsets` Admin API。
 
 缺少或有差异：
 
-- 一次只接受一个 describe/reset 目标 group；缺少 `--all-groups`。
+- reset-offsets 一次只接受一个目标 group；尚未支持该子命令的 `--all-groups`。
 - reset 一次只接受一个 topic；缺少 `--all-topics` 和原版更丰富的 topic-partition 集合。
 - 缺少 `--dry-run`、`--export`、`--from-file`、`--validate-regex`、`--verbose` 细节模式。
 
@@ -241,7 +241,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 ### P1：补齐已支持脚本的主要差距
 
 1. Configs 增加 user、client、IP、broker-logger、client-metrics 和 default entity。
-2. Consumer Groups 增加 all-groups、all-topics、from-file、export、dry-run 和完整 member assignment 解码。
+2. Consumer Groups 为 reset-offsets 增加 all-groups/all-topics，并增加 from-file、export、dry-run 和 verbose 细节模式。
 3. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
 4. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
 5. Leader Election 增加 JSON 文件批量输入。
@@ -271,3 +271,4 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Consumer Group reset write | reset-offsets 从 consumer synchronous commit 迁移到 librdkafka `AlterConsumerGroupOffsets` Admin API，保留安全预览和所有 reset target 算法 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 reset/describe 闭环集成测试通过 |
 | 2026-08-03 | Describe Cluster | cluster ID 与 endpoint 查询统一迁移到 librdkafka `DescribeCluster` Admin API，新增 rack 与 controller 输出 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成测试通过 |
 | 2026-08-03 | Topic default replication factor | create 未指定 `--replication-factor` 时使用 librdkafka `-1` sentinel，交由 broker 的 default.replication.factor 决定 | Topic create 单元路径及 Kafka 3.6.2/4.3.1 集成测试 |
+| 2026-08-03 | Consumer Group 批量目标 | describe 的 offsets/state/members 视图及 delete 支持重复 `--group` 与 `--all-groups`；all-groups 通过 librdkafka `ListConsumerGroups` 解析目标 | Clippy、53 个普通测试、bundled Kafka 4.3.1 批量 describe/delete 集成测试通过 |

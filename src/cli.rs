@@ -297,8 +297,14 @@ pub enum GroupAction {
         group_type: Option<String>,
     },
     Describe {
+        #[arg(
+            long,
+            required_unless_present = "all_groups",
+            conflicts_with = "all_groups"
+        )]
+        group: Vec<String>,
         #[arg(long)]
-        group: String,
+        all_groups: bool,
         /// Show group members instead of committed offsets.
         #[arg(long, conflicts_with_all = ["state", "offsets"])]
         members: bool,
@@ -310,8 +316,14 @@ pub enum GroupAction {
         offsets: bool,
     },
     Delete {
-        #[arg(long)]
+        #[arg(
+            long,
+            required_unless_present = "all_groups",
+            conflicts_with = "all_groups"
+        )]
         group: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
         #[arg(long)]
         execute: bool,
     },
