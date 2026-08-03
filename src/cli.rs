@@ -287,7 +287,14 @@ pub struct GroupsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum GroupAction {
-    List,
+    List {
+        /// Include state and optionally filter by comma-separated group states.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        state: Option<String>,
+        /// Include type and optionally filter by comma-separated group types.
+        #[arg(long = "type", num_args = 0..=1, default_missing_value = "")]
+        group_type: Option<String>,
+    },
     Describe {
         #[arg(long)]
         group: String,

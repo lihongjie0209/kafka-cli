@@ -98,9 +98,10 @@
 
 已支持：
 
-- list。
-- describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`。
+- list 使用 librdkafka `ListConsumerGroups` Admin API，支持裸 `--state`/`--type` 展示列，以及逗号分隔的 broker-side state/type 过滤。
+- describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`；state/members 使用 librdkafka `DescribeConsumerGroups` Admin API。
 - committed offset、log end offset、lag 和错误列。
+- members 输出已解码的当前和 target topic-partition assignment；state 输出 group type、assignor、member count 与 coordinator。
 - delete group、delete offsets，默认预览并通过 `--execute` 执行。
 - reset offsets：earliest、latest、absolute offset、shift-by、current、datetime、ISO-8601 duration。
 
@@ -108,8 +109,7 @@
 
 - 一次只接受一个 describe/reset 目标 group；缺少 `--all-groups`。
 - reset 一次只接受一个 topic；缺少 `--all-topics` 和原版更丰富的 topic-partition 集合。
-- 缺少 `--dry-run`、`--export`、`--from-file`、`--type`、`--validate-regex`、`--verbose` 细节模式。
-- members assignment 对 classic group 当前主要展示原始 assignment 字节长度，而非完全解码后的 topic-partition 清单。
+- 缺少 `--dry-run`、`--export`、`--from-file`、`--validate-regex`、`--verbose` 细节模式。
 
 ### 4.5 Configs
 
@@ -203,7 +203,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：52 个通过。
+- Rust 单元测试与普通 CLI 测试：53 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -266,3 +266,5 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Cluster endpoints | `cluster list-endpoints` 从独立协议客户端迁移到 librdkafka metadata API | 既有 Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成覆盖 |
 | 2026-08-03 | Topic ID describe | 使用 librdkafka `DescribeTopics` 获取 topic UUID；describe 新增 `--topic-id`，表格和 JSON 输出携带 topic ID | Clippy、50 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 名称/ID 闭环集成测试通过 |
 | 2026-08-03 | Get Offsets ListOffsets | earliest、latest、timestamp 全部迁移至 librdkafka `ListOffsets`，新增 max-timestamp 及 `-1/-2/-3` 原版别名，输出 timestamp | Clippy、52 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
+| 2026-08-03 | Consumer Group list | 从旧同步 group-list API 迁移到 librdkafka `ListConsumerGroups` Admin API，新增 Kafka 原版 `--state` 与 `--type` 可选过滤 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
+| 2026-08-03 | Consumer Group describe | state/members 从旧 group-list API 迁移到 librdkafka `DescribeConsumerGroups`；解码 current/target member assignment，并输出 type、assignor、coordinator | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 state/members 集成测试通过 |

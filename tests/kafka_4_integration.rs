@@ -312,6 +312,10 @@ fn all_command_families_work_against_kafka_4_3_1() {
 
     // groups, configs, offsets
     success(&bootstrap, &["groups", "list"]);
+    assert!(success(&bootstrap, &["groups", "list", "--state"]).contains("integration-suite"));
+    assert!(
+        success(&bootstrap, &["groups", "list", "--type", "classic"]).contains("integration-suite")
+    );
     assert!(
         success(
             &bootstrap,

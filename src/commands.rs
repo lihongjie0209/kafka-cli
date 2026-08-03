@@ -757,14 +757,6 @@ fn apply_client_properties(
     Ok(())
 }
 
-#[derive(Serialize)]
-struct GroupRow {
-    group: String,
-    state: String,
-    protocol: String,
-    members: usize,
-}
-
 async fn groups(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
@@ -772,7 +764,13 @@ async fn groups(
     action: GroupAction,
 ) -> Result<()> {
     match action {
-        GroupAction::List => describe_groups(config, timeout, format, None),
+        GroupAction::List { state, group_type } => list_groups(
+            config,
+            timeout,
+            format,
+            state.as_deref(),
+            group_type.as_deref(),
+        ),
         GroupAction::Describe {
             group,
             members,
@@ -853,6 +851,88 @@ async fn groups(
     }
 }
 
+fn list_groups(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    format: OutputFormat,
+    states: Option<&str>,
+    types: Option<&str>,
+) -> Result<()> {
+    let states = states
+        .map(parse_group_states)
+        .transpose()?
+        .unwrap_or_default();
+    let types = types
+        .map(parse_group_types)
+        .transpose()?
+        .unwrap_or_default();
+    let client = admin(config)?;
+    let rows = ffi::list_consumer_groups(
+        client.inner().native_ptr(),
+        &states,
+        &types,
+        duration_ms(timeout)?,
+    )?;
+    output::write_value(format, "groups.list", &rows, |rows| {
+        output::table(
+            ["GROUP", "TYPE", "STATE", "SIMPLE"],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.group_type.clone(),
+                    row.state.clone(),
+                    row.is_simple.to_string(),
+                ]
+            }),
+        )
+    })
+}
+
+fn parse_group_states(value: &str) -> Result<Vec<ffi::ConsumerGroupState>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|state| match normalized_group_filter(state).as_str() {
+            "preparingrebalance" => Ok(ffi::ConsumerGroupState::PreparingRebalance),
+            "completingrebalance" => Ok(ffi::ConsumerGroupState::CompletingRebalance),
+            "stable" => Ok(ffi::ConsumerGroupState::Stable),
+            "dead" => Ok(ffi::ConsumerGroupState::Dead),
+            "empty" => Ok(ffi::ConsumerGroupState::Empty),
+            _ => Err(Error::Usage(format!(
+                "unknown consumer-group state: {state}"
+            ))),
+        })
+        .collect()
+}
+
+fn parse_group_types(value: &str) -> Result<Vec<ffi::ConsumerGroupType>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(
+            |group_type| match normalized_group_filter(group_type).as_str() {
+                "consumer" => Ok(ffi::ConsumerGroupType::Consumer),
+                "classic" => Ok(ffi::ConsumerGroupType::Classic),
+                _ => Err(Error::Usage(format!(
+                    "unknown consumer-group type: {group_type}"
+                ))),
+            },
+        )
+        .collect()
+}
+
+fn normalized_group_filter(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 #[derive(Serialize)]
 struct GroupOffsetRow {
     group: String,
@@ -872,6 +952,7 @@ struct GroupMemberRow {
     client_id: String,
     host: String,
     assignment: String,
+    target_assignment: String,
 }
 
 #[derive(Clone, Copy)]
@@ -959,23 +1040,26 @@ fn describe_group_members(
     format: OutputFormat,
     group: &str,
 ) -> Result<()> {
-    let groups = base_consumer(config)?.fetch_group_list(Some(group), timeout)?;
+    let client = admin(config)?;
+    let groups = ffi::describe_consumer_groups(
+        client.inner().native_ptr(),
+        &[group.to_owned()],
+        duration_ms(timeout)?,
+    )?;
     let rows = groups
-        .groups()
         .iter()
         .flat_map(|description| {
             description
-                .members()
+                .members
                 .iter()
                 .map(move |member| GroupMemberRow {
-                    group: description.name().to_owned(),
-                    member_id: member.id().to_owned(),
-                    instance_id: None,
-                    client_id: member.client_id().to_owned(),
-                    host: member.client_host().to_owned(),
-                    assignment: member
-                        .assignment()
-                        .map_or_else(String::new, |bytes| format!("{} bytes", bytes.len())),
+                    group: description.group.clone(),
+                    member_id: member.member_id.clone(),
+                    instance_id: member.instance_id.clone(),
+                    client_id: member.client_id.clone(),
+                    host: member.host.clone(),
+                    assignment: group_partitions(&member.assignment),
+                    target_assignment: group_partitions(&member.target_assignment),
                 })
         })
         .collect::<Vec<_>>();
@@ -988,6 +1072,7 @@ fn describe_group_members(
                 "CLIENT_ID",
                 "HOST",
                 "ASSIGNMENT",
+                "TARGET_ASSIGNMENT",
             ],
             rows.iter().map(|row| {
                 [
@@ -997,10 +1082,19 @@ fn describe_group_members(
                     row.client_id.clone(),
                     row.host.clone(),
                     row.assignment.clone(),
+                    row.target_assignment.clone(),
                 ]
             }),
         )
     })
+}
+
+fn group_partitions(partitions: &[ffi::ConsumerGroupPartition]) -> String {
+    partitions
+        .iter()
+        .map(|partition| format!("{}:{}", partition.topic, partition.partition))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn group_offset_lag(committed_offset: i64, log_end_offset: Option<i64>) -> Option<i64> {
@@ -1016,26 +1110,33 @@ fn describe_groups(
     format: OutputFormat,
     group: Option<&str>,
 ) -> Result<()> {
-    let list = base_consumer(config)?.fetch_group_list(group, timeout)?;
-    let rows = list
-        .groups()
-        .iter()
-        .map(|group| GroupRow {
-            group: group.name().to_owned(),
-            state: group.state().to_owned(),
-            protocol: group.protocol().to_owned(),
-            members: group.members().len(),
-        })
-        .collect::<Vec<_>>();
-    output::write_value(format, "groups.describe", &rows, |rows| {
+    let group = group.ok_or_else(|| Error::Usage("--group is required for describe".into()))?;
+    let client = admin(config)?;
+    let rows = ffi::describe_consumer_groups(
+        client.inner().native_ptr(),
+        &[group.to_owned()],
+        duration_ms(timeout)?,
+    )?;
+    output::write_value(format, "groups.describe.state", &rows, |rows| {
         output::table(
-            ["GROUP", "STATE", "PROTOCOL", "MEMBERS"],
+            [
+                "GROUP",
+                "TYPE",
+                "STATE",
+                "ASSIGNOR",
+                "MEMBERS",
+                "COORDINATOR_ID",
+                "COORDINATOR",
+            ],
             rows.iter().map(|row| {
                 [
                     row.group.clone(),
+                    row.group_type.clone(),
                     row.state.clone(),
-                    row.protocol.clone(),
-                    row.members.to_string(),
+                    row.assignor.clone(),
+                    row.members.len().to_string(),
+                    row.coordinator_id.to_string(),
+                    row.coordinator.clone(),
                 ]
             }),
         )
@@ -3386,6 +3487,24 @@ mod tests {
     #[test]
     fn group_offset_lag_should_be_unknown_without_a_commit() {
         assert_eq!(group_offset_lag(-1, Some(10)), None);
+    }
+
+    #[test]
+    fn consumer_group_filters_should_accept_kafka_names() {
+        assert_eq!(
+            parse_group_states("Stable,Preparing_Rebalance").expect("states"),
+            [
+                ffi::ConsumerGroupState::Stable,
+                ffi::ConsumerGroupState::PreparingRebalance,
+            ]
+        );
+        assert_eq!(
+            parse_group_types("consumer,CLASSIC").expect("types"),
+            [
+                ffi::ConsumerGroupType::Consumer,
+                ffi::ConsumerGroupType::Classic,
+            ]
+        );
     }
 
     #[test]

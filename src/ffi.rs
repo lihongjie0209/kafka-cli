@@ -229,6 +229,63 @@ pub struct ListOffsetEntry {
     pub timestamp: i64,
 }
 
+/// Consumer-group states supported by librdkafka list filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerGroupState {
+    PreparingRebalance,
+    CompletingRebalance,
+    Stable,
+    Dead,
+    Empty,
+}
+
+/// Consumer-group protocol types supported by librdkafka.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerGroupType {
+    Consumer,
+    Classic,
+}
+
+/// One entry returned by librdkafka's `ListConsumerGroups` API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsumerGroupListing {
+    pub group: String,
+    pub state: String,
+    pub group_type: String,
+    pub is_simple: bool,
+}
+
+/// Topic partition assigned to a consumer-group member.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsumerGroupPartition {
+    pub topic: String,
+    pub partition: i32,
+}
+
+/// One member returned by librdkafka's `DescribeConsumerGroups` API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsumerGroupMember {
+    pub member_id: String,
+    pub instance_id: Option<String>,
+    pub client_id: String,
+    pub host: String,
+    pub assignment: Vec<ConsumerGroupPartition>,
+    pub target_assignment: Vec<ConsumerGroupPartition>,
+}
+
+/// Full consumer-group description returned by librdkafka.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConsumerGroupDescription {
+    pub group: String,
+    pub state: String,
+    pub group_type: String,
+    pub assignor: String,
+    pub coordinator_id: i32,
+    pub coordinator: String,
+    pub is_simple: bool,
+    pub members: Vec<ConsumerGroupMember>,
+}
+
 /// A committed consumer-group offset returned by librdkafka.
 #[derive(Debug)]
 pub struct GroupOffsetEntry {
@@ -288,6 +345,340 @@ fn poll(queue: &Queue, timeout_ms: i32) -> Result<Event> {
         return Err(Error::Config(message));
     }
     Ok(event)
+}
+
+/// Lists consumer groups with broker-side state and type filters.
+pub fn list_consumer_groups(
+    client: *mut sys::rd_kafka_t,
+    states: &[ConsumerGroupState],
+    types: &[ConsumerGroupType],
+    timeout_ms: i32,
+) -> Result<Vec<ConsumerGroupListing>> {
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_LISTCONSUMERGROUPS,
+        timeout_ms,
+    )?;
+    let native_states = states
+        .iter()
+        .copied()
+        .map(native_consumer_group_state)
+        .collect::<Vec<_>>();
+    if !native_states.is_empty() {
+        let error = unsafe {
+            sys::rd_kafka_AdminOptions_set_match_consumer_group_states(
+                options.0,
+                native_states.as_ptr(),
+                native_states.len(),
+            )
+        };
+        check_owned_error(error)?;
+    }
+    let native_types = types
+        .iter()
+        .copied()
+        .map(native_consumer_group_type)
+        .collect::<Vec<_>>();
+    if !native_types.is_empty() {
+        let error = unsafe {
+            sys::rd_kafka_AdminOptions_set_match_consumer_group_types(
+                options.0,
+                native_types.as_ptr(),
+                native_types.len(),
+            )
+        };
+        check_owned_error(error)?;
+    }
+    unsafe { sys::rd_kafka_ListConsumerGroups(client, options.0, queue.0) };
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_ListConsumerGroups_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid ListConsumerGroups response".into(),
+        ));
+    }
+    let mut error_count = 0;
+    let errors =
+        unsafe { sys::rd_kafka_ListConsumerGroups_result_errors(result, &raw mut error_count) };
+    if error_count > 0 && errors.is_null() {
+        return Err(Error::Config(
+            "broker returned a null consumer-group error array".into(),
+        ));
+    }
+    for index in 0..error_count {
+        let error = unsafe { *errors.add(index) };
+        if native_error_failed(error) {
+            return Err(Error::Config(unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            }));
+        }
+    }
+    let mut count = 0;
+    let listings = unsafe { sys::rd_kafka_ListConsumerGroups_result_valid(result, &raw mut count) };
+    if count > 0 && listings.is_null() {
+        return Err(Error::Config(
+            "broker returned a null consumer-group listing array".into(),
+        ));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let listing = unsafe { *listings.add(index) };
+        if listing.is_null() {
+            return Err(Error::Config(
+                "broker returned a null consumer-group listing".into(),
+            ));
+        }
+        rows.push(ConsumerGroupListing {
+            group: unsafe { c_string(sys::rd_kafka_ConsumerGroupListing_group_id(listing)) },
+            state: consumer_group_state_name(unsafe {
+                sys::rd_kafka_ConsumerGroupListing_state(listing)
+            })
+            .to_owned(),
+            group_type: consumer_group_type_name(unsafe {
+                sys::rd_kafka_ConsumerGroupListing_type(listing)
+            })
+            .to_owned(),
+            is_simple: unsafe {
+                sys::rd_kafka_ConsumerGroupListing_is_simple_consumer_group(listing)
+            } != 0,
+        });
+    }
+    Ok(rows)
+}
+
+/// Describes consumer groups and decodes member assignments through librdkafka.
+pub fn describe_consumer_groups(
+    client: *mut sys::rd_kafka_t,
+    groups: &[String],
+    timeout_ms: i32,
+) -> Result<Vec<ConsumerGroupDescription>> {
+    let groups = groups
+        .iter()
+        .map(|group| {
+            CString::new(group.as_str())
+                .map_err(|_| Error::Usage("consumer group contains a NUL byte".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut pointers = groups
+        .iter()
+        .map(|group| group.as_ptr())
+        .collect::<Vec<_>>();
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_DESCRIBECONSUMERGROUPS,
+        timeout_ms,
+    )?;
+    unsafe {
+        sys::rd_kafka_DescribeConsumerGroups(
+            client,
+            pointers.as_mut_ptr(),
+            pointers.len(),
+            options.0,
+            queue.0,
+        );
+    }
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_DescribeConsumerGroups_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid DescribeConsumerGroups response".into(),
+        ));
+    }
+    let mut count = 0;
+    let descriptions =
+        unsafe { sys::rd_kafka_DescribeConsumerGroups_result_groups(result, &raw mut count) };
+    if count > 0 && descriptions.is_null() {
+        return Err(Error::Config(
+            "broker returned a null consumer-group description array".into(),
+        ));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let description = unsafe { *descriptions.add(index) };
+        rows.push(unsafe { consumer_group_description_from_native(description) }?);
+    }
+    Ok(rows)
+}
+
+unsafe fn consumer_group_description_from_native(
+    description: *const sys::rd_kafka_ConsumerGroupDescription_t,
+) -> Result<ConsumerGroupDescription> {
+    if description.is_null() {
+        return Err(Error::Config(
+            "broker returned a null consumer-group description".into(),
+        ));
+    }
+    let error = unsafe { sys::rd_kafka_ConsumerGroupDescription_error(description) };
+    if native_error_failed(error) {
+        return Err(Error::Config(unsafe {
+            c_string(sys::rd_kafka_error_string(error))
+        }));
+    }
+    let coordinator = unsafe { sys::rd_kafka_ConsumerGroupDescription_coordinator(description) };
+    let member_count = unsafe { sys::rd_kafka_ConsumerGroupDescription_member_count(description) };
+    let members = (0..member_count)
+        .map(|index| unsafe {
+            consumer_group_member_from_native(sys::rd_kafka_ConsumerGroupDescription_member(
+                description,
+                index,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ConsumerGroupDescription {
+        group: unsafe { c_string(sys::rd_kafka_ConsumerGroupDescription_group_id(description)) },
+        state: consumer_group_state_name(unsafe {
+            sys::rd_kafka_ConsumerGroupDescription_state(description)
+        })
+        .to_owned(),
+        group_type: consumer_group_type_name(unsafe {
+            sys::rd_kafka_ConsumerGroupDescription_type(description)
+        })
+        .to_owned(),
+        assignor: unsafe {
+            c_string(sys::rd_kafka_ConsumerGroupDescription_partition_assignor(
+                description,
+            ))
+        },
+        coordinator_id: if coordinator.is_null() {
+            -1
+        } else {
+            unsafe { sys::rd_kafka_Node_id(coordinator) }
+        },
+        coordinator: if coordinator.is_null() {
+            String::new()
+        } else {
+            format!(
+                "{}:{}",
+                unsafe { c_string(sys::rd_kafka_Node_host(coordinator)) },
+                unsafe { sys::rd_kafka_Node_port(coordinator) }
+            )
+        },
+        is_simple: unsafe {
+            sys::rd_kafka_ConsumerGroupDescription_is_simple_consumer_group(description)
+        } != 0,
+        members,
+    })
+}
+
+unsafe fn consumer_group_member_from_native(
+    member: *const sys::rd_kafka_MemberDescription_t,
+) -> Result<ConsumerGroupMember> {
+    if member.is_null() {
+        return Err(Error::Config(
+            "broker returned a null consumer-group member".into(),
+        ));
+    }
+    Ok(ConsumerGroupMember {
+        member_id: unsafe { c_string(sys::rd_kafka_MemberDescription_consumer_id(member)) },
+        instance_id: unsafe {
+            optional_c_string_from_ptr(sys::rd_kafka_MemberDescription_group_instance_id(member))
+        },
+        client_id: unsafe { c_string(sys::rd_kafka_MemberDescription_client_id(member)) },
+        host: unsafe { c_string(sys::rd_kafka_MemberDescription_host(member)) },
+        assignment: unsafe {
+            member_assignment_partitions(sys::rd_kafka_MemberDescription_assignment(member))
+        }?,
+        target_assignment: unsafe {
+            member_assignment_partitions(sys::rd_kafka_MemberDescription_target_assignment(member))
+        }?,
+    })
+}
+
+unsafe fn member_assignment_partitions(
+    assignment: *const sys::rd_kafka_MemberAssignment_t,
+) -> Result<Vec<ConsumerGroupPartition>> {
+    if assignment.is_null() {
+        return Ok(Vec::new());
+    }
+    let partitions = unsafe { sys::rd_kafka_MemberAssignment_partitions(assignment) };
+    if partitions.is_null() {
+        return Ok(Vec::new());
+    }
+    let count = usize::try_from(unsafe { (*partitions).cnt })
+        .map_err(|_| Error::Config("invalid member assignment partition count".into()))?;
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let partition = unsafe { &*(*partitions).elems.add(index) };
+        rows.push(ConsumerGroupPartition {
+            topic: unsafe { c_string(partition.topic) },
+            partition: partition.partition,
+        });
+    }
+    Ok(rows)
+}
+
+unsafe fn optional_c_string_from_ptr(pointer: *const c_char) -> Option<String> {
+    (!pointer.is_null()).then(|| unsafe { c_string(pointer) })
+}
+
+fn check_owned_error(error: *mut sys::rd_kafka_error_t) -> Result<()> {
+    if error.is_null() {
+        return Ok(());
+    }
+    let failed = native_error_failed(error);
+    let message = failed.then(|| unsafe { c_string(sys::rd_kafka_error_string(error)) });
+    unsafe { sys::rd_kafka_error_destroy(error) };
+    message.map_or(Ok(()), |message| Err(Error::Config(message)))
+}
+
+const fn native_consumer_group_state(
+    value: ConsumerGroupState,
+) -> sys::rd_kafka_consumer_group_state_t {
+    match value {
+        ConsumerGroupState::PreparingRebalance => {
+            sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_PREPARING_REBALANCE
+        }
+        ConsumerGroupState::CompletingRebalance => {
+            sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_COMPLETING_REBALANCE
+        }
+        ConsumerGroupState::Stable => {
+            sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_STABLE
+        }
+        ConsumerGroupState::Dead => {
+            sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_DEAD
+        }
+        ConsumerGroupState::Empty => {
+            sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_EMPTY
+        }
+    }
+}
+
+const fn native_consumer_group_type(
+    value: ConsumerGroupType,
+) -> sys::rd_kafka_consumer_group_type_t {
+    match value {
+        ConsumerGroupType::Consumer => {
+            sys::rd_kafka_consumer_group_type_t::RD_KAFKA_CONSUMER_GROUP_TYPE_CONSUMER
+        }
+        ConsumerGroupType::Classic => {
+            sys::rd_kafka_consumer_group_type_t::RD_KAFKA_CONSUMER_GROUP_TYPE_CLASSIC
+        }
+    }
+}
+
+const fn consumer_group_state_name(value: sys::rd_kafka_consumer_group_state_t) -> &'static str {
+    match value {
+        sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_PREPARING_REBALANCE => {
+            "PreparingRebalance"
+        }
+        sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_COMPLETING_REBALANCE => {
+            "CompletingRebalance"
+        }
+        sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_STABLE => "Stable",
+        sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_DEAD => "Dead",
+        sys::rd_kafka_consumer_group_state_t::RD_KAFKA_CONSUMER_GROUP_STATE_EMPTY => "Empty",
+        _ => "Unknown",
+    }
+}
+
+const fn consumer_group_type_name(value: sys::rd_kafka_consumer_group_type_t) -> &'static str {
+    match value {
+        sys::rd_kafka_consumer_group_type_t::RD_KAFKA_CONSUMER_GROUP_TYPE_CONSUMER => "Consumer",
+        sys::rd_kafka_consumer_group_type_t::RD_KAFKA_CONSUMER_GROUP_TYPE_CLASSIC => "Classic",
+        _ => "Unknown",
+    }
 }
 
 /// Resolves offsets through librdkafka's `ListOffsets` Admin API.

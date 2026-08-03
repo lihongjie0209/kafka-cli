@@ -202,6 +202,18 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "groups",
+            "list",
+            "--state",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("STATE"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "configs",
             "alter",
             "--entity-type",
