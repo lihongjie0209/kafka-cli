@@ -32,16 +32,32 @@ pub fn write_value<T: Serialize>(
     value: &T,
     table: impl FnOnce(&T) -> String,
 ) -> Result<()> {
+    write_value_with_errors(format, command, value, &[], table)
+}
+
+/// Writes a serializable value and command-level batch errors.
+pub fn write_value_with_errors<T: Serialize>(
+    format: OutputFormat,
+    command: &str,
+    value: &T,
+    errors: &[String],
+    table: impl FnOnce(&T) -> String,
+) -> Result<()> {
     let mut stdout = io::stdout().lock();
     match format {
-        OutputFormat::Table => writeln!(stdout, "{}", table(value))?,
+        OutputFormat::Table => {
+            writeln!(stdout, "{}", table(value))?;
+            for error in errors {
+                writeln!(stdout, "Error: {error}")?;
+            }
+        }
         OutputFormat::Json => serde_json::to_writer_pretty(
             &mut stdout,
             &Envelope {
                 schema_version: 1,
                 command,
                 data: value,
-                errors: Vec::new(),
+                errors: errors.to_vec(),
             },
         )?,
     }
@@ -88,5 +104,19 @@ mod tests {
             rendered,
             "┌────────┬───────────┐\n│ TOPIC  ┆ PARTITION │\n╞════════╪═══════════╡\n│ events ┆ 0         │\n├╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┤\n│ audit  ┆ 12        │\n└────────┴───────────┘"
         );
+    }
+
+    #[test]
+    fn json_envelope_should_serialize_batch_errors() {
+        let envelope = Envelope {
+            schema_version: 1,
+            command: "groups.reset-offsets",
+            data: Vec::<String>::new(),
+            errors: vec!["group is active".into()],
+        };
+
+        let value = serde_json::to_value(envelope).expect("serialize envelope");
+
+        assert_eq!(value["errors"], serde_json::json!(["group is active"]));
     }
 }

@@ -1,6 +1,6 @@
 //! End-to-end command-family coverage against a real Kafka 4.x broker.
 
-use std::{fs, process::Output};
+use std::{fs, process::Output, thread, time::Duration};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -478,6 +478,27 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let selected_rows = selected_reset["data"].as_array().expect("reset rows");
     assert_eq!(selected_rows.len(), 1);
     assert_eq!(selected_rows[0]["partition"], 0);
+    let merged_reset: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "groups",
+            "reset-offsets",
+            "--group",
+            "integration-suite",
+            "--topic",
+            "integration-events:0",
+            "--topic",
+            "integration-events:1",
+            "--to-earliest",
+        ],
+    ))
+    .expect("merged reset JSON");
+    assert_eq!(
+        merged_reset["data"].as_array().expect("reset rows").len(),
+        2
+    );
     let exported_reset = success(
         &bootstrap,
         &[
@@ -593,8 +614,81 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
+    let mut active_consumer = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kafka"))
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "consume",
+            "--topic",
+            "integration-events",
+            "--group",
+            "active-reset-group",
+            "--timeout-ms",
+            "20000",
+        ])
+        .spawn()
+        .expect("start active consumer");
+    let mut active = false;
+    for _ in 0..20 {
+        let state = success(
+            &bootstrap,
+            &[
+                "groups",
+                "describe",
+                "--group",
+                "active-reset-group",
+                "--state",
+            ],
+        );
+        if state.contains("Stable") {
+            active = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert!(active, "consumer group did not become active");
+    let active_reset: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "groups",
+            "reset-offsets",
+            "--group",
+            "active-reset-group",
+            "--topic",
+            "integration-events",
+            "--to-earliest",
+            "--execute",
+        ],
+    ))
+    .expect("active group reset JSON");
     assert!(
-        success(&bootstrap, &["groups", "delete", "--all-groups"]).contains("integration-suite")
+        active_reset["data"]
+            .as_array()
+            .expect("reset rows")
+            .is_empty()
+    );
+    assert!(
+        active_reset["errors"][0]
+            .as_str()
+            .expect("reset error")
+            .contains("current state is Stable")
+    );
+    active_consumer.kill().expect("stop active consumer");
+    active_consumer.wait().expect("wait for active consumer");
+    let delete_preview: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &["--output", "json", "groups", "delete", "--all-groups"],
+    ))
+    .expect("group delete preview JSON");
+    assert_eq!(delete_preview["command"], "groups.delete");
+    assert!(
+        delete_preview["data"]
+            .as_array()
+            .expect("delete rows")
+            .iter()
+            .any(|row| row["group"] == "integration-suite" && row["status"] == "PREVIEW")
     );
     success(
         &bootstrap,

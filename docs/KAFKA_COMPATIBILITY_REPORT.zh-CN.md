@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目版本：`master`（报告随每个对齐提交持续更新）。
+- 本项目基准：`master`，提交 `9018626f1855d270c5eda01f4a752f3f65a79046`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（约 30%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -22,6 +22,29 @@
 | 部分支持 | 命令可用，但缺少原版的一部分资源类型、选项、输出细节或高级模式 |
 | 未支持 | 没有对应命令入口或实质实现 |
 | 有意差异 | 本项目为了安全或机器可读输出而采用不同默认行为 |
+
+### 2.1 审计方法与统计口径
+
+本报告不是根据 README 或命令名称推断能力，而是同时核对以下证据：
+
+1. Apache Kafka 基准提交的 `bin/*.sh`，以及脚本实际转发到的 Java `*CommandOptions`/`OptionSpec` 定义。
+2. 本项目 `src/cli.rs` 的 clap 命令树、`src/commands.rs` 的执行路径、`src/ffi.rs` 的 librdkafka 调用。
+3. `tests/cli.rs`、Kafka 3.6.2/4.3.1 集成测试与 GitHub Actions 结果。
+
+“入口覆盖”只统计可识别的脚本名称；“动作覆盖”统计 list/create/alter 等一级动作；“选项覆盖”必须同时具备解析和有效执行语义。仅能解析、没有后端效果的参数不算支持。本报告不以输出逐字符一致为目标，表格/JSON 属于本项目自己的输出契约。
+
+### 2.2 覆盖度仪表盘
+
+| 维度 | 结果 | 解读 |
+|---|---:|---|
+| Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
+| 已覆盖入口的一级动作 | 31 / 31 | 13 个入口中原版主要动作均有对应路径，但不代表动作内选项完整；本项目另扩展 cluster api-versions |
+| librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
+| 普通自动化测试 | 66 个通过 | 63 个 library unit tests + 3 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 均为单 broker 代表性路径，不等于完整兼容矩阵 |
+| 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
+
+原版动作数 31 的构成：Topics 5、Consumer Groups 6、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 7 个入口各 1。Console producer/consumer 属于单动作数据命令；本项目额外把 API versions 也放入 cluster 子命令。
 
 ## 3. 顶层脚本覆盖
 
@@ -120,7 +143,7 @@
 - 原版复数 entity type（`topics`、`brokers`、`groups`、`users`）以及兼容的单数别名。
 - user SCRAM credential describe、upsert 和 delete，支持 SCRAM-SHA-256、SCRAM-SHA-512、iterations 与 password。
 - SCRAM 预览只显示 mechanism 和 iterations，不回显 password。
-- alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON/YAML，而非手工文本。
+- alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON，而非手工文本。
 - 预览与 `--execute`。
 
 缺少：普通 user quota、client、user/client 组合、IP、broker-logger、client-metrics、entity-default、bootstrap-controller。除 SCRAM credential 外，资源类型覆盖仍少于原版。broker default entity 必须使用空 ConfigResource name，但 librdkafka 2.12 的 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时直接返回 NULL，因此不能通过该库表达。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
@@ -158,7 +181,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 
 已支持 preferred、unclean；topic+partition、原版 `--path-to-json-file` 批量 partition 输入或 all-topic-partitions；预览与 `--execute`。批量输入会校验空列表、负 partition 和重复 topic-partition，执行统一使用 librdkafka `ElectLeaders` Admin API。
 
-差异：未提供旧 `--admin.config` 别名和 bootstrap-controller。原版执行命令直接产生变更；本项目要求 `--execute`，预览使用统一表格/JSON/YAML 输出。
+差异：未提供旧 `--admin.config` 别名和 bootstrap-controller。原版执行命令直接产生变更；本项目要求 `--execute`，预览使用统一表格/JSON 输出。
 
 ### 4.11 Log Dirs
 
@@ -187,7 +210,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 | Java 插件 | formatter、reader、deserializer 可加载类 | 不支持加载 Java 类 |
 | 超时 | 各工具分别定义 | 全局 `--timeout-ms`，部分命令有原版语义差异 |
 
-JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出已全部使用 `comfy-table`，没有继续手工拼接 table 文本。
+JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。结构化结果集的表格由 `comfy-table` 生成；producer/consumer 的记录流、reset-offsets 的 CSV 导出以及状态提示仍有意使用流式或普通文本。当前 group delete 的预览/结果、部分 SCRAM/ACL/reassignment/cluster 提示仍是手工文本，因此不能宣称所有非流式输出均已统一。项目当前不支持 YAML 输出。
 
 ## 6. 客户端实现架构
 
@@ -205,7 +228,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：62 个通过。
+- Rust 单元测试与普通 CLI 测试：66 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -257,6 +280,35 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 
 在对外发布时，建议使用“兼容 13 个常用 Kafka CLI 入口的 Rust 工具”表述，不应使用“100% 兼容 Apache Kafka CLI”。完成 P0 和 P1 后，才适合将已覆盖的 13 个脚本声明为主要功能兼容。
 
+### 10.1 二次代码审计发现的待修正项
+
+以下不是远期功能愿望，而是已实现命令与原版语义之间仍需处理的具体问题：
+
+| 优先级 | 位置 | 当前行为 | 原版/期望行为 |
+|---|---|---|---|
+| P1 | 批量管理请求 | 部分路径在首个错误处返回，逐实体成功/失败信息不完整 | 原版批量工具通常展示逐实体结果；本项目应保持 partial failure 语义一致 |
+| P2 | regex | Rust regex 预校验与 librdkafka POSIX topic regex 不是同一语法实现 | 应明确分离 Java Pattern 兼容校验与实际订阅语法，或避免过度承诺 |
+
+本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并，以及 groups delete 结构化输出。当前剩余问题主要是其他管理命令的逐实体失败结果和正则语法边界。
+
+### 10.2 逐入口验收结论
+
+| 入口 | 动作完整性 | 主要参数完整性 | 行为/输出兼容性 | 综合结论 |
+|---|---|---|---|---|
+| topics | 完整 | 高 | 高/中 | 常用功能可替代，缺单次响应 partition 限制 |
+| console-producer | 单动作 | 中 | 中 | 可做常规生产，不替代 Java reader 插件体系 |
+| console-consumer | 单动作 | 中 | 中 | 可做常规消费，不替代 formatter/deserializer 插件体系 |
+| consumer-groups | 完整 | 高 | 高/中 | reset 已对齐 inactive group、空 group、重复 selector 和结构化批量输出；epoch 列仍受 librdkafka 限制 |
+| configs | 完整 | 低/中 | 中 | topic/broker/group/SCRAM 可用，entity 覆盖明显不足 |
+| get-offsets | 单动作 | 高 | 中 | 查询能力较完整，缺分层存储相关 OffsetSpec |
+| acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
+| reassign-partitions | 完整 | 中 | 中 | 基础迁移可用，生产限流/保留 throttle 等关键能力缺失 |
+| delete-records | 单动作 | 高 | 高/中 | 核心功能完整，额外 `--execute` 是安全差异 |
+| leader-election | 单动作 | 高 | 高/中 | 核心功能完整，额外 `--execute` 是安全差异 |
+| log-dirs | 单动作 | 高 | 高/中 | 常用 describe 能力完整 |
+| broker-api-versions | 单动作 | 高 | 中 | 核心查询完整，输出格式不同 |
+| cluster | 完整 | 中 | 中 | 常用查询和 unregister 可用，controller/fenced 参数不足 |
+
 ## 11. librdkafka 对齐变更记录
 
 | 日期 | 功能 | 结果 | 验证 |
@@ -272,17 +324,18 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Describe Cluster | cluster ID 与 endpoint 查询统一迁移到 librdkafka `DescribeCluster` Admin API，新增 rack 与 controller 输出 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成测试通过 |
 | 2026-08-03 | Topic default replication factor | create 未指定 `--replication-factor` 时使用 librdkafka `-1` sentinel，交由 broker 的 default.replication.factor 决定 | Topic create 单元路径及 Kafka 3.6.2/4.3.1 集成测试 |
 | 2026-08-03 | Consumer Group 批量目标 | describe 的 offsets/state/members 视图及 delete 支持重复 `--group` 与 `--all-groups`；all-groups 通过 librdkafka `ListConsumerGroups` 解析目标 | Clippy、53 个普通测试、bundled Kafka 4.3.1 批量 describe/delete 集成测试通过 |
-| 2026-08-03 | Consumer Group 批量 reset | reset-offsets 支持重复 group/topic、all-groups、all-topics 和显式 dry-run；预览改为统一表格/JSON/YAML 输出，执行仍使用 librdkafka `AlterConsumerGroupOffsets` | Clippy、53 个普通测试、bundled Kafka 4.3.1 all-groups/all-topics 集成测试通过 |
+| 2026-08-03 | Consumer Group 批量 reset | reset-offsets 支持重复 group/topic、all-groups、all-topics 和显式 dry-run；预览改为统一表格/JSON 输出，执行仍使用 librdkafka `AlterConsumerGroupOffsets` | Clippy、53 个普通测试、bundled Kafka 4.3.1 all-groups/all-topics 集成测试通过 |
 | 2026-08-03 | Leader Election JSON 批量目标 | 新增原版 `--path-to-json-file` 格式，校验空列表、非法/重复 partition；librdkafka `ElectLeaders` FFI 从单目标扩展为 partition list，预览改为统一结构化输出 | Clippy、54 个普通测试、bundled Kafka 4.3.1 单目标/批量目标集成测试通过 |
 | 2026-08-03 | Consumer Group reset CSV | 新增原版 `--export`/`--from-file` 无表头 CSV；支持单 group 三列与多 group 四列格式、CSV 转义、重复/选择范围校验和 offset 边界调整，执行复用 librdkafka `AlterConsumerGroupOffsets` | Clippy、55 个普通测试、bundled Kafka 4.3.1 export→import→execute 集成闭环通过 |
 | 2026-08-03 | Console Producer 主要参数 | 新增 sync/默认 async 发送模式，并将 batch、retries/backoff、linger、request timeout、metadata expiry、buffer memory、socket buffer 等原版参数映射到 librdkafka；补充原版 acks/compression 参数名 | Clippy、56 个普通测试、bundled Kafka 4.3.1 sync 调优参数与默认 async 发送/消费闭环通过 |
 | 2026-08-03 | Console Consumer librdkafka 选项 | 新增 include 正则订阅、空闲 timeout、isolation level 和 skip-message-on-error；修正手工 partition 无 offset 时默认为 latest，command-property 保持最高优先级 | Clippy、57 个普通测试、bundled Kafka 4.3.1 include/read_committed/timeout 参数消费闭环通过 |
-| 2026-08-03 | Configs add-config-file | 新增原版 Java properties `--add-config-file`，与 add-config 互斥并复用 librdkafka IncrementalAlterConfigs；普通配置变更预览改为统一表格/JSON/YAML | Clippy、58 个普通测试、bundled Kafka 4.3.1 properties 文件 add/delete 闭环通过 |
+| 2026-08-03 | Configs add-config-file | 新增原版 Java properties `--add-config-file`，与 add-config 互斥并复用 librdkafka IncrementalAlterConfigs；普通配置变更预览改为统一表格/JSON | Clippy、58 个普通测试、bundled Kafka 4.3.1 properties 文件 add/delete 闭环通过 |
 | 2026-08-03 | Configs 全实体与 `--all` | describe 的 entity-name 改为可选，topic/broker/group 分别通过 librdkafka metadata/ListConsumerGroups 枚举；默认过滤为动态配置，`--all` 返回继承/静态/默认配置并输出 entity/source | Clippy、59 个普通测试、bundled Kafka 4.3.1 全 topic 枚举及 all config 集成测试通过 |
 | 2026-08-03 | Consumer Group validate-regex | 新增无需 broker 的结构化正则校验子命令，并为 kafka-consumer-groups 兼容入口改写原版 `--validate-regex` | Clippy、61 个普通测试（含无 bootstrap CLI 测试）通过 |
 | 2026-08-03 | Consumer Group verbose | offset verbose 输出 librdkafka committed leader epoch；members verbose 输出 current/target assignment，普通视图只显示 partition 数量；明确 group/member epoch 未由 librdkafka 2.12 暴露 | Clippy、61 个普通测试、bundled Kafka 4.3.1 verbose offsets/members 集成测试通过 |
 | 2026-08-03 | Consumer Group reset partition selector | reset-offsets 新增原版 `topic:partition,partition` 选择语法，校验负数、重复和不存在 partition；规划及执行继续使用 librdkafka metadata/ListOffsets/AlterConsumerGroupOffsets | Clippy、62 个普通测试、bundled Kafka 4.3.1 单 partition JSON 规划集成测试通过 |
-| 2026-08-03 | Consumer Group delete-offsets 批量 topic | delete-offsets 支持重复 topic 与 `topic:partition,partition`，校验不存在 partition；librdkafka DeleteConsumerGroupOffsets FFI 扩展为跨 topic partition list，预览改用统一表格/JSON/YAML | Clippy、62 个普通测试、bundled Kafka 4.3.1 跨 topic 删除集成测试通过 |
+| 2026-08-03 | Consumer Group delete-offsets 批量 topic | delete-offsets 支持重复 topic 与 `topic:partition,partition`，校验不存在 partition；librdkafka DeleteConsumerGroupOffsets FFI 扩展为跨 topic partition list，预览改用统一表格/JSON | Clippy、62 个普通测试、bundled Kafka 4.3.1 跨 topic 删除集成测试通过 |
+| 2026-08-03 | Consumer Group 二次语义审计 | reset-offsets 仅处理 Empty/Dead/不存在的 group，活动组写入结构化 errors；无 committed topic 的 group 不再中断批次；重复 topic selector 合并；group delete 统一 table/JSON 结果 | Clippy、66 个普通测试、Kafka 4.3.1 active-group/重复 selector/delete JSON 集成测试通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

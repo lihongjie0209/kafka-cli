@@ -903,22 +903,42 @@ async fn groups(
             all_groups,
             execute,
         } => {
-            let group = resolve_group_names(config, timeout, &group, all_groups)?;
-            if group.is_empty() {
+            let groups = resolve_group_names(config, timeout, &group, all_groups)?;
+            if groups.is_empty() {
                 return Err(Error::Usage("no consumer groups matched".into()));
             }
             if !execute {
-                println!("Would delete consumer groups: {}", group.join(","));
-                return Ok(());
+                let rows = groups
+                    .into_iter()
+                    .map(|group| GroupDeleteRow {
+                        group,
+                        status: "PREVIEW".into(),
+                        error: None,
+                    })
+                    .collect::<Vec<_>>();
+                return write_group_delete_rows(format, &rows);
             }
-            let names = group.iter().map(String::as_str).collect::<Vec<_>>();
+            let names = groups.iter().map(String::as_str).collect::<Vec<_>>();
             let results = admin(config)?
                 .delete_groups(&names, &AdminOptions::new())
                 .await?;
             let failures = results.iter().filter(|result| result.is_err()).count();
-            for result in results {
-                println!("{result:?}");
-            }
+            let rows = results
+                .into_iter()
+                .map(|result| match result {
+                    Ok(group) => GroupDeleteRow {
+                        group,
+                        status: "DELETED".into(),
+                        error: None,
+                    },
+                    Err((group, error)) => GroupDeleteRow {
+                        group,
+                        status: "FAILED".into(),
+                        error: Some(error.to_string()),
+                    },
+                })
+                .collect::<Vec<_>>();
+            write_group_delete_rows(format, &rows)?;
             if failures == 0 {
                 Ok(())
             } else {
@@ -935,6 +955,28 @@ async fn groups(
             execute,
         } => delete_group_offsets_command(config, timeout, format, &group, &topic, execute),
     }
+}
+
+#[derive(Debug, Serialize)]
+struct GroupDeleteRow {
+    group: String,
+    status: String,
+    error: Option<String>,
+}
+
+fn write_group_delete_rows(format: OutputFormat, rows: &[GroupDeleteRow]) -> Result<()> {
+    output::write_value(format, "groups.delete", &rows, |rows| {
+        output::table(
+            ["GROUP", "STATUS", "ERROR"],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.status.clone(),
+                    row.error.as_deref().unwrap_or("-").to_owned(),
+                ]
+            }),
+        )
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1443,12 +1485,23 @@ fn reset_offsets(
     if groups.is_empty() {
         return Err(Error::Usage("no consumer groups matched".into()));
     }
+    let (groups, group_errors) = resettable_groups(config, timeout, &groups)?;
     if let Some(path) = args.from_file.as_deref() {
-        let rows = read_reset_plan(path, &groups, args.group.len() == 1, config, timeout)?;
+        let rows = if groups.is_empty() {
+            Vec::new()
+        } else {
+            read_reset_plan(path, &groups, args.group.len() == 1, config, timeout)?
+        };
         if args.execute {
             execute_reset_rows(config, timeout, &rows)?;
         }
-        return write_reset_rows(format, &rows, args.export, args.group.len() == 1);
+        return write_reset_rows(
+            format,
+            &rows,
+            args.export,
+            args.group.len() == 1,
+            &group_errors,
+        );
     }
     let timestamp = if let Some(datetime) = args.to_datetime.as_deref() {
         Some(parse_datetime_millis(datetime)?)
@@ -1477,9 +1530,7 @@ fn reset_offsets(
             .map(|offset| offset.topic)
             .collect::<BTreeSet<_>>();
             if topics.is_empty() {
-                return Err(Error::Usage(format!(
-                    "consumer group {group} has no committed topics"
-                )));
+                continue;
             }
             topics
                 .into_iter()
@@ -1569,11 +1620,48 @@ fn reset_offsets(
             )?;
         }
     }
-    write_reset_rows(format, &rows, args.export, args.group.len() == 1)
+    write_reset_rows(
+        format,
+        &rows,
+        args.export,
+        args.group.len() == 1,
+        &group_errors,
+    )
+}
+
+fn resettable_groups(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    selected: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let client = admin(config)?;
+    let states =
+        ffi::list_consumer_groups(client.inner().native_ptr(), &[], &[], duration_ms(timeout)?)?
+            .into_iter()
+            .map(|listing| (listing.group, listing.state))
+            .collect::<BTreeMap<_, _>>();
+    Ok(classify_resettable_groups(selected, &states))
+}
+
+fn classify_resettable_groups(
+    selected: &[String],
+    states: &BTreeMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut groups = Vec::new();
+    let mut errors = Vec::new();
+    for group in selected {
+        match states.get(group).map(String::as_str) {
+            None | Some("Empty" | "Dead") => groups.push(group.clone()),
+            Some(state) => errors.push(format!(
+                "assignments can only be reset if group '{group}' is inactive; current state is {state}"
+            )),
+        }
+    }
+    (groups, errors)
 }
 
 fn parse_reset_topics(values: &[String]) -> Result<BTreeMap<String, Option<BTreeSet<i32>>>> {
-    let mut topics = BTreeMap::new();
+    let mut topics: BTreeMap<String, Option<BTreeSet<i32>>> = BTreeMap::new();
     for value in values {
         let (topic, partitions) = if let Some((topic, partitions)) = value.split_once(':') {
             if topic.is_empty() || partitions.is_empty() || partitions.contains(':') {
@@ -1601,11 +1689,14 @@ fn parse_reset_topics(values: &[String]) -> Result<BTreeMap<String, Option<BTree
             }
             (value.clone(), None)
         };
-        if topics.insert(topic.clone(), partitions).is_some() {
-            return Err(Error::Usage(format!(
-                "duplicate reset topic selection for {topic}"
-            )));
-        }
+        topics
+            .entry(topic)
+            .and_modify(|current| match (&mut *current, &partitions) {
+                (Some(current), Some(partitions)) => current.extend(partitions),
+                (current, None) => *current = None,
+                (None, Some(_)) => {}
+            })
+            .or_insert(partitions);
     }
     Ok(topics)
 }
@@ -1615,6 +1706,7 @@ fn write_reset_rows(
     rows: &[ResetOffsetRow],
     export: bool,
     single_group: bool,
+    errors: &[String],
 ) -> Result<()> {
     if export {
         let mut writer = csv::WriterBuilder::new()
@@ -1634,9 +1726,12 @@ fn write_reset_rows(
         let csv = String::from_utf8(bytes)
             .map_err(|error| Error::Usage(format!("reset CSV is not UTF-8: {error}")))?;
         print!("{csv}");
+        for error in errors {
+            eprintln!("Error: {error}");
+        }
         return Ok(());
     }
-    output::write_value(format, "groups.reset-offsets", &rows, |rows| {
+    output::write_value_with_errors(format, "groups.reset-offsets", &rows, errors, |rows| {
         output::table(
             ["GROUP", "TOPIC", "PARTITION", "NEW_OFFSET"],
             rows.iter().map(|row| {
@@ -4377,13 +4472,52 @@ mod tests {
     }
 
     #[test]
-    fn reset_topics_should_parse_partition_lists_and_reject_duplicates() {
-        let topics = parse_reset_topics(&["events:0,2".into(), "orders".into()])
-            .expect("valid reset topics");
-        assert_eq!(topics["events"], Some(BTreeSet::from([0, 2])));
+    fn reset_topics_should_merge_repeated_partition_selections() {
+        let topics = parse_reset_topics(&[
+            "events:0,2".into(),
+            "events:1".into(),
+            "orders:0".into(),
+            "orders".into(),
+        ])
+        .expect("valid reset topics");
+        assert_eq!(topics["events"], Some(BTreeSet::from([0, 1, 2])));
         assert_eq!(topics["orders"], None);
-        assert!(parse_reset_topics(&["events:0".into(), "events:1".into()]).is_err());
+    }
+
+    #[test]
+    fn reset_topics_should_reject_negative_partitions() {
         assert!(parse_reset_topics(&["events:-1".into()]).is_err());
+    }
+
+    #[test]
+    fn resettable_groups_should_retain_inactive_and_missing_groups() {
+        let states = BTreeMap::from([
+            ("empty".into(), "Empty".into()),
+            ("dead".into(), "Dead".into()),
+            ("active".into(), "Stable".into()),
+        ]);
+        let (groups, _) = classify_resettable_groups(
+            &[
+                "empty".into(),
+                "dead".into(),
+                "missing".into(),
+                "active".into(),
+            ],
+            &states,
+        );
+        assert_eq!(groups, ["empty", "dead", "missing"]);
+    }
+
+    #[test]
+    fn resettable_groups_should_report_active_group_state() {
+        let states = BTreeMap::from([("active".into(), "Stable".into())]);
+        let (_, errors) = classify_resettable_groups(&["active".into()], &states);
+        assert_eq!(
+            errors,
+            [
+                "assignments can only be reset if group 'active' is inactive; current state is Stable"
+            ]
+        );
     }
 
     #[test]
