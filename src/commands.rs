@@ -1434,20 +1434,43 @@ fn reset_offsets(
                     "consumer group {group} has no committed topics"
                 )));
             }
-            topics.iter().cloned().collect::<Vec<_>>()
+            topics
+                .into_iter()
+                .map(|topic| (topic, None))
+                .collect::<BTreeMap<_, _>>()
         } else {
-            args.topic.clone()
+            parse_reset_topics(&args.topic)?
         };
         let mut planned_offsets = Vec::new();
-        for topic_name in topics {
+        for (topic_name, selected) in topics {
             let metadata = consumer.fetch_metadata(Some(&topic_name), timeout)?;
             let topic = metadata
                 .topics()
                 .iter()
                 .find(|topic| topic.name() == topic_name)
                 .ok_or_else(|| Error::Usage(format!("topic {topic_name} not found")))?;
+            let partitions = topic
+                .partitions()
+                .iter()
+                .filter(|partition| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.contains(&partition.id()))
+                })
+                .collect::<Vec<_>>();
+            if let Some(selected) = &selected {
+                let existing = partitions
+                    .iter()
+                    .map(|partition| partition.id())
+                    .collect::<BTreeSet<_>>();
+                if let Some(missing) = selected.difference(&existing).next() {
+                    return Err(Error::Usage(format!(
+                        "partition {topic_name}:{missing} does not exist"
+                    )));
+                }
+            }
             let mut requested = TopicPartitionList::new();
-            for partition in topic.partitions() {
+            for partition in &partitions {
                 requested.add_partition(&topic_name, partition.id());
             }
             let committed = if args.shift_by.is_some() || args.to_current {
@@ -1457,7 +1480,7 @@ fn reset_offsets(
             };
             let timestamp_offsets = if let Some(timestamp) = timestamp {
                 let mut timestamp_request = TopicPartitionList::new();
-                for partition in topic.partitions() {
+                for partition in &partitions {
                     timestamp_request.add_partition_offset(
                         &topic_name,
                         partition.id(),
@@ -1468,7 +1491,7 @@ fn reset_offsets(
             } else {
                 None
             };
-            for partition in topic.partitions() {
+            for partition in partitions {
                 let (low, high) =
                     consumer.fetch_watermarks(&topic_name, partition.id(), timeout)?;
                 let target = reset_target(
@@ -1500,6 +1523,44 @@ fn reset_offsets(
         }
     }
     write_reset_rows(format, &rows, args.export, args.group.len() == 1)
+}
+
+fn parse_reset_topics(values: &[String]) -> Result<BTreeMap<String, Option<BTreeSet<i32>>>> {
+    let mut topics = BTreeMap::new();
+    for value in values {
+        let (topic, partitions) = if let Some((topic, partitions)) = value.split_once(':') {
+            if topic.is_empty() || partitions.is_empty() || partitions.contains(':') {
+                return Err(Error::Usage(format!(
+                    "invalid reset topic {value}; expected topic:partition,partition"
+                )));
+            }
+            let partitions = partitions
+                .split(',')
+                .map(|partition| {
+                    partition.parse::<i32>().map_err(|_| {
+                        Error::Usage(format!("invalid partition {partition} in {value}"))
+                    })
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
+            if partitions.iter().any(|partition| *partition < 0) {
+                return Err(Error::Usage(format!(
+                    "partitions in {value} must be non-negative"
+                )));
+            }
+            (topic.to_owned(), Some(partitions))
+        } else {
+            if value.is_empty() {
+                return Err(Error::Usage("reset topic must not be empty".into()));
+            }
+            (value.clone(), None)
+        };
+        if topics.insert(topic.clone(), partitions).is_some() {
+            return Err(Error::Usage(format!(
+                "duplicate reset topic selection for {topic}"
+            )));
+        }
+    }
+    Ok(topics)
 }
 
 fn write_reset_rows(
@@ -4266,6 +4327,16 @@ mod tests {
             93_784_000
         );
         assert!(parse_iso8601_duration_millis("1 hour").is_err());
+    }
+
+    #[test]
+    fn reset_topics_should_parse_partition_lists_and_reject_duplicates() {
+        let topics = parse_reset_topics(&["events:0,2".into(), "orders".into()])
+            .expect("valid reset topics");
+        assert_eq!(topics["events"], Some(BTreeSet::from([0, 2])));
+        assert_eq!(topics["orders"], None);
+        assert!(parse_reset_topics(&["events:0".into(), "events:1".into()]).is_err());
+        assert!(parse_reset_topics(&["events:-1".into()]).is_err());
     }
 
     #[test]

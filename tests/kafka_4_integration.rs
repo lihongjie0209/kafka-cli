@@ -460,6 +460,24 @@ fn all_command_families_work_against_kafka_4_3_1() {
         described_offsets.contains("integration-events"),
         "unexpected group offsets output: {described_offsets}"
     );
+    let selected_reset: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "groups",
+            "reset-offsets",
+            "--group",
+            "integration-suite",
+            "--topic",
+            "integration-events:0",
+            "--to-earliest",
+        ],
+    ))
+    .expect("partition-selected reset JSON");
+    let selected_rows = selected_reset["data"].as_array().expect("reset rows");
+    assert_eq!(selected_rows.len(), 1);
+    assert_eq!(selected_rows[0]["partition"], 0);
     let exported_reset = success(
         &bootstrap,
         &[
