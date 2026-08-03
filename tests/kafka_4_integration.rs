@@ -1451,6 +1451,62 @@ fn all_command_families_work_against_kafka_4_3_1() {
         &[
             "acls",
             "add",
+            "--topic",
+            "integration-events",
+            "--topic",
+            "integration-orders",
+            "--group",
+            "integration-batch-group",
+            "--allow-principal",
+            "User:batch-reader",
+            "--operation",
+            "read",
+            "--execute",
+        ],
+    );
+    let batch_acl = success(
+        &bootstrap,
+        &[
+            "acls",
+            "list",
+            "--topic",
+            "integration-events",
+            "--topic",
+            "integration-orders",
+            "--group",
+            "integration-batch-group",
+            "--principal",
+            "User:batch-reader",
+            "--principal",
+            "User:not-present",
+        ],
+    );
+    assert!(batch_acl.contains("integration-events"));
+    assert!(batch_acl.contains("integration-orders"));
+    assert!(batch_acl.contains("integration-batch-group"));
+    success(
+        &bootstrap,
+        &[
+            "acls",
+            "remove",
+            "--topic",
+            "integration-events",
+            "--topic",
+            "integration-orders",
+            "--group",
+            "integration-batch-group",
+            "--principal",
+            "User:batch-reader",
+            "--operation",
+            "read",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "acls",
+            "add",
             "--cluster",
             "--allow-principal",
             "User:operator",

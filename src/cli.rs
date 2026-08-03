@@ -717,17 +717,17 @@ pub enum AclAction {
 #[derive(Debug, Args)]
 pub struct AclFilterArgs {
     #[arg(long)]
-    pub topic: Option<String>,
+    pub topic: Vec<String>,
     #[arg(long)]
-    pub group: Option<String>,
+    pub group: Vec<String>,
     #[arg(long)]
     pub cluster: bool,
     #[arg(long)]
-    pub transactional_id: Option<String>,
+    pub transactional_id: Vec<String>,
     #[arg(long)]
-    pub delegation_token: Option<String>,
+    pub delegation_token: Vec<String>,
     #[arg(long)]
-    pub principal: Option<String>,
+    pub principal: Vec<String>,
     #[arg(long, value_enum, default_value_t)]
     pub resource_pattern_type: AclResourcePattern,
 }

@@ -4507,14 +4507,7 @@ fn acls(
     let timeout_ms = duration_ms(timeout)?;
     match action {
         AclAction::List(filter) => {
-            let rows = ffi::describe_acls(
-                client.inner().native_ptr(),
-                &acl_filter(filter, None)?,
-                timeout_ms,
-            )?
-            .into_iter()
-            .map(acl_row)
-            .collect::<Vec<_>>();
+            let rows = acl_list_rows(client.inner().native_ptr(), filter, timeout_ms)?;
             output::write_value(format, "acls.list", &rows, |rows| acl_table(rows))
         }
         AclAction::Add(mutation) => {
@@ -4583,6 +4576,55 @@ fn acls(
     }
 }
 
+fn acl_list_rows(
+    client: *mut rdkafka_sys::rd_kafka_t,
+    filter: &crate::cli::AclFilterArgs,
+    timeout_ms: i32,
+) -> Result<Vec<AclRow>> {
+    let resources = acl_resources(filter)?;
+    let resources = if resources.is_empty() {
+        vec![(AclResourceType::Any, None)]
+    } else {
+        resources
+            .into_iter()
+            .map(|(resource_type, name)| (resource_type, Some(name)))
+            .collect()
+    };
+    let principals = normalized_acl_values(&filter.principal, "principal")?;
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for (resource_type, resource_name) in resources {
+        let acl_filter = AclBindingFilter {
+            resource_type,
+            resource_name,
+            pattern_type: acl_wire_pattern(filter.resource_pattern_type),
+            principal: None,
+            host: None,
+            operation: AclOperation::Any,
+            permission_type: AclPermissionType::Any,
+        };
+        for binding in ffi::describe_acls(client, &acl_filter, timeout_ms)? {
+            if !principals.is_empty() && !principals.contains(&binding.principal) {
+                continue;
+            }
+            let row = acl_row(binding);
+            let key = (
+                row.resource_type.clone(),
+                row.resource_name.clone(),
+                row.pattern_type.clone(),
+                row.principal.clone(),
+                row.host.clone(),
+                row.operation.clone(),
+                row.permission.clone(),
+            );
+            if seen.insert(key) {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows)
+}
+
 fn write_acl_mutation_result(
     format: OutputFormat,
     command: &str,
@@ -4608,22 +4650,6 @@ fn write_acl_mutation_result(
     })
 }
 
-fn acl_filter(
-    filter: &crate::cli::AclFilterArgs,
-    operation: Option<AclOperation>,
-) -> Result<AclBindingFilter> {
-    let (resource_type, name) = acl_resource(filter)?;
-    Ok(AclBindingFilter {
-        resource_type,
-        resource_name: name,
-        pattern_type: acl_wire_pattern(filter.resource_pattern_type),
-        principal: filter.principal.clone(),
-        host: None,
-        operation: operation.unwrap_or(AclOperation::Any),
-        permission_type: AclPermissionType::Any,
-    })
-}
-
 fn acl_operations(values: &[String]) -> Result<Vec<AclOperation>> {
     values
         .iter()
@@ -4644,35 +4670,40 @@ fn acl_operations(values: &[String]) -> Result<Vec<AclOperation>> {
         .collect()
 }
 
-fn acl_resource(filter: &crate::cli::AclFilterArgs) -> Result<(AclResourceType, Option<String>)> {
+fn normalized_acl_values(values: &[String], label: &str) -> Result<BTreeSet<String>> {
+    values
+        .iter()
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(Error::Usage(format!("ACL {label} cannot be empty")))
+            } else {
+                Ok(value.to_owned())
+            }
+        })
+        .collect()
+}
+
+fn acl_resources(filter: &crate::cli::AclFilterArgs) -> Result<Vec<(AclResourceType, String)>> {
     let mut resources = Vec::new();
-    if let Some(topic) = &filter.topic {
-        resources.push((AclResourceType::Topic, topic.clone()));
+    for topic in normalized_acl_values(&filter.topic, "topic")? {
+        resources.push((AclResourceType::Topic, topic));
     }
-    if let Some(group) = &filter.group {
-        resources.push((AclResourceType::Group, group.clone()));
+    for group in normalized_acl_values(&filter.group, "group")? {
+        resources.push((AclResourceType::Group, group));
     }
     if filter.cluster {
         resources.push((AclResourceType::Cluster, "kafka-cluster".into()));
     }
-    if let Some(transactional_id) = &filter.transactional_id {
-        resources.push((AclResourceType::TransactionalId, transactional_id.clone()));
+    for transactional_id in normalized_acl_values(&filter.transactional_id, "transactional ID")? {
+        resources.push((AclResourceType::TransactionalId, transactional_id));
     }
-    if filter.delegation_token.is_some() {
+    if !filter.delegation_token.is_empty() {
         return Err(Error::Unsupported(
             "librdkafka does not support delegation-token ACL resources".into(),
         ));
     }
-    match resources.len() {
-        0 => Ok((AclResourceType::Any, None)),
-        1 => resources.pop().map_or_else(
-            || Err(Error::Config("ACL resource selection was lost".into())),
-            |(kind, name)| Ok((kind, Some(name))),
-        ),
-        _ => Err(Error::Usage(
-            "ACL requests accept exactly one resource selector".into(),
-        )),
-    }
+    Ok(resources)
 }
 
 const fn acl_wire_pattern(pattern: crate::cli::AclResourcePattern) -> AclPatternType {
@@ -4696,22 +4727,23 @@ fn acl_bindings(
             "ACL creation requires literal or prefixed resource pattern type".into(),
         ));
     }
+    validate_acl_entry_values(mutation)?;
     let resources = acl_mutation_resources(mutation, operations)?;
-    let mut principals = mutation
-        .allow_principal
-        .iter()
-        .map(|principal| (principal.as_str(), AclPermissionType::Allow))
+    let mut principals = normalized_acl_values(&mutation.allow_principal, "allow principal")?
+        .into_iter()
+        .map(|principal| (principal, AclPermissionType::Allow))
         .chain(
-            mutation
-                .deny_principal
-                .iter()
-                .map(|principal| (principal.as_str(), AclPermissionType::Deny)),
+            normalized_acl_values(&mutation.deny_principal, "deny principal")?
+                .into_iter()
+                .map(|principal| (principal, AclPermissionType::Deny)),
         )
         .collect::<Vec<_>>();
-    if principals.is_empty()
-        && let Some(principal) = &mutation.filter.principal
-    {
-        principals.push((principal, AclPermissionType::Allow));
+    if principals.is_empty() {
+        principals.extend(
+            normalized_acl_values(&mutation.filter.principal, "principal")?
+                .into_iter()
+                .map(|principal| (principal, AclPermissionType::Allow)),
+        );
     }
     if principals.is_empty() {
         return Err(Error::Usage(
@@ -4727,7 +4759,7 @@ fn acl_bindings(
                 &mutation.deny_host
             };
             let hosts = if configured_hosts.is_empty() {
-                vec![mutation.host.as_deref().unwrap_or("*")]
+                vec![mutation.host.as_deref().map_or("*", str::trim)]
             } else {
                 configured_hosts.iter().map(String::as_str).collect()
             };
@@ -4737,8 +4769,8 @@ fn acl_bindings(
                         resource_type,
                         resource_name: resource_name.clone(),
                         pattern_type: acl_wire_pattern(mutation.filter.resource_pattern_type),
-                        principal: (*principal).to_owned(),
-                        host: host.to_owned(),
+                        principal: principal.clone(),
+                        host: host.trim().to_owned(),
                         operation: *operation,
                         permission_type: *permission,
                     });
@@ -4753,48 +4785,35 @@ fn acl_removal_filters(
     mutation: &crate::cli::AclMutationArgs,
     operations: &[AclOperation],
 ) -> Result<Vec<AclBindingFilter>> {
+    validate_acl_entry_values(mutation)?;
     let resources = if mutation.producer || mutation.consumer {
         acl_mutation_resources(mutation, operations)?
     } else {
-        let (resource_type, resource_name) = acl_resource(&mutation.filter)?;
-        vec![(
-            resource_type,
-            resource_name.unwrap_or_default(),
-            operations.to_vec(),
-        )]
+        let resources = acl_resources(&mutation.filter)?;
+        if resources.is_empty() {
+            vec![(AclResourceType::Any, String::new(), operations.to_vec())]
+        } else {
+            resources
+                .into_iter()
+                .map(|(resource_type, resource_name)| {
+                    (resource_type, resource_name, operations.to_vec())
+                })
+                .collect()
+        }
     };
-    let mut entries = mutation
-        .allow_principal
-        .iter()
-        .flat_map(|principal| {
-            let hosts = if mutation.allow_host.is_empty() {
-                vec![mutation.host.as_deref().unwrap_or("*")]
-            } else {
-                mutation.allow_host.iter().map(String::as_str).collect()
-            };
-            hosts
+    let mut entries = acl_removal_entries(mutation)?;
+    if entries.is_empty() {
+        entries.extend(
+            normalized_acl_values(&mutation.filter.principal, "principal")?
                 .into_iter()
-                .map(move |host| (principal.as_str(), host, AclPermissionType::Allow))
-        })
-        .chain(mutation.deny_principal.iter().flat_map(|principal| {
-            let hosts = if mutation.deny_host.is_empty() {
-                vec![mutation.host.as_deref().unwrap_or("*")]
-            } else {
-                mutation.deny_host.iter().map(String::as_str).collect()
-            };
-            hosts
-                .into_iter()
-                .map(move |host| (principal.as_str(), host, AclPermissionType::Deny))
-        }))
-        .collect::<Vec<_>>();
-    if entries.is_empty()
-        && let Some(principal) = mutation.filter.principal.as_deref()
-    {
-        entries.push((
-            principal,
-            mutation.host.as_deref().unwrap_or("*"),
-            AclPermissionType::Any,
-        ));
+                .map(|principal| {
+                    (
+                        principal,
+                        mutation.host.as_deref().map_or("*", str::trim).to_owned(),
+                        AclPermissionType::Any,
+                    )
+                }),
+        );
     }
     let mut filters = Vec::new();
     for (resource_type, resource_name, operations) in resources {
@@ -4821,8 +4840,8 @@ fn acl_removal_filters(
                     resource_type,
                     resource_name: (!resource_name.is_empty()).then(|| resource_name.clone()),
                     pattern_type: acl_wire_pattern(mutation.filter.resource_pattern_type),
-                    principal: Some((*principal).to_owned()),
-                    host: Some((*host).to_owned()),
+                    principal: Some(principal.clone()),
+                    host: Some(host.clone()),
                     operation: *operation,
                     permission_type: *permission,
                 });
@@ -4832,29 +4851,79 @@ fn acl_removal_filters(
     Ok(filters)
 }
 
+fn acl_removal_entries(
+    mutation: &crate::cli::AclMutationArgs,
+) -> Result<Vec<(String, String, AclPermissionType)>> {
+    let allow_principals = normalized_acl_values(&mutation.allow_principal, "allow principal")?;
+    let deny_principals = normalized_acl_values(&mutation.deny_principal, "deny principal")?;
+    let allow_hosts = normalized_acl_values(&mutation.allow_host, "allow host")?;
+    let deny_hosts = normalized_acl_values(&mutation.deny_host, "deny host")?;
+    let default_host = mutation.host.as_deref().map_or("*", str::trim);
+    let allowed = allow_principals.iter().flat_map(|principal| {
+        let hosts = if allow_hosts.is_empty() {
+            vec![default_host]
+        } else {
+            allow_hosts.iter().map(String::as_str).collect()
+        };
+        hosts
+            .into_iter()
+            .map(move |host| (principal.clone(), host.to_owned(), AclPermissionType::Allow))
+    });
+    let denied = deny_principals.iter().flat_map(|principal| {
+        let hosts = if deny_hosts.is_empty() {
+            vec![default_host]
+        } else {
+            deny_hosts.iter().map(String::as_str).collect()
+        };
+        hosts
+            .into_iter()
+            .map(move |host| (principal.clone(), host.to_owned(), AclPermissionType::Deny))
+    });
+    Ok(allowed.chain(denied).collect())
+}
+
+fn validate_acl_entry_values(mutation: &crate::cli::AclMutationArgs) -> Result<()> {
+    normalized_acl_values(&mutation.allow_principal, "allow principal")?;
+    normalized_acl_values(&mutation.deny_principal, "deny principal")?;
+    normalized_acl_values(&mutation.allow_host, "allow host")?;
+    normalized_acl_values(&mutation.deny_host, "deny host")?;
+    if mutation
+        .host
+        .as_deref()
+        .is_some_and(|host| host.trim().is_empty())
+    {
+        return Err(Error::Usage("ACL host cannot be empty".into()));
+    }
+    Ok(())
+}
+
 fn acl_mutation_resources(
     mutation: &crate::cli::AclMutationArgs,
     operations: &[AclOperation],
 ) -> Result<Vec<(AclResourceType, String, Vec<AclOperation>)>> {
     if !mutation.producer && !mutation.consumer {
-        let (resource_type, resource_name) = acl_resource(&mutation.filter)?;
-        return Ok(vec![(
-            resource_type,
-            resource_name
-                .ok_or_else(|| Error::Usage("an ACL resource selector is required".into()))?,
-            operations.to_vec(),
-        )]);
+        let resources = acl_resources(&mutation.filter)?;
+        if resources.is_empty() {
+            return Err(Error::Usage("an ACL resource selector is required".into()));
+        }
+        return Ok(resources
+            .into_iter()
+            .map(|(resource_type, resource_name)| {
+                (resource_type, resource_name, operations.to_vec())
+            })
+            .collect());
     }
     if !mutation.deny_principal.is_empty() || !mutation.deny_host.is_empty() {
         return Err(Error::Usage(
             "role ACLs only support allow principals and hosts".into(),
         ));
     }
-    let topic = mutation
-        .filter
-        .topic
-        .clone()
-        .ok_or_else(|| Error::Usage("--producer and --consumer require --topic".into()))?;
+    let topics = normalized_acl_values(&mutation.filter.topic, "topic")?;
+    if topics.is_empty() {
+        return Err(Error::Usage(
+            "--producer and --consumer require --topic".into(),
+        ));
+    }
     let mut topic_operations = Vec::new();
     if mutation.producer {
         topic_operations.extend([
@@ -4870,26 +4939,33 @@ fn acl_mutation_resources(
             }
         }
     }
-    let mut resources = vec![(AclResourceType::Topic, topic, topic_operations)];
+    let mut resources = topics
+        .into_iter()
+        .map(|topic| (AclResourceType::Topic, topic, topic_operations.clone()))
+        .collect::<Vec<_>>();
     if mutation.consumer {
-        resources.push((
-            AclResourceType::Group,
-            mutation
-                .filter
-                .group
-                .clone()
-                .ok_or_else(|| Error::Usage("--consumer requires --group".into()))?,
-            vec![AclOperation::Read],
-        ));
+        let groups = normalized_acl_values(&mutation.filter.group, "group")?;
+        if groups.is_empty() {
+            return Err(Error::Usage("--consumer requires --group".into()));
+        }
+        resources.extend(
+            groups
+                .into_iter()
+                .map(|group| (AclResourceType::Group, group, vec![AclOperation::Read])),
+        );
     }
-    if mutation.producer
-        && let Some(transactional_id) = &mutation.filter.transactional_id
-    {
-        resources.push((
-            AclResourceType::TransactionalId,
-            transactional_id.clone(),
-            vec![AclOperation::Write, AclOperation::Describe],
-        ));
+    if mutation.producer {
+        resources.extend(
+            normalized_acl_values(&mutation.filter.transactional_id, "transactional ID")?
+                .into_iter()
+                .map(|transactional_id| {
+                    (
+                        AclResourceType::TransactionalId,
+                        transactional_id,
+                        vec![AclOperation::Write, AclOperation::Describe],
+                    )
+                }),
+        );
     }
     if mutation.idempotent {
         resources.push((
@@ -7373,6 +7449,67 @@ mod tests {
                 && binding.host == "*"
                 && binding.permission_type == AclPermissionType::Deny
         }));
+    }
+
+    #[test]
+    fn acl_bindings_should_expand_repeated_resource_selectors() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "add",
+            "--topic",
+            "orders",
+            "--topic",
+            "payments",
+            "--group",
+            "billing",
+            "--allow-principal",
+            "User:reader",
+            "--operation",
+            "read",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Add(mutation) = args.action else {
+            panic!("expected ACL add");
+        };
+        let operations = acl_operations(&mutation.operation).expect("operations");
+        let bindings = acl_bindings(&mutation, &operations).expect("bindings");
+        let names = bindings
+            .iter()
+            .map(|binding| binding.resource_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names, BTreeSet::from(["billing", "orders", "payments"]));
+    }
+
+    #[test]
+    fn acl_resources_should_trim_and_deduplicate_repeated_values() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "list",
+            "--topic",
+            " orders ",
+            "--topic",
+            "orders",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::List(filter) = args.action else {
+            panic!("expected ACL list");
+        };
+        assert_eq!(
+            acl_resources(&filter).expect("resources"),
+            [(AclResourceType::Topic, "orders".into())]
+        );
     }
 
     #[test]
