@@ -1704,6 +1704,43 @@ mod tests {
     parses_command_family!(cluster_family_parses, "cluster", "cluster-id");
     parses_command_family!(client_metrics_family_parses, "client-metrics", "list");
     parses_command_family!(features_family_parses, "features", "describe");
+    parses_command_family!(
+        features_upgrade_family_parses,
+        "features",
+        "upgrade",
+        "--release-version",
+        "4.3-IV0",
+        "--dry-run"
+    );
+    parses_command_family!(
+        features_downgrade_family_parses,
+        "features",
+        "downgrade",
+        "--metadata",
+        "4.2-IV1",
+        "--unsafe"
+    );
+    parses_command_family!(
+        features_disable_family_parses,
+        "features",
+        "disable",
+        "--feature",
+        "group.version"
+    );
+    parses_command_family!(
+        features_version_mapping_family_parses,
+        "features",
+        "version-mapping",
+        "--release-version",
+        "4.3-IV0"
+    );
+    parses_command_family!(
+        features_dependencies_family_parses,
+        "features",
+        "feature-dependencies",
+        "--feature",
+        "eligible.leader.replicas.version=1"
+    );
 
     #[test]
     fn client_metrics_should_collect_repeated_match_and_metrics_values() {

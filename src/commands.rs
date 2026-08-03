@@ -3390,6 +3390,12 @@ fn metadata_version(value: &str) -> Result<MetadataVersionSpec> {
         return Ok(*version);
     }
     let release = value.split('.').take(2).collect::<Vec<_>>().join(".");
+    if let Some(version) = METADATA_VERSIONS
+        .iter()
+        .find(|version| version.version == release)
+    {
+        return Ok(*version);
+    }
     METADATA_VERSIONS
         .iter()
         .rev()
@@ -3630,6 +3636,12 @@ async fn features(
                     })
                     .await?;
                 let response = krafka::protocol::ApiVersionsResponse::decode_v3(&mut bytes)?;
+                if response.error_code != 0 {
+                    return Err(Error::Config(format!(
+                        "ApiVersions request to node {node_id} failed with error code {}",
+                        response.error_code
+                    )));
+                }
                 drop(connection);
                 (
                     response.supported_features,
@@ -8117,6 +8129,12 @@ mod tests {
         assert_eq!(metadata_version("3.7").expect("3.7 alias").level, 19);
         assert_eq!(metadata_version("3.7.2").expect("3.7 patch").level, 19);
         assert_eq!(
+            metadata_version("3.7-IV2.foo")
+                .expect("Kafka truncates after the second dot-separated component")
+                .level,
+            17
+        );
+        assert_eq!(
             metadata_version("4.4-IV1").expect("unstable exact").level,
             32
         );
@@ -8138,6 +8156,71 @@ mod tests {
         assert_eq!(parsed.get("metadata.version"), Some(&30));
         assert!(
             parse_feature_levels(&["group.version=0".into(), "group.version=1".into()]).is_err()
+        );
+    }
+
+    #[test]
+    fn feature_release_upgrade_should_include_non_zero_release_defaults() {
+        let (_, updates, dry_run) = feature_updates(&FeatureAction::Upgrade {
+            metadata: None,
+            release_version: Some("3.9-IV0".into()),
+            feature: Vec::new(),
+            dry_run: true,
+        })
+        .expect("release upgrade");
+
+        assert!(dry_run);
+        assert!(updates.iter().any(|update| {
+            update.feature == "metadata.version" && update.max_version_level == 21
+        }));
+        assert!(
+            updates.iter().any(|update| {
+                update.feature == "kraft.version" && update.max_version_level == 1
+            })
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| update.feature == "transaction.version")
+        );
+        assert!(updates.iter().all(|update| {
+            update.upgrade_type == krafka::protocol::FeatureUpgradeType::Upgrade
+        }));
+    }
+
+    #[test]
+    fn feature_downgrade_and_disable_should_select_kafka_upgrade_types() {
+        let (_, safe, _) = feature_updates(&FeatureAction::Downgrade {
+            metadata: Some("3.7-IV2".into()),
+            release_version: None,
+            feature: Vec::new(),
+            r#unsafe: false,
+            dry_run: false,
+        })
+        .expect("safe downgrade");
+        assert_eq!(
+            safe[0].upgrade_type,
+            krafka::protocol::FeatureUpgradeType::SafeDowngrade
+        );
+
+        let (_, unsafe_updates, _) = feature_updates(&FeatureAction::Disable {
+            feature: vec!["group.version".into()],
+            r#unsafe: true,
+            dry_run: false,
+        })
+        .expect("unsafe disable");
+        assert_eq!(unsafe_updates[0].max_version_level, 0);
+        assert_eq!(
+            unsafe_updates[0].upgrade_type,
+            krafka::protocol::FeatureUpgradeType::UnsafeDowngrade
+        );
+        assert!(
+            feature_updates(&FeatureAction::Disable {
+                feature: vec!["group.version".into(), "group.version".into()],
+                r#unsafe: false,
+                dry_run: false,
+            })
+            .is_err()
         );
     }
 
