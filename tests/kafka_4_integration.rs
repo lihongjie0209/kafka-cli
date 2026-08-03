@@ -625,6 +625,13 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .stdout(predicate::str::contains("trace"));
 
     // groups, configs, offsets
+    let all_groups = success(&bootstrap, &["all-groups", "list"]);
+    assert!(all_groups.contains("integration-suite"));
+    assert!(all_groups.contains("Classic"));
+    assert!(
+        success(&bootstrap, &["all-groups", "list", "--consumer"]).contains("integration-suite")
+    );
+    assert!(!success(&bootstrap, &["all-groups", "list", "--share"]).contains("integration-suite"));
     success(&bootstrap, &["groups", "list", "--timeout", "5000"]);
     assert!(success(&bootstrap, &["groups", "list", "--state"]).contains("integration-suite"));
     success(&bootstrap, &["groups", "list", "--state", "Assigning"]);

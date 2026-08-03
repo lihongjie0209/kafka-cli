@@ -76,6 +76,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-console-producer" => Some("produce"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-consumer-groups" => Some("groups"),
+        "kafka-groups" => Some("all-groups"),
         "kafka-configs" => Some("configs"),
         "kafka-get-offsets" => Some("offsets"),
         "kafka-acls" => Some("acls"),
@@ -136,6 +137,7 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             ("--delete", "delete", true),
             ("--list", "list", false),
         ],
+        "all-groups" => &[("--list", "list", false)],
         "configs" => &[
             ("--describe", "describe", false),
             ("--alter", "alter", true),
@@ -280,6 +282,8 @@ pub enum Command {
     Consume(ConsumeArgs),
     /// Inspect and manage consumer groups.
     Groups(GroupsArgs),
+    /// List groups of every Kafka group type.
+    AllGroups(AllGroupsArgs),
     /// Inspect and alter dynamic configuration.
     Configs(ConfigsArgs),
     /// Query partition offsets.
@@ -851,6 +855,42 @@ pub struct GroupsArgs {
     pub action: GroupAction,
 }
 
+#[derive(Debug, Args)]
+pub struct AllGroupsArgs {
+    #[command(subcommand)]
+    pub action: AllGroupsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AllGroupsAction {
+    /// List Classic, Consumer, Share, and Streams groups.
+    List {
+        /// Filter by Kafka group type.
+        #[arg(long, value_enum)]
+        group_type: Option<AllGroupType>,
+        /// Filter by the exact protocol type.
+        #[arg(long)]
+        protocol: Option<String>,
+        /// Include all kinds of consumer groups.
+        #[arg(long, conflicts_with_all = ["group_type", "protocol", "share", "streams"])]
+        consumer: bool,
+        /// Include Share groups only.
+        #[arg(long, conflicts_with_all = ["group_type", "protocol", "consumer", "streams"])]
+        share: bool,
+        /// Include Streams groups only.
+        #[arg(long, conflicts_with_all = ["group_type", "protocol", "consumer", "share"])]
+        streams: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AllGroupType {
+    Classic,
+    Consumer,
+    Share,
+    Streams,
+}
+
 impl GroupsArgs {
     pub(crate) fn timeout(&self, default: Duration) -> Duration {
         self.timeout_ms.map_or(default, Duration::from_millis)
@@ -1318,6 +1358,7 @@ mod tests {
     #[test]
     fn compatibility_command_should_accept_sh_suffix() {
         assert_eq!(compatibility_command("kafka-topics.sh"), Some("topics"));
+        assert_eq!(compatibility_command("kafka-groups.sh"), Some("all-groups"));
         assert_eq!(
             compatibility_command("kafka-client-metrics.sh"),
             Some("client-metrics")
@@ -1707,6 +1748,51 @@ mod tests {
         "--skip-message-on-error"
     );
     parses_command_family!(groups_family_parses, "groups", "list");
+    parses_command_family!(
+        all_groups_family_parses,
+        "all-groups",
+        "list",
+        "--group-type",
+        "share",
+        "--protocol",
+        "share"
+    );
+
+    #[test]
+    fn all_groups_named_filters_should_be_mutually_exclusive() {
+        for filters in [
+            ["--consumer", "--share"],
+            ["--consumer", "--streams"],
+            ["--share", "--streams"],
+        ] {
+            let result = Cli::try_parse_from([
+                "kafka",
+                "--bootstrap-server",
+                "localhost:9092",
+                "all-groups",
+                "list",
+                filters[0],
+                filters[1],
+            ]);
+
+            assert!(result.is_err(), "accepted conflicting filters: {filters:?}");
+        }
+    }
+
+    #[test]
+    fn all_groups_should_reject_unknown_group_type() {
+        let result = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "all-groups",
+            "list",
+            "--group-type",
+            "unknown",
+        ]);
+
+        assert!(result.is_err(), "accepted unknown group type");
+    }
     parses_command_family!(
         groups_original_timeout_parses,
         "groups",

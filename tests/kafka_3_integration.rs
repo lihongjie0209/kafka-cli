@@ -212,6 +212,12 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .stdout(predicate::str::contains("STATE"));
     Command::cargo_bin("kafka")
         .expect("kafka binary")
+        .args(["--bootstrap-server", &bootstrap, "all-groups", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PROTOCOL"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
         .args([
             "--bootstrap-server",
             &bootstrap,

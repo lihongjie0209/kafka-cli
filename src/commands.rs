@@ -43,9 +43,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{
-        AclAction, Cli, ClientMetricsAction, ClusterAction, Command, ConfigAction,
-        ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs, ElectionType,
-        FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
+        AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
+        ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
+        ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
         ReassignAction, ResetOffsetsArgs, TopicAction, TransactionAction,
     },
     config,
@@ -138,6 +138,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 format,
                 args.action,
                 verbose,
+            )
+            .await
+        }
+        Command::AllGroups(args) => {
+            list_all_groups(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                args.action,
             )
             .await
         }
@@ -1885,6 +1895,110 @@ async fn groups(
             topic,
             execute,
         } => delete_group_offsets_command(config, timeout, format, &group, &topic, execute),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AllGroupRow {
+    group: String,
+    group_type: String,
+    protocol: String,
+}
+
+async fn list_all_groups(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: AllGroupsAction,
+) -> Result<()> {
+    let AllGroupsAction::List {
+        group_type,
+        protocol,
+        consumer,
+        share,
+        streams,
+    } = action;
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let groups = client.list_consumer_groups().await?;
+    drop(client);
+    let mut rows = groups
+        .into_iter()
+        .map(|group| AllGroupRow {
+            group: group.group_id,
+            group_type: group
+                .group_type
+                .as_ref()
+                .map_or_else(String::new, |kind| group_type_label(&kind.to_string())),
+            protocol: group.protocol_type,
+        })
+        .filter(|row| {
+            all_group_matches(
+                row,
+                group_type,
+                protocol.as_deref(),
+                consumer,
+                share,
+                streams,
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.group.cmp(&right.group));
+    output::write_value(format, "all-groups.list", &rows, |rows| {
+        output::table(
+            ["GROUP", "TYPE", "PROTOCOL"],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.group_type.clone(),
+                    row.protocol.clone(),
+                ]
+            }),
+        )
+    })
+}
+
+fn all_group_matches(
+    row: &AllGroupRow,
+    group_type: Option<AllGroupType>,
+    protocol: Option<&str>,
+    consumer: bool,
+    share: bool,
+    streams: bool,
+) -> bool {
+    let type_matches = group_type.is_none_or(|requested| {
+        row.group_type.eq_ignore_ascii_case(match requested {
+            AllGroupType::Classic => "classic",
+            AllGroupType::Consumer => "consumer",
+            AllGroupType::Share => "share",
+            AllGroupType::Streams => "streams",
+        })
+    });
+    let protocol_matches = protocol.is_none_or(|requested| row.protocol == requested);
+    if group_type.is_some() || protocol.is_some() {
+        return type_matches && protocol_matches;
+    }
+    if consumer {
+        return row.protocol == "consumer"
+            || row.protocol.is_empty()
+            || row.group_type.eq_ignore_ascii_case("consumer");
+    }
+    if share {
+        return row.group_type.eq_ignore_ascii_case("share");
+    }
+    if streams {
+        return row.group_type.eq_ignore_ascii_case("streams");
+    }
+    true
+}
+
+fn group_type_label(group_type: &str) -> String {
+    match group_type.to_ascii_lowercase().as_str() {
+        "classic" => "Classic".into(),
+        "consumer" => "Consumer".into(),
+        "share" => "Share".into(),
+        "streams" => "Streams".into(),
+        _ => group_type.to_owned(),
     }
 }
 
@@ -11837,5 +11951,55 @@ mod tests {
         let status = reassignment_statuses(&plan, &[], &current);
         assert!(status[0].complete);
         assert_eq!(status[0].replicas, [2, 1]);
+    }
+
+    fn listed_group(group_type: &str, protocol: &str) -> AllGroupRow {
+        AllGroupRow {
+            group: "test-group".into(),
+            group_type: group_type.into(),
+            protocol: protocol.into(),
+        }
+    }
+
+    #[test]
+    fn all_groups_consumer_filter_should_include_simple_classic_group() {
+        let row = listed_group("Classic", "");
+
+        assert!(all_group_matches(&row, None, None, true, false, false));
+    }
+
+    #[test]
+    fn all_groups_consumer_filter_should_exclude_share_group() {
+        let row = listed_group("Share", "share");
+
+        assert!(!all_group_matches(&row, None, None, true, false, false));
+    }
+
+    #[test]
+    fn all_groups_type_and_protocol_filters_should_both_match() {
+        let row = listed_group("Share", "share");
+
+        assert!(all_group_matches(
+            &row,
+            Some(AllGroupType::Share),
+            Some("share"),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn all_groups_type_and_protocol_filters_should_reject_protocol_mismatch() {
+        let row = listed_group("Share", "share");
+
+        assert!(!all_group_matches(
+            &row,
+            Some(AllGroupType::Share),
+            Some("consumer"),
+            false,
+            false,
+            false,
+        ));
     }
 }
