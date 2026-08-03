@@ -38,9 +38,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{
-        AclAction, Cli, ClusterAction, Command, ConfigAction, ConfigEntityType, DescribeTopicArgs,
-        ElectionType, GroupAction, ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs,
-        TopicAction,
+        AclAction, Cli, ClusterAction, Command, ConfigAction, ConfigEntityArgs, ConfigEntityType,
+        DescribeTopicArgs, ElectionType, GroupAction, ListTopicArgs, OffsetTime, ReassignAction,
+        ResetOffsetsArgs, TopicAction,
     },
     config,
     error::{Error, Result},
@@ -99,14 +99,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
             groups(&client_config, timeout, format, args.action, verbose).await
         }
         Command::Configs(args) => {
-            configs(
+            Box::pin(configs(
                 &client_config,
                 bootstrap,
                 command_config.as_deref(),
                 timeout,
                 format,
                 args.action,
-            )
+            ))
             .await
         }
         Command::Offsets(args) => offsets(&client_config, timeout, format, &args),
@@ -2809,14 +2809,15 @@ async fn configs(
     action: ConfigAction,
 ) -> Result<()> {
     match action {
-        ConfigAction::Describe {
-            entity_type,
-            entity_name,
-            entity_default,
-            all,
-        } => {
+        ConfigAction::Describe { entity, all } => {
+            let ResolvedConfigEntities {
+                types: entity_type,
+                names: entity_name,
+                entity_default,
+                embedded_defaults,
+            } = resolve_config_entities(entity)?;
             validate_config_entity_types(&entity_type)?;
-            validate_config_entity_names(&entity_type, &entity_name, false)?;
+            validate_config_entity_names(&entity_type, &entity_name, false, embedded_defaults)?;
             if quota_entity_types(&entity_type) {
                 return describe_quota_configs(
                     config,
@@ -2850,14 +2851,18 @@ async fn configs(
             describe_resource_configs(config, timeout, format, entity_type, entity_name, all).await
         }
         ConfigAction::Alter {
-            entity_type,
-            entity_name,
-            entity_default,
+            entity,
             add,
             add_file,
             delete,
             execute,
         } => {
+            let ResolvedConfigEntities {
+                types: entity_type,
+                names: entity_name,
+                entity_default,
+                embedded_defaults,
+            } = resolve_config_entities(entity)?;
             let delete = normalize_config_deletions(delete);
             let pairs = if let Some(path) = add_file.as_deref() {
                 let mut pairs = config::load_properties(path)?
@@ -2874,7 +2879,7 @@ async fn configs(
                 ));
             }
             validate_config_entity_types(&entity_type)?;
-            validate_config_entity_names(&entity_type, &entity_name, true)?;
+            validate_config_entity_names(&entity_type, &entity_name, true, embedded_defaults)?;
             validate_config_keys(&pairs)?;
             validate_quota_change_names(&entity_type, &pairs, &delete)?;
             if quota_entity_types(&entity_type) && !only_scram_changes(&pairs, &delete) {
@@ -2943,6 +2948,104 @@ async fn configs(
     }
 }
 
+struct ResolvedConfigEntities {
+    types: Vec<ConfigEntityType>,
+    names: Vec<String>,
+    entity_default: bool,
+    embedded_defaults: bool,
+}
+
+fn resolve_config_entities(entity: ConfigEntityArgs) -> Result<ResolvedConfigEntities> {
+    let ConfigEntityArgs {
+        entity_type,
+        entity_name,
+        entity_default,
+        topic,
+        client,
+        user,
+        broker,
+        broker_logger,
+        ip,
+        client_metrics,
+        group,
+        client_defaults,
+        user_defaults,
+        broker_defaults,
+        ip_defaults,
+    } = entity;
+    let generic = !entity_type.is_empty() || !entity_name.is_empty() || entity_default;
+    let specific = topic.is_some()
+        || client.is_some()
+        || user.is_some()
+        || broker.is_some()
+        || broker_logger.is_some()
+        || ip.is_some()
+        || client_metrics.is_some()
+        || group.is_some()
+        || client_defaults
+        || user_defaults
+        || broker_defaults
+        || ip_defaults;
+    if generic && specific {
+        return Err(Error::Usage(
+            "--entity-{type,name,default} cannot be combined with specific entity flags".into(),
+        ));
+    }
+    if generic {
+        if entity_type.is_empty() {
+            return Err(Error::Usage(
+                "at least one --entity-type must be specified".into(),
+            ));
+        }
+        return Ok(ResolvedConfigEntities {
+            types: entity_type,
+            names: entity_name,
+            entity_default,
+            embedded_defaults: false,
+        });
+    }
+
+    let mut selections = Vec::new();
+    for (kind, name) in [
+        (ConfigEntityType::Topic, topic),
+        (ConfigEntityType::Client, client),
+        (ConfigEntityType::User, user),
+        (ConfigEntityType::Broker, broker),
+        (ConfigEntityType::BrokerLogger, broker_logger),
+        (ConfigEntityType::Ip, ip),
+        (ConfigEntityType::ClientMetrics, client_metrics),
+        (ConfigEntityType::Group, group),
+    ] {
+        if let Some(name) = name {
+            selections.push((kind, name));
+        }
+    }
+    for (kind, selected) in [
+        (ConfigEntityType::Client, client_defaults),
+        (ConfigEntityType::User, user_defaults),
+        (ConfigEntityType::Broker, broker_defaults),
+        (ConfigEntityType::Ip, ip_defaults),
+    ] {
+        if selected {
+            selections.push((kind, String::new()));
+        }
+    }
+    if selections.is_empty() {
+        return Err(Error::Usage("at least one entity must be specified".into()));
+    }
+    let only_default = selections.len() == 1 && selections[0].1.is_empty();
+    Ok(ResolvedConfigEntities {
+        types: selections.iter().map(|(kind, _)| *kind).collect(),
+        names: if only_default {
+            Vec::new()
+        } else {
+            selections.into_iter().map(|(_, name)| name).collect()
+        },
+        entity_default: only_default,
+        embedded_defaults: !only_default,
+    })
+}
+
 fn normalize_config_deletions(delete: Vec<String>) -> Vec<String> {
     delete
         .into_iter()
@@ -2969,13 +3072,14 @@ fn validate_config_entity_names(
     types: &[ConfigEntityType],
     names: &[String],
     altering: bool,
+    embedded_defaults: bool,
 ) -> Result<()> {
     if !altering && types == [ConfigEntityType::BrokerLogger] && names.is_empty() {
         return Err(Error::Usage(
             "broker-logger describe requires --entity-name".into(),
         ));
     }
-    if altering && names.iter().any(String::is_empty) {
+    if altering && !embedded_defaults && names.iter().any(String::is_empty) {
         return Err(Error::Usage(
             "--entity-name cannot be empty with --alter; use --entity-default".into(),
         ));
@@ -3178,7 +3282,9 @@ fn quota_entities<'a>(
             Ok((
                 quota_entity_name(*kind)
                     .ok_or_else(|| Error::Usage("invalid quota type".into()))?,
-                names.get(index).map(String::as_str),
+                names
+                    .get(index)
+                    .and_then(|name| (!name.is_empty()).then_some(name.as_str())),
             ))
         })
         .collect()
@@ -3227,7 +3333,7 @@ async fn describe_quota_configs(
         .map(|(kind, name)| {
             (
                 *kind,
-                if entity_default {
+                if entity_default || (names.len() == types.len() && name.is_none()) {
                     1
                 } else if name.is_some() {
                     0
@@ -3257,7 +3363,10 @@ async fn describe_quota_configs(
             })
         })
         .collect::<Vec<_>>();
-    if types == [ConfigEntityType::User] && !entity_default {
+    if types == [ConfigEntityType::User]
+        && !entity_default
+        && names.first().is_none_or(|name| !name.is_empty())
+    {
         let admin = admin(config)?;
         let users = names.first().cloned().into_iter().collect::<Vec<_>>();
         rows.extend(
@@ -6710,6 +6819,39 @@ mod tests {
     }
 
     #[test]
+    fn config_entities_should_resolve_mixed_default_user_and_named_client() {
+        let resolved = resolve_config_entities(ConfigEntityArgs {
+            client: Some("billing".into()),
+            user_defaults: true,
+            ..ConfigEntityArgs::default()
+        })
+        .expect("mixed quota selection");
+
+        assert_eq!(
+            (resolved.types, resolved.names, resolved.embedded_defaults),
+            (
+                vec![ConfigEntityType::Client, ConfigEntityType::User],
+                vec!["billing".to_owned(), String::new()],
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn quota_entities_should_pair_named_client_and_default_user() {
+        let names = ["billing".to_owned(), String::new()];
+        let entities = quota_entities(
+            &[ConfigEntityType::Client, ConfigEntityType::User],
+            &names,
+            false,
+            true,
+        )
+        .expect("mixed quota entity");
+
+        assert_eq!(entities, [("client-id", Some("billing")), ("user", None)]);
+    }
+
+    #[test]
     fn config_entity_types_should_reject_duplicates() {
         assert!(matches!(
             validate_config_entity_types(&[ConfigEntityType::Topic, ConfigEntityType::Topic]),
@@ -6724,6 +6866,7 @@ mod tests {
                 &[ConfigEntityType::BrokerLogger],
                 &["not-a-broker".into()],
                 false,
+                false,
             ),
             Err(Error::Usage(message)) if message.contains("integer broker ID")
         ));
@@ -6731,8 +6874,12 @@ mod tests {
 
     #[test]
     fn config_ip_entity_name_should_accept_ip_literal() {
-        let result =
-            validate_config_entity_names(&[ConfigEntityType::Ip], &["127.0.0.1".into()], false);
+        let result = validate_config_entity_names(
+            &[ConfigEntityType::Ip],
+            &["127.0.0.1".into()],
+            false,
+            false,
+        );
 
         assert!(result.is_ok(), "IP validation failed: {result:?}");
     }
@@ -6743,6 +6890,7 @@ mod tests {
             validate_config_entity_names(
                 &[ConfigEntityType::Ip],
                 &["invalid host name with spaces".into()],
+                false,
                 false,
             ),
             Err(Error::Usage(message)) if message.contains("valid IP or resolvable host")
@@ -6756,6 +6904,7 @@ mod tests {
                 &[ConfigEntityType::User],
                 &[String::new()],
                 true,
+                false,
             ),
             Err(Error::Usage(message)) if message.contains("--entity-default")
         ));
@@ -6764,7 +6913,12 @@ mod tests {
     #[test]
     fn config_broker_logger_describe_should_require_entity_name() {
         assert!(matches!(
-            validate_config_entity_names(&[ConfigEntityType::BrokerLogger], &[], false),
+            validate_config_entity_names(
+                &[ConfigEntityType::BrokerLogger],
+                &[],
+                false,
+                false,
+            ),
             Err(Error::Usage(message)) if message.contains("requires --entity-name")
         ));
     }

@@ -1080,11 +1080,48 @@ fn all_command_families_work_against_kafka_4_3_1() {
         &[
             "configs",
             "alter",
+            "--user-defaults",
+            "--client",
+            "integration-mixed-client",
+            "--add-config",
+            "request_percentage=26",
+            "--execute",
+        ],
+    );
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--user-defaults",
+            "--client",
+            "integration-mixed-client",
+        ],
+        "26",
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
             "--entity-type",
             "ips",
             "--entity-default",
             "--add-config",
             "connection_creation_rate=1000",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--user-defaults",
+            "--client",
+            "integration-mixed-client",
+            "--delete-config",
+            "request_percentage",
             "--execute",
         ],
     );

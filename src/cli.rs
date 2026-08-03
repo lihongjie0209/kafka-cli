@@ -112,6 +112,9 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             }
         }
     }
+    if command == "configs" {
+        rewrite_legacy_config_entities(args);
+    }
     let candidates: &[(&str, &str, bool)] = match command {
         "topics" => &[
             ("--create", "create", false),
@@ -170,6 +173,83 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
         }
         _ => {}
     }
+}
+
+fn rewrite_legacy_config_entities(args: &mut Vec<OsString>) {
+    let mut types = Vec::new();
+    let mut selectors = Vec::new();
+    let mut remove = vec![false; args.len()];
+    let mut index = 0;
+    while index < args.len() {
+        let Some(value) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if value == "--entity-type" && index + 1 < args.len() {
+            if let Some(kind) = args[index + 1].to_str() {
+                types.push(kind.to_owned());
+                remove[index] = true;
+                remove[index + 1] = true;
+                index += 2;
+                continue;
+            }
+        } else if let Some(kind) = value.strip_prefix("--entity-type=") {
+            types.push(kind.to_owned());
+            remove[index] = true;
+        } else if value == "--entity-name" && index + 1 < args.len() {
+            if let Some(name) = args[index + 1].to_str() {
+                selectors.push(Some(name.to_owned()));
+                remove[index] = true;
+                remove[index + 1] = true;
+                index += 2;
+                continue;
+            }
+        } else if let Some(name) = value.strip_prefix("--entity-name=") {
+            selectors.push(Some(name.to_owned()));
+            remove[index] = true;
+        } else if value == "--entity-default" {
+            selectors.push(None);
+            remove[index] = true;
+        }
+        index += 1;
+    }
+    if types.len() < 2 || types.len() != selectors.len() || !selectors.iter().any(Option::is_none) {
+        return;
+    }
+    let mut replacements = Vec::new();
+    for (kind, selector) in types.iter().zip(selectors) {
+        let named = match kind.as_str() {
+            "topics" | "topic" => "--topic",
+            "clients" | "client" => "--client",
+            "users" | "user" => "--user",
+            "brokers" | "broker" => "--broker",
+            "broker-loggers" | "broker-logger" => "--broker-logger",
+            "ips" | "ip" => "--ip",
+            "client-metrics" | "client-metric" => "--client-metrics",
+            "groups" | "group" => "--group",
+            _ => return,
+        };
+        if let Some(name) = selector {
+            replacements.push(OsString::from(named));
+            replacements.push(OsString::from(name));
+        } else {
+            let defaults = match kind.as_str() {
+                "clients" | "client" => "--client-defaults",
+                "users" | "user" => "--user-defaults",
+                "brokers" | "broker" => "--broker-defaults",
+                "ips" | "ip" => "--ip-defaults",
+                _ => return,
+            };
+            replacements.push(OsString::from(defaults));
+        }
+    }
+    let mut retained = args
+        .drain(..)
+        .enumerate()
+        .filter_map(|(index, argument)| (!remove[index]).then_some(argument))
+        .collect::<Vec<_>>();
+    retained.extend(replacements);
+    *args = retained;
 }
 
 /// Top-level command suite.
@@ -609,6 +689,44 @@ pub struct ConfigsArgs {
     pub action: ConfigAction,
 }
 
+#[derive(Debug, Args, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka ConfigCommand exposes four independent default-entity selector flags"
+)]
+pub struct ConfigEntityArgs {
+    #[arg(long, value_enum)]
+    pub entity_type: Vec<ConfigEntityType>,
+    #[arg(long)]
+    pub entity_name: Vec<String>,
+    #[arg(long, conflicts_with = "entity_name")]
+    pub entity_default: bool,
+    #[arg(long)]
+    pub topic: Option<String>,
+    #[arg(long)]
+    pub client: Option<String>,
+    #[arg(long)]
+    pub user: Option<String>,
+    #[arg(long)]
+    pub broker: Option<String>,
+    #[arg(long)]
+    pub broker_logger: Option<String>,
+    #[arg(long)]
+    pub ip: Option<String>,
+    #[arg(long)]
+    pub client_metrics: Option<String>,
+    #[arg(long)]
+    pub group: Option<String>,
+    #[arg(long)]
+    pub client_defaults: bool,
+    #[arg(long)]
+    pub user_defaults: bool,
+    #[arg(long)]
+    pub broker_defaults: bool,
+    #[arg(long)]
+    pub ip_defaults: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum ConfigEntityType {
     #[value(name = "topics", alias = "topic")]
@@ -632,23 +750,15 @@ pub enum ConfigEntityType {
 #[derive(Debug, Subcommand)]
 pub enum ConfigAction {
     Describe {
-        #[arg(long, value_enum, required = true)]
-        entity_type: Vec<ConfigEntityType>,
-        #[arg(long)]
-        entity_name: Vec<String>,
-        #[arg(long, conflicts_with = "entity_name")]
-        entity_default: bool,
+        #[command(flatten)]
+        entity: ConfigEntityArgs,
         /// Include inherited/static/default configurations, not only dynamic overrides.
         #[arg(long)]
         all: bool,
     },
     Alter {
-        #[arg(long, value_enum, required = true)]
-        entity_type: Vec<ConfigEntityType>,
-        #[arg(long)]
-        entity_name: Vec<String>,
-        #[arg(long, conflicts_with = "entity_name")]
-        entity_default: bool,
+        #[command(flatten)]
+        entity: ConfigEntityArgs,
         #[arg(long = "add-config")]
         add: Vec<String>,
         #[arg(long = "add-config-file", conflicts_with = "add")]
@@ -948,6 +1058,36 @@ mod tests {
             assert_eq!(arguments[2], action, "wrong action for {flag}");
             assert_eq!(arguments[3], "--execute", "{flag} became a preview");
         }
+    }
+
+    #[test]
+    fn legacy_configs_should_rewrite_mixed_generic_defaults() {
+        let mut arguments = vec![
+            OsString::from("kafka-configs.sh"),
+            OsString::from("configs"),
+            OsString::from("--bootstrap-server"),
+            OsString::from("localhost:9092"),
+            OsString::from("--alter"),
+            OsString::from("--entity-type"),
+            OsString::from("users"),
+            OsString::from("--entity-default"),
+            OsString::from("--entity-type"),
+            OsString::from("clients"),
+            OsString::from("--entity-name"),
+            OsString::from("billing"),
+            OsString::from("--add-config"),
+            OsString::from("request_percentage=25"),
+        ];
+        rewrite_legacy_action(&mut arguments, "configs");
+
+        let cli = Cli::try_parse_from(arguments).expect("rewritten mixed quota command");
+        let Command::Configs(ConfigsArgs {
+            action: ConfigAction::Alter { entity, .. },
+        }) = cli.command
+        else {
+            panic!("expected configs alter command");
+        };
+        assert!(entity.user_defaults && entity.client.as_deref() == Some("billing"));
     }
 
     #[test]
@@ -1393,6 +1533,16 @@ mod tests {
         "--entity-name",
         "alice",
         "--entity-name",
+        "billing",
+        "--add-config",
+        "request_percentage=25"
+    );
+    parses_command_family!(
+        configs_specific_mixed_default_quota_parses,
+        "configs",
+        "alter",
+        "--user-defaults",
+        "--client",
         "billing",
         "--add-config",
         "request_percentage=25"
