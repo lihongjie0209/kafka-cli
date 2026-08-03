@@ -404,7 +404,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("integration-suite")
     );
-    success(
+    let verbose_members = success(
         &bootstrap,
         &[
             "groups",
@@ -412,8 +412,10 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--group",
             "integration-suite",
             "--members",
+            "--verbose",
         ],
     );
+    assert!(verbose_members.contains("ASSIGNMENT"));
     assert!(
         success(
             &bootstrap,
@@ -423,6 +425,19 @@ fn all_command_families_work_against_kafka_4_3_1() {
     );
     assert!(
         success(&bootstrap, &["groups", "describe", "--all-groups"]).contains("integration-events")
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "groups",
+                "describe",
+                "--group",
+                "integration-suite",
+                "--verbose"
+            ]
+        )
+        .contains("LEADER_EPOCH")
     );
     success(
         &bootstrap,

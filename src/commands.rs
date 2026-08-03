@@ -58,12 +58,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
     let command_config = cli.command_config.clone();
     let timeout = cli.timeout();
     let format = cli.output;
+    let verbose = cli.verbose > 0;
 
     match cli.command {
         Command::Topics(args) => topics(&client_config, timeout, format, args.action).await,
         Command::Produce(args) => produce(client_config, timeout, args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
-        Command::Groups(args) => groups(&client_config, timeout, format, args.action).await,
+        Command::Groups(args) => {
+            groups(&client_config, timeout, format, args.action, verbose).await
+        }
         Command::Configs(args) => configs(&client_config, timeout, format, args.action).await,
         Command::Offsets(args) => offsets(&client_config, timeout, format, &args),
         Command::DeleteRecords(args) => {
@@ -867,6 +870,7 @@ async fn groups(
     timeout: Duration,
     format: OutputFormat,
     action: GroupAction,
+    verbose: bool,
 ) -> Result<()> {
     match action {
         GroupAction::ValidateRegex { .. } => unreachable!("handled before client configuration"),
@@ -892,7 +896,7 @@ async fn groups(
                 GroupDescribeMode::Offsets
             };
             let groups = resolve_group_names(config, timeout, &group, all_groups)?;
-            describe_group_details(config, timeout, format, &groups, mode)
+            describe_group_details(config, timeout, format, &groups, mode, verbose)
         }
         GroupAction::Delete {
             group,
@@ -1098,6 +1102,7 @@ struct GroupOffsetRow {
     group: String,
     topic: String,
     partition: i32,
+    leader_epoch: Option<i32>,
     committed_offset: i64,
     log_end_offset: Option<i64>,
     lag: Option<i64>,
@@ -1111,6 +1116,7 @@ struct GroupMemberRow {
     instance_id: Option<String>,
     client_id: String,
     host: String,
+    partitions: usize,
     assignment: String,
     target_assignment: String,
 }
@@ -1128,6 +1134,7 @@ fn describe_group_details(
     format: OutputFormat,
     groups: &[String],
     mode: GroupDescribeMode,
+    verbose: bool,
 ) -> Result<()> {
     if groups.is_empty() {
         return Err(Error::Usage("no consumer groups matched".into()));
@@ -1137,7 +1144,7 @@ fn describe_group_details(
             return describe_groups(config, timeout, format, groups);
         }
         GroupDescribeMode::Members => {
-            return describe_group_members(config, timeout, format, groups);
+            return describe_group_members(config, timeout, format, groups, verbose);
         }
         GroupDescribeMode::Offsets => {}
     }
@@ -1171,6 +1178,7 @@ fn describe_group_details(
                         group: group.clone(),
                         topic: offset.topic,
                         partition: offset.partition,
+                        leader_epoch: offset.leader_epoch,
                         committed_offset: offset.offset,
                         log_end_offset,
                         lag,
@@ -1180,6 +1188,40 @@ fn describe_group_details(
         })
         .collect::<Vec<_>>();
     output::write_value(format, "groups.describe.offsets", &rows, |rows| {
+        group_offsets_table(rows, verbose)
+    })
+}
+
+fn group_offsets_table(rows: &[GroupOffsetRow], verbose: bool) -> String {
+    if verbose {
+        output::table(
+            [
+                "GROUP",
+                "TOPIC",
+                "PARTITION",
+                "LEADER_EPOCH",
+                "CURRENT_OFFSET",
+                "LOG_END_OFFSET",
+                "LAG",
+                "ERROR",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.topic.clone(),
+                    row.partition.to_string(),
+                    row.leader_epoch
+                        .map_or_else(|| "-".into(), |value| value.to_string()),
+                    row.committed_offset.to_string(),
+                    row.log_end_offset
+                        .map_or_else(|| "-".into(), |value| value.to_string()),
+                    row.lag
+                        .map_or_else(|| "-".into(), |value| value.to_string()),
+                    row.error.as_deref().unwrap_or("-").to_owned(),
+                ]
+            }),
+        )
+    } else {
         output::table(
             [
                 "GROUP",
@@ -1204,7 +1246,7 @@ fn describe_group_details(
                 ]
             }),
         )
-    })
+    }
 }
 
 fn describe_group_members(
@@ -1212,6 +1254,7 @@ fn describe_group_members(
     timeout: Duration,
     format: OutputFormat,
     groups: &[String],
+    verbose: bool,
 ) -> Result<()> {
     let client = admin(config)?;
     let groups =
@@ -1228,12 +1271,19 @@ fn describe_group_members(
                     instance_id: member.instance_id.clone(),
                     client_id: member.client_id.clone(),
                     host: member.host.clone(),
+                    partitions: member.assignment.len(),
                     assignment: group_partitions(&member.assignment),
                     target_assignment: group_partitions(&member.target_assignment),
                 })
         })
         .collect::<Vec<_>>();
     output::write_value(format, "groups.describe.members", &rows, |rows| {
+        group_members_table(rows, verbose)
+    })
+}
+
+fn group_members_table(rows: &[GroupMemberRow], verbose: bool) -> String {
+    if verbose {
         output::table(
             [
                 "GROUP",
@@ -1241,6 +1291,7 @@ fn describe_group_members(
                 "INSTANCE_ID",
                 "CLIENT_ID",
                 "HOST",
+                "PARTITIONS",
                 "ASSIGNMENT",
                 "TARGET_ASSIGNMENT",
             ],
@@ -1251,12 +1302,34 @@ fn describe_group_members(
                     row.instance_id.as_deref().unwrap_or("-").to_owned(),
                     row.client_id.clone(),
                     row.host.clone(),
+                    row.partitions.to_string(),
                     row.assignment.clone(),
                     row.target_assignment.clone(),
                 ]
             }),
         )
-    })
+    } else {
+        output::table(
+            [
+                "GROUP",
+                "MEMBER_ID",
+                "INSTANCE_ID",
+                "CLIENT_ID",
+                "HOST",
+                "PARTITIONS",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.member_id.clone(),
+                    row.instance_id.as_deref().unwrap_or("-").to_owned(),
+                    row.client_id.clone(),
+                    row.host.clone(),
+                    row.partitions.to_string(),
+                ]
+            }),
+        )
+    }
 }
 
 fn group_partitions(partitions: &[ffi::ConsumerGroupPartition]) -> String {

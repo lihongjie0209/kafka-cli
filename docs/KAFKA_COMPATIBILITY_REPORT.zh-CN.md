@@ -102,6 +102,7 @@
 - describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`；支持重复 `--group` 和 `--all-groups`，state/members 使用 librdkafka `DescribeConsumerGroups` Admin API。
 - committed offset、log end offset、lag 和错误列。
 - members 输出已解码的当前和 target topic-partition assignment；state 输出 group type、assignor、member count 与 coordinator。
+- describe 支持原版 `--verbose`：offset 视图增加 librdkafka 返回的 committed leader epoch，members 视图增加 current/target assignment；非 verbose members 只显示 partition 数量。librdkafka 2.12 未暴露 consumer group/member epoch，因此这些 Kafka 4 新列不会伪造。
 - delete group 支持重复 `--group` 和 `--all-groups`；delete group/delete offsets 默认预览并通过 `--execute` 执行。
 - reset offsets：支持重复 `--group`/`--topic`、`--all-groups`、`--all-topics`、`--dry-run`/`--execute`，以及 earliest、latest、absolute offset、shift-by、current、datetime、ISO-8601 duration；支持原版 `--export` 与 `--from-file` 无表头 CSV（单 group 三列、多 group 四列），导入校验选择范围、重复目标并按 log start/end 边界调整 offset；执行阶段使用 librdkafka `AlterConsumerGroupOffsets` Admin API。
 - `validate-regex` 可在不提供 bootstrap-server 时独立校验正则；兼容脚本入口的原版 `--validate-regex` 会自动改写到该子命令，结果使用表格/JSON 输出。语法由 Rust regex/librdkafka 可用集合约束，不宣称覆盖所有 Java Pattern 扩展。
@@ -109,7 +110,7 @@
 缺少或有差异：
 
 - reset 尚未支持原版更丰富的 topic-partition 集合。
-- 缺少 `--verbose` 细节模式。
+- librdkafka 2.12 未暴露 Kafka consumer protocol 的 group epoch、member epoch 与 target assignment epoch；verbose 无法输出这些原版新列。
 
 ### 4.5 Configs
 
@@ -243,10 +244,9 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 ### P1：补齐已支持脚本的主要差距
 
 1. Configs 增加 user、client、IP、broker-logger、client-metrics 和 default entity。
-2. Consumer Groups 增加 verbose 细节模式。
-3. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
-4. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
-5. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
+2. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
+3. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
+4. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
 
 ### P2：扩大原版工具覆盖面
 
@@ -281,3 +281,4 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Configs add-config-file | 新增原版 Java properties `--add-config-file`，与 add-config 互斥并复用 librdkafka IncrementalAlterConfigs；普通配置变更预览改为统一表格/JSON/YAML | Clippy、58 个普通测试、bundled Kafka 4.3.1 properties 文件 add/delete 闭环通过 |
 | 2026-08-03 | Configs 全实体与 `--all` | describe 的 entity-name 改为可选，topic/broker/group 分别通过 librdkafka metadata/ListConsumerGroups 枚举；默认过滤为动态配置，`--all` 返回继承/静态/默认配置并输出 entity/source | Clippy、59 个普通测试、bundled Kafka 4.3.1 全 topic 枚举及 all config 集成测试通过 |
 | 2026-08-03 | Consumer Group validate-regex | 新增无需 broker 的结构化正则校验子命令，并为 kafka-consumer-groups 兼容入口改写原版 `--validate-regex` | Clippy、61 个普通测试（含无 bootstrap CLI 测试）通过 |
+| 2026-08-03 | Consumer Group verbose | offset verbose 输出 librdkafka committed leader epoch；members verbose 输出 current/target assignment，普通视图只显示 partition 数量；明确 group/member epoch 未由 librdkafka 2.12 暴露 | Clippy、61 个普通测试、bundled Kafka 4.3.1 verbose offsets/members 集成测试通过 |

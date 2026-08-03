@@ -317,6 +317,7 @@ pub struct GroupOffsetEntry {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
+    pub leader_epoch: Option<i32>,
     pub error: Option<String>,
 }
 
@@ -1650,6 +1651,11 @@ pub fn list_consumer_group_offsets(
             topic: unsafe { c_string(partition.topic) },
             partition: partition.partition,
             offset: partition.offset,
+            leader_epoch: match unsafe { sys::rd_kafka_topic_partition_get_leader_epoch(partition) }
+            {
+                epoch if epoch >= 0 => Some(epoch),
+                _ => None,
+            },
             error: if partition.err == sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
                 None
             } else {
