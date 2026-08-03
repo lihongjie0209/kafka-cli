@@ -660,6 +660,20 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "1",
         ],
     );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "groups",
+            "--entity-name",
+            "console-share-integration",
+            "--add-config",
+            "share.auto.offset.reset=earliest",
+            "--execute",
+        ],
+    );
     // groups, configs, offsets
     let runtime = tokio::runtime::Runtime::new().expect("Share consumer runtime");
     let share_consumer = runtime
