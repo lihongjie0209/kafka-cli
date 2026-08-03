@@ -1169,6 +1169,9 @@ async fn configs(
             entity_type,
             entity_name,
         } => {
+            if matches!(entity_type, ConfigEntityType::User) {
+                return describe_user_scram(config, timeout, format, entity_name);
+            }
             let specifier = resource(entity_type, &entity_name)?;
             let results = admin(config)?
                 .describe_configs(
@@ -1219,6 +1222,9 @@ async fn configs(
                     "provide --add-config or --delete-config".into(),
                 ));
             }
+            if matches!(entity_type, ConfigEntityType::User) {
+                return alter_user_scram(config, timeout, &entity_name, &pairs, &delete, execute);
+            }
             if !execute {
                 if !pairs.is_empty() {
                     println!(
@@ -1248,11 +1254,74 @@ async fn configs(
     }
 }
 
+fn describe_user_scram(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    format: OutputFormat,
+    user: String,
+) -> Result<()> {
+    let client = admin(config)?;
+    let rows = ffi::describe_user_scram_credentials(
+        client.inner().native_ptr(),
+        &[user],
+        duration_ms(timeout)?,
+    )?;
+    output::write_value(format, "configs.describe-user", &rows, |rows| {
+        output::table(
+            ["USER", "MECHANISM", "ITERATIONS"],
+            rows.iter().map(|row| {
+                [
+                    row.user.clone(),
+                    scram_mechanism_name(row.mechanism).to_owned(),
+                    row.iterations.to_string(),
+                ]
+            }),
+        )
+    })
+}
+
+fn alter_user_scram(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    user: &str,
+    add: &[(String, String)],
+    delete: &[String],
+    execute: bool,
+) -> Result<()> {
+    let changes = parse_scram_changes(add, delete)?;
+    if !execute {
+        for change in &changes {
+            match change {
+                ffi::ScramCredentialAlteration::Upsert {
+                    mechanism,
+                    iterations,
+                    ..
+                } => println!(
+                    "Would set {} with {iterations} iterations",
+                    scram_mechanism_name(*mechanism)
+                ),
+                ffi::ScramCredentialAlteration::Delete { mechanism } => {
+                    println!("Would delete {}", scram_mechanism_name(*mechanism));
+                }
+            }
+        }
+        return Ok(());
+    }
+    let client = admin(config)?;
+    ffi::alter_user_scram_credentials(
+        client.inner().native_ptr(),
+        user,
+        &changes,
+        duration_ms(timeout)?,
+    )
+}
+
 const fn native_resource_type(kind: ConfigEntityType) -> rdkafka_sys::rd_kafka_ResourceType_t {
     match kind {
         ConfigEntityType::Topic => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TOPIC,
         ConfigEntityType::Broker => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
         ConfigEntityType::Group => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_GROUP,
+        ConfigEntityType::User => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_UNKNOWN,
     }
 }
 
@@ -1264,7 +1333,108 @@ fn resource(kind: ConfigEntityType, name: &str) -> Result<ResourceSpecifier<'_>>
             name.parse()
                 .map_err(|_| Error::Usage("broker entity name must be an integer".into()))?,
         ),
+        ConfigEntityType::User => {
+            return Err(Error::Config(
+                "user configuration must use the SCRAM Admin API".into(),
+            ));
+        }
     })
+}
+
+fn parse_scram_changes(
+    add: &[(String, String)],
+    delete: &[String],
+) -> Result<Vec<ffi::ScramCredentialAlteration>> {
+    let mut mechanisms = BTreeSet::new();
+    let mut changes = Vec::new();
+    for (name, value) in add {
+        let mechanism = parse_scram_mechanism(name)?;
+        if !mechanisms.insert(mechanism_key(mechanism)) {
+            return Err(Error::Usage(format!(
+                "duplicate SCRAM alteration for {}",
+                scram_mechanism_name(mechanism)
+            )));
+        }
+        let body = value
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "{} must use [iterations=N,password=secret]",
+                    scram_mechanism_name(mechanism)
+                ))
+            })?;
+        let properties = body
+            .split(',')
+            .map(|item| {
+                item.split_once('=').ok_or_else(|| {
+                    Error::Usage(format!("invalid SCRAM credential property: {item}"))
+                })
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let password = properties
+            .get("password")
+            .filter(|password| !password.is_empty())
+            .ok_or_else(|| Error::Usage("SCRAM credential requires password".into()))?;
+        let iterations = properties.get("iterations").map_or(Ok(4096), |value| {
+            value
+                .parse::<i32>()
+                .map_err(|_| Error::Usage(format!("invalid SCRAM iteration count: {value}")))
+        })?;
+        if iterations < 4096 {
+            return Err(Error::Usage(
+                "SCRAM iteration count must be at least 4096".into(),
+            ));
+        }
+        if properties
+            .keys()
+            .any(|key| !matches!(*key, "iterations" | "password"))
+        {
+            return Err(Error::Usage(
+                "SCRAM credentials only accept iterations and password".into(),
+            ));
+        }
+        changes.push(ffi::ScramCredentialAlteration::Upsert {
+            mechanism,
+            iterations,
+            password: password.as_bytes().to_vec(),
+        });
+    }
+    for name in delete {
+        let mechanism = parse_scram_mechanism(name)?;
+        if !mechanisms.insert(mechanism_key(mechanism)) {
+            return Err(Error::Usage(format!(
+                "duplicate SCRAM alteration for {}",
+                scram_mechanism_name(mechanism)
+            )));
+        }
+        changes.push(ffi::ScramCredentialAlteration::Delete { mechanism });
+    }
+    Ok(changes)
+}
+
+fn parse_scram_mechanism(value: &str) -> Result<ffi::ScramMechanism> {
+    match value.to_ascii_uppercase().as_str() {
+        "SCRAM-SHA-256" => Ok(ffi::ScramMechanism::Sha256),
+        "SCRAM-SHA-512" => Ok(ffi::ScramMechanism::Sha512),
+        _ => Err(Error::Usage(format!(
+            "unsupported user config {value}; expected SCRAM-SHA-256 or SCRAM-SHA-512"
+        ))),
+    }
+}
+
+const fn mechanism_key(value: ffi::ScramMechanism) -> u8 {
+    match value {
+        ffi::ScramMechanism::Sha256 => 1,
+        ffi::ScramMechanism::Sha512 => 2,
+    }
+}
+
+const fn scram_mechanism_name(value: ffi::ScramMechanism) -> &'static str {
+    match value {
+        ffi::ScramMechanism::Sha256 => "SCRAM-SHA-256",
+        ffi::ScramMechanism::Sha512 => "SCRAM-SHA-512",
+    }
 }
 
 #[derive(Serialize)]
@@ -1623,16 +1793,15 @@ async fn cluster(
             })
         }
         ClusterAction::ListEndpoints => {
-            let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
-            let cluster = client.describe_cluster().await?;
-            drop(client);
-            let rows = cluster
-                .brokers
-                .into_iter()
+            let client = base_consumer(config)?;
+            let metadata = client.fetch_metadata(None, timeout)?;
+            let rows = metadata
+                .brokers()
+                .iter()
                 .map(|broker| BrokerRow {
-                    id: broker.broker_id,
-                    host: broker.host,
-                    port: broker.port,
+                    id: broker.id(),
+                    host: broker.host().to_owned(),
+                    port: broker.port(),
                 })
                 .collect::<Vec<_>>();
             output::write_value(format, "cluster.list-endpoints", &rows, |rows| {
@@ -2982,6 +3151,54 @@ mod tests {
     fn parse_pairs_should_retain_equals_in_value() {
         let pairs = parse_pairs(&["password=a=b".into()]).expect("valid pair");
         assert_eq!(pairs, [("password".into(), "a=b".into())]);
+    }
+
+    #[test]
+    fn scram_changes_should_parse_upserts_and_deletes_without_exposing_passwords() {
+        let changes = parse_scram_changes(
+            &[(
+                "SCRAM-SHA-256".into(),
+                "[iterations=8192,password=a=b]".into(),
+            )],
+            &["SCRAM-SHA-512".into()],
+        )
+        .expect("valid SCRAM changes");
+
+        assert!(matches!(
+            &changes[0],
+            ffi::ScramCredentialAlteration::Upsert {
+                mechanism: ffi::ScramMechanism::Sha256,
+                iterations: 8192,
+                password,
+            } if password == b"a=b"
+        ));
+        assert!(matches!(
+            changes[1],
+            ffi::ScramCredentialAlteration::Delete {
+                mechanism: ffi::ScramMechanism::Sha512,
+            }
+        ));
+    }
+
+    #[test]
+    fn scram_changes_should_reject_weak_iterations_and_duplicate_mechanisms() {
+        assert!(matches!(
+            parse_scram_changes(
+                &[(
+                    "SCRAM-SHA-256".into(),
+                    "[iterations=1024,password=secret]".into(),
+                )],
+                &[],
+            ),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse_scram_changes(
+                &[("SCRAM-SHA-256".into(), "[password=secret]".into(),)],
+                &["SCRAM-SHA-256".into()],
+            ),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]

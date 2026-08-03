@@ -449,6 +449,48 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "integration-user",
+            "--add-config",
+            "SCRAM-SHA-256=[iterations=4096,password=integration-secret]",
+            "--execute",
+        ],
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "configs",
+                "describe",
+                "--entity-type",
+                "users",
+                "--entity-name",
+                "integration-user",
+            ],
+        )
+        .contains("SCRAM-SHA-256")
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "integration-user",
+            "--delete-config",
+            "SCRAM-SHA-256",
+            "--execute",
+        ],
+    );
     assert!(
         success(&bootstrap, &["offsets", "--topic", "integration-events"])
             .contains("integration-events")

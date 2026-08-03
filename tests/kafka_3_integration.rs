@@ -146,4 +146,53 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .assert()
         .success()
         .stdout(predicate::str::contains("CLUSTER_ID"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "configs",
+            "alter",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "kafka-36-user",
+            "--add-config",
+            "SCRAM-SHA-512=[iterations=4096,password=integration-secret]",
+            "--execute",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "configs",
+            "describe",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "kafka-36-user",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SCRAM-SHA-512"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "configs",
+            "alter",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "kafka-36-user",
+            "--delete-config",
+            "SCRAM-SHA-512",
+            "--execute",
+        ])
+        .assert()
+        .success();
 }

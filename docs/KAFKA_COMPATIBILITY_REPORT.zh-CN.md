@@ -33,7 +33,7 @@
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 常用行输入、key、JSON、headers、partition；未复刻可插拔 reader 全部选项 |
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/group/partition/offset/from-beginning/max-messages；未复刻 formatter/deserializer 全部选项 |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、describe、delete、delete-offsets、reset-offsets；缺少批量与导入导出模式 |
-| `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group；缺少其他 entity type |
+| `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group，以及 librdkafka SCRAM user credential；缺少其他 entity type |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | topic 正则、partition 模式、earliest/latest/timestamp、排除内部主题 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；缺少 throttle 高级参数 |
@@ -113,9 +113,15 @@
 
 ### 4.5 Configs
 
-已支持：topic、broker、group 的 describe；增量 add/delete config；预览与 `--execute`。
+已支持：
 
-缺少：client、user、user/client 组合、IP、broker-logger、client-metrics、entity-default、`--all`、`--add-config-file`、bootstrap-controller。资源类型覆盖明显少于原版。
+- topic、broker、group 的 describe 和增量 add/delete config。
+- 原版复数 entity type（`topics`、`brokers`、`groups`、`users`）以及兼容的单数别名。
+- user SCRAM credential describe、upsert 和 delete，支持 SCRAM-SHA-256、SCRAM-SHA-512、iterations 与 password。
+- SCRAM 预览只显示 mechanism 和 iterations，不回显 password。
+- 预览与 `--execute`。
+
+缺少：普通 user quota、client、user/client 组合、IP、broker-logger、client-metrics、entity-default、`--all`、`--add-config-file`、bootstrap-controller。除 SCRAM credential 外，资源类型覆盖仍少于原版。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
 
 ### 4.6 Get Offsets
 
@@ -162,7 +168,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 
 ### 4.13 Cluster
 
-已支持 cluster ID、broker endpoints、API versions、unregister broker。
+已支持 cluster ID、broker endpoints、API versions、unregister broker。Cluster ID 和 broker endpoints 均通过 rdkafka/librdkafka metadata API 获取。
 
 缺少或有差异：bootstrap-controller、list-endpoints 的 `--include-fenced-brokers`、原版短参数和废弃 config 别名。unregister 要求 `--execute`，避免误操作。
 
@@ -197,7 +203,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：48 个通过。
+- Rust 单元测试与普通 CLI 测试：50 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -256,3 +262,5 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 日期 | 功能 | 结果 | 验证 |
 |---|---|---|---|
 | 2026-08-03 | ACL Create/Describe/Delete | 从手写 Kafka 协议迁移到 librdkafka Admin FFI；不支持的 Delegation Token 资源改为明确报错 | Clippy、48 个普通测试、Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
+| 2026-08-03 | User SCRAM credential | 新增 `configs` users entity 的 SCRAM-SHA-256/512 describe、upsert、delete；CI 集成测试改用 bundled OpenSSL librdkafka | Clippy、50 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
+| 2026-08-03 | Cluster endpoints | `cluster list-endpoints` 从独立协议客户端迁移到 librdkafka metadata API | 既有 Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成覆盖 |

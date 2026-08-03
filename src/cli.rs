@@ -354,9 +354,14 @@ pub struct ConfigsArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ConfigEntityType {
+    #[value(name = "topics", alias = "topic")]
     Topic,
+    #[value(name = "brokers", alias = "broker")]
     Broker,
+    #[value(name = "groups", alias = "group")]
     Group,
+    #[value(name = "users", alias = "user")]
+    User,
 }
 
 #[derive(Debug, Subcommand)]

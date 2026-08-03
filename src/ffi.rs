@@ -86,6 +86,13 @@ impl Drop for NativeAcl {
     }
 }
 
+struct ScramAlteration(*mut sys::rd_kafka_UserScramCredentialAlteration_t);
+impl Drop for ScramAlteration {
+    fn drop(&mut self) {
+        unsafe { sys::rd_kafka_UserScramCredentialAlteration_destroy(self.0) };
+    }
+}
+
 /// ACL resource types supported by librdkafka.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AclResourceType {
@@ -161,6 +168,34 @@ pub struct AclMutationResult {
     pub failures: usize,
 }
 
+/// SCRAM mechanisms supported by Kafka and librdkafka.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum ScramMechanism {
+    Sha256,
+    Sha512,
+}
+
+/// One user's configured SCRAM credential metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScramCredentialDescription {
+    pub user: String,
+    pub mechanism: ScramMechanism,
+    pub iterations: i32,
+}
+
+/// One requested SCRAM credential alteration.
+#[derive(Debug, Clone)]
+pub enum ScramCredentialAlteration {
+    Upsert {
+        mechanism: ScramMechanism,
+        iterations: i32,
+        password: Vec<u8>,
+    },
+    Delete {
+        mechanism: ScramMechanism,
+    },
+}
+
 /// A committed consumer-group offset returned by librdkafka.
 #[derive(Debug)]
 pub struct GroupOffsetEntry {
@@ -220,6 +255,217 @@ fn poll(queue: &Queue, timeout_ms: i32) -> Result<Event> {
         return Err(Error::Config(message));
     }
     Ok(event)
+}
+
+/// Describes SCRAM credential metadata for the selected users.
+pub fn describe_user_scram_credentials(
+    client: *mut sys::rd_kafka_t,
+    users: &[String],
+    timeout_ms: i32,
+) -> Result<Vec<ScramCredentialDescription>> {
+    let users = users
+        .iter()
+        .map(|user| {
+            CString::new(user.as_str())
+                .map_err(|_| Error::Usage("SCRAM user contains a NUL byte".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut pointers = users.iter().map(|user| user.as_ptr()).collect::<Vec<_>>();
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_DESCRIBEUSERSCRAMCREDENTIALS,
+        timeout_ms,
+    )?;
+    unsafe {
+        sys::rd_kafka_DescribeUserScramCredentials(
+            client,
+            pointers.as_mut_ptr(),
+            pointers.len(),
+            options.0,
+            queue.0,
+        );
+    }
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_DescribeUserScramCredentials_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid DescribeUserScramCredentials response".into(),
+        ));
+    }
+    let mut count = 0;
+    let descriptions = unsafe {
+        sys::rd_kafka_DescribeUserScramCredentials_result_descriptions(result, &raw mut count)
+    };
+    if count > 0 && descriptions.is_null() {
+        return Err(Error::Config(
+            "broker returned a null SCRAM description array".into(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for index in 0..count {
+        let description = unsafe { *descriptions.add(index) };
+        if description.is_null() {
+            return Err(Error::Config(
+                "broker returned a null SCRAM description".into(),
+            ));
+        }
+        let error = unsafe { sys::rd_kafka_UserScramCredentialsDescription_error(description) };
+        if native_error_failed(error) {
+            return Err(Error::Config(unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            }));
+        }
+        let user = unsafe {
+            c_string(sys::rd_kafka_UserScramCredentialsDescription_user(
+                description,
+            ))
+        };
+        let credential_count = unsafe {
+            sys::rd_kafka_UserScramCredentialsDescription_scramcredentialinfo_count(description)
+        };
+        for credential_index in 0..credential_count {
+            let credential = unsafe {
+                sys::rd_kafka_UserScramCredentialsDescription_scramcredentialinfo(
+                    description,
+                    credential_index,
+                )
+            };
+            if credential.is_null() {
+                return Err(Error::Config(
+                    "broker returned a null SCRAM credential".into(),
+                ));
+            }
+            rows.push(ScramCredentialDescription {
+                user: user.clone(),
+                mechanism: scram_mechanism_from_native(unsafe {
+                    sys::rd_kafka_ScramCredentialInfo_mechanism(credential)
+                })?,
+                iterations: unsafe { sys::rd_kafka_ScramCredentialInfo_iterations(credential) },
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Upserts and deletes one user's SCRAM credentials.
+pub fn alter_user_scram_credentials(
+    client: *mut sys::rd_kafka_t,
+    user: &str,
+    changes: &[ScramCredentialAlteration],
+    timeout_ms: i32,
+) -> Result<()> {
+    let user =
+        CString::new(user).map_err(|_| Error::Usage("SCRAM user contains a NUL byte".into()))?;
+    let native = changes
+        .iter()
+        .map(|change| {
+            let alteration = match change {
+                ScramCredentialAlteration::Upsert {
+                    mechanism,
+                    iterations,
+                    password,
+                } => unsafe {
+                    sys::rd_kafka_UserScramCredentialUpsertion_new(
+                        user.as_ptr(),
+                        native_scram_mechanism(*mechanism),
+                        *iterations,
+                        password.as_ptr(),
+                        password.len(),
+                        ptr::null(),
+                        0,
+                    )
+                },
+                ScramCredentialAlteration::Delete { mechanism } => unsafe {
+                    sys::rd_kafka_UserScramCredentialDeletion_new(
+                        user.as_ptr(),
+                        native_scram_mechanism(*mechanism),
+                    )
+                },
+            };
+            if alteration.is_null() {
+                Err(Error::Config(
+                    "librdkafka failed to construct a SCRAM alteration".into(),
+                ))
+            } else {
+                Ok(ScramAlteration(alteration))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut pointers = native.iter().map(|change| change.0).collect::<Vec<_>>();
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_ALTERUSERSCRAMCREDENTIALS,
+        timeout_ms,
+    )?;
+    unsafe {
+        sys::rd_kafka_AlterUserScramCredentials(
+            client,
+            pointers.as_mut_ptr(),
+            pointers.len(),
+            options.0,
+            queue.0,
+        );
+    }
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_AlterUserScramCredentials_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid AlterUserScramCredentials response".into(),
+        ));
+    }
+    let mut count = 0;
+    let responses =
+        unsafe { sys::rd_kafka_AlterUserScramCredentials_result_responses(result, &raw mut count) };
+    if count > 0 && responses.is_null() {
+        return Err(Error::Config(
+            "broker returned a null SCRAM alteration response array".into(),
+        ));
+    }
+    for index in 0..count {
+        let response = unsafe { *responses.add(index) };
+        if response.is_null() {
+            return Err(Error::Config(
+                "broker returned a null SCRAM alteration response".into(),
+            ));
+        }
+        let error =
+            unsafe { sys::rd_kafka_AlterUserScramCredentials_result_response_error(response) };
+        if native_error_failed(error) {
+            return Err(Error::Config(unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            }));
+        }
+    }
+    Ok(())
+}
+
+const fn native_scram_mechanism(value: ScramMechanism) -> sys::rd_kafka_ScramMechanism_t {
+    match value {
+        ScramMechanism::Sha256 => sys::rd_kafka_ScramMechanism_t::RD_KAFKA_SCRAM_MECHANISM_SHA_256,
+        ScramMechanism::Sha512 => sys::rd_kafka_ScramMechanism_t::RD_KAFKA_SCRAM_MECHANISM_SHA_512,
+    }
+}
+
+fn scram_mechanism_from_native(value: sys::rd_kafka_ScramMechanism_t) -> Result<ScramMechanism> {
+    match value {
+        sys::rd_kafka_ScramMechanism_t::RD_KAFKA_SCRAM_MECHANISM_SHA_256 => {
+            Ok(ScramMechanism::Sha256)
+        }
+        sys::rd_kafka_ScramMechanism_t::RD_KAFKA_SCRAM_MECHANISM_SHA_512 => {
+            Ok(ScramMechanism::Sha512)
+        }
+        _ => Err(Error::Unsupported(
+            "librdkafka returned an unknown SCRAM mechanism".into(),
+        )),
+    }
+}
+
+fn native_error_failed(error: *const sys::rd_kafka_error_t) -> bool {
+    !error.is_null()
+        && unsafe { sys::rd_kafka_error_code(error) }
+            != sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
 }
 
 /// Creates ACL bindings through librdkafka's Admin API.
