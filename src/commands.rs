@@ -3410,17 +3410,17 @@ async fn reassign(
             let result = client
                 .alter_partition_reassignments(reassignment_topics(&plan, false), timeout)
                 .await?;
-            let failures = result
-                .topics
-                .iter()
-                .flat_map(|topic| &topic.partitions)
-                .filter(|partition| partition.error.is_some())
-                .count()
-                + usize::from(result.error.is_some());
+            let rows = reassignment_result_rows(&result, "STARTED");
+            let failures = rows.iter().filter(|row| row.error.is_some()).count();
             if failures == 0 {
-                let log_dir_failures = alter_reassignment_log_dirs(&client, &plan).await?;
+                let log_dir_rows = alter_reassignment_log_dirs(&client, &plan).await?;
                 drop(client);
+                let log_dir_failures = log_dir_rows
+                    .iter()
+                    .filter(|row| row.error.is_some())
+                    .count();
                 if log_dir_failures != 0 {
+                    write_mutation_rows(format, "reassign.execute.log-dirs", &log_dir_rows)?;
                     return Err(Error::Partial {
                         failed: log_dir_failures,
                         total: plan.partitions.len(),
@@ -3429,6 +3429,7 @@ async fn reassign(
                 write_reassignment_mutation_rows(format, "reassign.execute", &plan, "STARTED")
             } else {
                 drop(client);
+                write_mutation_rows(format, "reassign.execute", &rows)?;
                 Err(Error::Partial {
                     failed: failures,
                     total: plan.partitions.len(),
@@ -3453,16 +3454,12 @@ async fn reassign(
                 .alter_partition_reassignments(reassignment_topics(&plan, true), timeout)
                 .await?;
             drop(client);
-            let failures = result
-                .topics
-                .iter()
-                .flat_map(|topic| &topic.partitions)
-                .filter(|partition| partition.error.is_some())
-                .count()
-                + usize::from(result.error.is_some());
+            let rows = reassignment_result_rows(&result, "CANCELLED");
+            let failures = rows.iter().filter(|row| row.error.is_some()).count();
             if failures == 0 {
                 write_reassignment_mutation_rows(format, "reassign.cancel", &plan, "CANCELLED")
             } else {
+                write_mutation_rows(format, "reassign.cancel", &rows)?;
                 Err(Error::Partial {
                     failed: failures,
                     total: plan.partitions.len(),
@@ -3530,6 +3527,35 @@ fn write_reassignment_mutation_rows(
     write_mutation_rows(format, command, &rows)
 }
 
+fn reassignment_result_rows(
+    result: &krafka::admin::AlterReassignmentsResult,
+    success_status: &str,
+) -> Vec<MutationRow> {
+    let mut rows = result
+        .topics
+        .iter()
+        .flat_map(|topic| {
+            topic.partitions.iter().map(|partition| MutationRow {
+                resource: format!("{}:{}", topic.name, partition.partition_index),
+                status: if partition.error.is_some() {
+                    "FAILED".into()
+                } else {
+                    success_status.into()
+                },
+                error: partition.error.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(error) = &result.error {
+        rows.push(MutationRow {
+            resource: "reassignment-request".into(),
+            status: "FAILED".into(),
+            error: Some(error.clone()),
+        });
+    }
+    rows
+}
+
 type BrokerLogDirPlan = BTreeMap<i32, BTreeMap<String, BTreeMap<String, Vec<i32>>>>;
 
 fn broker_log_dir_plan(plan: &ReassignmentFile) -> BrokerLogDirPlan {
@@ -3554,13 +3580,13 @@ fn broker_log_dir_plan(plan: &ReassignmentFile) -> BrokerLogDirPlan {
 async fn alter_reassignment_log_dirs(
     client: &krafka::admin::AdminClient,
     plan: &ReassignmentFile,
-) -> Result<usize> {
+) -> Result<Vec<MutationRow>> {
     let moves = broker_log_dir_plan(plan);
     if moves.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let cluster = client.describe_cluster().await?;
-    let mut failures = 0;
+    let mut rows = Vec::new();
     for (broker_id, directories) in moves {
         let broker = cluster
             .brokers
@@ -3601,17 +3627,24 @@ async fn alter_reassignment_log_dirs(
         let _throttle_time_ms = i32::decode(&mut response)?;
         let topic_count = decode_acl_count(&mut response)?;
         for _ in 0..topic_count {
-            let _topic = decode_required_acl_string(&mut response, "log-dir topic")?;
+            let topic = decode_required_acl_string(&mut response, "log-dir topic")?;
             let partition_count = decode_acl_count(&mut response)?;
             for _ in 0..partition_count {
-                let _partition = i32::decode(&mut response)?;
-                if i16::decode(&mut response)? != 0 {
-                    failures += 1;
-                }
+                let partition = i32::decode(&mut response)?;
+                let error_code = i16::decode(&mut response)?;
+                rows.push(MutationRow {
+                    resource: format!("broker:{broker_id}:{topic}:{partition}"),
+                    status: if error_code == 0 {
+                        "LOG_DIR_MOVED".into()
+                    } else {
+                        "FAILED".into()
+                    },
+                    error: (error_code != 0).then(|| format!("Kafka error code {error_code}")),
+                });
             }
         }
     }
-    Ok(failures)
+    Ok(rows)
 }
 
 fn read_reassignment(path: &Path) -> Result<ReassignmentFile> {

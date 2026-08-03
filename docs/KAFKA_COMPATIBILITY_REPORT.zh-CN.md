@@ -286,10 +286,9 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 
 | 优先级 | 位置 | 当前行为 | 原版/期望行为 |
 |---|---|---|---|
-| P1 | 批量管理请求 | 部分路径在首个错误处返回，逐实体成功/失败信息不完整 | 原版批量工具通常展示逐实体结果；本项目应保持 partial failure 语义一致 |
 | P2 | regex | Rust regex 预校验与 librdkafka POSIX topic regex 不是同一语法实现 | 应明确分离 Java Pattern 兼容校验与实际订阅语法，或避免过度承诺 |
 
-本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并，以及 groups delete 结构化输出。当前剩余问题主要是其他管理命令的逐实体失败结果和正则语法边界。
+本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并、groups delete 结构化输出，以及 reassignment 的逐 partition/log-dir 错误结果。当前代码审计剩余问题是 Java Pattern、Rust regex 与 librdkafka POSIX regex 的语法边界。
 
 ### 10.2 逐入口验收结论
 
@@ -339,6 +338,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | 管理结果结构化输出 | Topics create/alter/delete、SCRAM alter、ACL add/remove、delete-records 统一接入 `comfy-table`/JSON envelope；ACL FFI 不再直接写 stderr，逐请求错误进入 envelope | Clippy、66 个普通测试、Kafka 4.3.1 Topics/SCRAM/ACL/delete-records JSON 集成测试通过 |
 | 2026-08-03 | 非流式输出闭环 | Reassignment execute/cancel、cluster unregister 及 Topics no-op 结果接入统一 mutation table/JSON；生产/消费流和 CSV 保持专用流格式 | Clippy、66 个普通测试、Kafka 4.3.1 reassignment/unregister JSON 集成测试通过 |
 | 2026-08-03 | 参数与 panic 路径复审 | reset-offsets 在任何 broker 请求前校验 reset scenario；移除 consume、group dispatch、user config 枚举路径的生产代码 `expect!/unreachable!` | all-features Clippy、67 个普通测试通过 |
+| 2026-08-03 | Reassignment partial failure | execute/cancel 将 top-level 和 partition error 映射到具体 mutation 行；AlterReplicaLogDirs 错误包含 broker/topic/partition，不再只返回汇总数量 | all-features Clippy、67 个普通测试、Kafka 4.3.1 失败请求 JSON 与非零退出码集成测试通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

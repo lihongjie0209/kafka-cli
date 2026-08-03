@@ -57,6 +57,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let delete_file = fixture.path().join("delete.json");
     let topics_file = fixture.path().join("topics.json");
     let reassignment_file = fixture.path().join("reassignment.json");
+    let invalid_reassignment_file = fixture.path().join("invalid-reassignment.json");
     let election_file = fixture.path().join("election.json");
     let reset_file = fixture.path().join("reset.csv");
     let topic_config_file = fixture.path().join("topic.properties");
@@ -1041,6 +1042,33 @@ fn all_command_families_work_against_kafka_4_3_1() {
             reassignment_file.to_str().expect("fixture path"),
             "--execute",
         ],
+    );
+    fs::write(
+        &invalid_reassignment_file,
+        r#"{"version":1,"partitions":[{"topic":"missing-reassignment-topic","partition":0,"replicas":[1]}]}"#,
+    )
+    .expect("invalid reassignment fixture");
+    let failed_reassignment = kafka(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "reassign",
+            "execute",
+            "--reassignment-json-file",
+            invalid_reassignment_file.to_str().expect("fixture path"),
+            "--execute",
+        ],
+    );
+    assert!(!failed_reassignment.status.success());
+    let failed_reassignment_json: serde_json::Value =
+        serde_json::from_slice(&failed_reassignment.stdout).expect("failed reassignment JSON");
+    assert!(
+        failed_reassignment_json["data"]
+            .as_array()
+            .expect("failed reassignment rows")
+            .iter()
+            .any(|row| row["error"].is_string())
     );
     success(&bootstrap, &["reassign", "list"]);
     assert!(
