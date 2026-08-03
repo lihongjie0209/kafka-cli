@@ -112,6 +112,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             args.topic.as_deref(),
             args.partition,
             args.all_topic_partitions,
+            args.path_to_json_file.as_deref(),
             args.execute,
         ),
         Command::LogDirs(args) => {
@@ -3146,31 +3147,55 @@ fn leader_election(
     topic: Option<&str>,
     partition: Option<i32>,
     all: bool,
+    path_to_json_file: Option<&Path>,
     execute: bool,
 ) -> Result<()> {
-    let target = match (all, topic, partition) {
-        (true, None, None) => None,
-        (false, Some(topic), Some(partition)) => Some((topic, partition)),
+    let targets = match (all, topic, partition, path_to_json_file) {
+        (true, None, None, None) => None,
+        (false, Some(topic), Some(partition), None) => Some(vec![(topic.to_owned(), partition)]),
+        (false, None, None, Some(path)) => Some(read_election_targets(path)?),
         _ => {
             return Err(Error::Usage(
-                "use --all-topic-partitions or both --topic and --partition".into(),
+                "use exactly one of --all-topic-partitions, --path-to-json-file, or both --topic and --partition".into(),
             ));
         }
     };
     if !execute {
-        match target {
-            Some((topic, partition)) => {
-                println!("Would trigger leader election for {topic}:{partition}");
-            }
-            None => println!("Would trigger leader election for all topic partitions"),
-        }
-        return Ok(());
+        let preview = targets.as_ref().map_or_else(
+            || {
+                vec![ElectionTargetRow {
+                    topic: "*".into(),
+                    partition: None,
+                }]
+            },
+            |targets| {
+                targets
+                    .iter()
+                    .map(|(topic, partition)| ElectionTargetRow {
+                        topic: topic.clone(),
+                        partition: Some(*partition),
+                    })
+                    .collect()
+            },
+        );
+        return output::write_value(format, "leader-election.preview", &preview, |rows| {
+            output::table(
+                ["TOPIC", "PARTITION"],
+                rows.iter().map(|row| {
+                    [
+                        row.topic.clone(),
+                        row.partition
+                            .map_or_else(|| "ALL".into(), |value| value.to_string()),
+                    ]
+                }),
+            )
+        });
     }
     let admin = admin(config)?;
     let rows = crate::ffi::elect_leaders(
         admin.inner().native_ptr(),
         matches!(kind, ElectionType::Unclean),
-        target,
+        targets.as_deref(),
         duration_ms(timeout)?,
     )?;
     let failures = rows.iter().filter(|row| row.error.is_some()).count();
@@ -3194,6 +3219,53 @@ fn leader_election(
             total: rows.len(),
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ElectionTargetFile {
+    partitions: Vec<ElectionTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ElectionTarget {
+    topic: String,
+    partition: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct ElectionTargetRow {
+    topic: String,
+    partition: Option<i32>,
+}
+
+fn read_election_targets(path: &Path) -> Result<Vec<(String, i32)>> {
+    let input: ElectionTargetFile = serde_json::from_reader(std::fs::File::open(path)?)?;
+    if input.partitions.is_empty() {
+        return Err(Error::Usage(
+            "leader election partition list is empty".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    input
+        .partitions
+        .into_iter()
+        .map(|target| {
+            if target.topic.is_empty() || target.partition < 0 {
+                return Err(Error::Usage(
+                    "leader election targets require a non-empty topic and non-negative partition"
+                        .into(),
+                ));
+            }
+            let key = (target.topic, target.partition);
+            if !seen.insert(key.clone()) {
+                return Err(Error::Usage(format!(
+                    "duplicate leader election target {}:{}",
+                    key.0, key.1
+                )));
+            }
+            Ok(key)
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -3700,6 +3772,31 @@ mod tests {
         .expect("write delete-records fixture");
         assert!(matches!(
             read_delete_records(file.path()),
+            Err(Error::Usage(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn leader_election_file_should_parse_and_reject_duplicates() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary file");
+        write!(
+            file,
+            r#"{{"partitions":[{{"topic":"events","partition":0}},{{"topic":"orders","partition":1}}]}}"#
+        )
+        .expect("write leader-election fixture");
+        assert_eq!(
+            read_election_targets(file.path()).expect("valid targets"),
+            [("events".into(), 0), ("orders".into(), 1)]
+        );
+
+        let mut duplicate = tempfile::NamedTempFile::new().expect("temporary file");
+        write!(
+            duplicate,
+            r#"{{"partitions":[{{"topic":"events","partition":0}},{{"topic":"events","partition":0}}]}}"#
+        )
+        .expect("write duplicate fixture");
+        assert!(matches!(
+            read_election_targets(duplicate.path()),
             Err(Error::Usage(message)) if message.contains("duplicate")
         ));
     }

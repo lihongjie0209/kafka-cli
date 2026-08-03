@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目版本：提交 `ce72ef10e52dd674267fe3109975bea14603dad8`。
+- 本项目版本：`master`（报告随每个对齐提交持续更新）。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（约 30%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -38,7 +38,7 @@
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；缺少 throttle 高级参数 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件、预览、执行 |
-| `kafka-leader-election.sh` | `kafka leader-election` | 部分支持 | preferred/unclean、单分区或全部；缺少 JSON 文件批量选择 |
+| `kafka-leader-election.sh` | `kafka leader-election` | 已支持 | preferred/unclean、单分区、JSON 文件批量选择或全部分区 |
 | `kafka-log-dirs.sh` | `kafka log-dirs` | 已支持 | broker/topic 过滤与目录、大小、lag 展示 |
 | `kafka-broker-api-versions.sh` | `kafka api-versions` | 已支持 | 全 broker 或指定 broker 的 API version 范围 |
 | `kafka-cluster.sh` | `kafka cluster` | 部分支持 | cluster ID、endpoints、API versions、unregister；缺少 fenced broker 细节选项 |
@@ -153,9 +153,9 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 
 ### 4.10 Leader Election
 
-已支持 preferred、unclean；topic+partition 或 all-topic-partitions；预览与 `--execute`。
+已支持 preferred、unclean；topic+partition、原版 `--path-to-json-file` 批量 partition 输入或 all-topic-partitions；预览与 `--execute`。批量输入会校验空列表、负 partition 和重复 topic-partition，执行统一使用 librdkafka `ElectLeaders` Admin API。
 
-缺少：`--path-to-json-file` 批量 partition 输入、旧 `--admin.config` 别名、bootstrap-controller。原版执行命令直接产生变更；本项目要求 `--execute`。
+差异：未提供旧 `--admin.config` 别名和 bootstrap-controller。原版执行命令直接产生变更；本项目要求 `--execute`，预览使用统一表格/JSON/YAML 输出。
 
 ### 4.11 Log Dirs
 
@@ -243,8 +243,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 2. Consumer Groups 增加 reset-offsets from-file/export，以及 validate-regex 和 verbose 细节模式。
 3. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
 4. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
-5. Leader Election 增加 JSON 文件批量输入。
-6. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
+5. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
 
 ### P2：扩大原版工具覆盖面
 
@@ -272,3 +271,4 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Topic default replication factor | create 未指定 `--replication-factor` 时使用 librdkafka `-1` sentinel，交由 broker 的 default.replication.factor 决定 | Topic create 单元路径及 Kafka 3.6.2/4.3.1 集成测试 |
 | 2026-08-03 | Consumer Group 批量目标 | describe 的 offsets/state/members 视图及 delete 支持重复 `--group` 与 `--all-groups`；all-groups 通过 librdkafka `ListConsumerGroups` 解析目标 | Clippy、53 个普通测试、bundled Kafka 4.3.1 批量 describe/delete 集成测试通过 |
 | 2026-08-03 | Consumer Group 批量 reset | reset-offsets 支持重复 group/topic、all-groups、all-topics 和显式 dry-run；预览改为统一表格/JSON/YAML 输出，执行仍使用 librdkafka `AlterConsumerGroupOffsets` | Clippy、53 个普通测试、bundled Kafka 4.3.1 all-groups/all-topics 集成测试通过 |
+| 2026-08-03 | Leader Election JSON 批量目标 | 新增原版 `--path-to-json-file` 格式，校验空列表、非法/重复 partition；librdkafka `ElectLeaders` FFI 从单目标扩展为 partition list，预览改为统一结构化输出 | Clippy、54 个普通测试、bundled Kafka 4.3.1 单目标/批量目标集成测试通过 |

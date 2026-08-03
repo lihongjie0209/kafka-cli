@@ -1758,24 +1758,27 @@ pub fn alter_consumer_group_offsets(
     Ok(())
 }
 
-/// Triggers preferred or unclean leader election for one partition or all partitions.
+/// Triggers preferred or unclean leader election for selected partitions or all partitions.
 pub fn elect_leaders(
     client: *mut sys::rd_kafka_t,
     unclean: bool,
-    partition: Option<(&str, i32)>,
+    partitions: Option<&[(String, i32)]>,
     timeout_ms: i32,
 ) -> Result<Vec<ElectionEntry>> {
-    let topic = partition
-        .map(|(topic, _)| CString::new(topic))
-        .transpose()
-        .map_err(|_| Error::Usage("topic contains a NUL byte".into()))?;
-    let partitions = if let (Some((_, partition)), Some(topic)) = (partition, topic.as_ref()) {
-        let list = unsafe { sys::rd_kafka_topic_partition_list_new(1) };
+    let partitions = if let Some(partitions) = partitions {
+        let capacity = i32::try_from(partitions.len())
+            .map_err(|_| Error::Usage("too many leader election targets".into()))?;
+        let list = unsafe { sys::rd_kafka_topic_partition_list_new(capacity) };
         if list.is_null() {
             return Err(Error::Config("failed to allocate partition list".into()));
         }
-        unsafe { sys::rd_kafka_topic_partition_list_add(list, topic.as_ptr(), partition) };
-        Some(PartitionList(list))
+        let list = PartitionList(list);
+        for (topic, partition) in partitions {
+            let topic = CString::new(topic.as_str())
+                .map_err(|_| Error::Usage("topic contains a NUL byte".into()))?;
+            unsafe { sys::rd_kafka_topic_partition_list_add(list.0, topic.as_ptr(), *partition) };
+        }
+        Some(list)
     } else {
         None
     };

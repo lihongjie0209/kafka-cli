@@ -575,12 +575,14 @@ pub struct DeleteRecordsArgs {
 pub struct LeaderElectionArgs {
     #[arg(long, value_enum)]
     pub election_type: ElectionType,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["all_topic_partitions", "path_to_json_file"])]
     pub topic: Option<String>,
     #[arg(long)]
     pub partition: Option<i32>,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["topic", "partition", "path_to_json_file"])]
     pub all_topic_partitions: bool,
+    #[arg(long, conflicts_with_all = ["topic", "partition", "all_topic_partitions"])]
+    pub path_to_json_file: Option<PathBuf>,
     #[arg(long)]
     pub execute: bool,
 }

@@ -57,6 +57,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let delete_file = fixture.path().join("delete.json");
     let topics_file = fixture.path().join("topics.json");
     let reassignment_file = fixture.path().join("reassignment.json");
+    let election_file = fixture.path().join("election.json");
     fs::write(
         &delete_file,
         r#"{"partitions":[{"topic":"integration-events","partition":0,"offset":1}]}"#,
@@ -72,6 +73,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
         r#"{"version":1,"partitions":[{"topic":"integration-events","partition":0,"replicas":[1],"log_dirs":["any"]}]}"#,
     )
     .expect("reassignment fixture");
+    fs::write(
+        &election_file,
+        r#"{"partitions":[{"topic":"integration-events","partition":0},{"topic":"manual-assignment","partition":1}]}"#,
+    )
+    .expect("leader-election fixture");
 
     // topics
     success(
@@ -122,6 +128,29 @@ fn all_command_families_work_against_kafka_4_3_1() {
             ]
         )
         .contains("\"partition\": 1")
+    );
+    let election_preview = success(
+        &bootstrap,
+        &[
+            "leader-election",
+            "--election-type",
+            "preferred",
+            "--path-to-json-file",
+            election_file.to_str().expect("fixture path"),
+        ],
+    );
+    assert!(election_preview.contains("integration-events"));
+    assert!(election_preview.contains("manual-assignment"));
+    success(
+        &bootstrap,
+        &[
+            "leader-election",
+            "--election-type",
+            "preferred",
+            "--path-to-json-file",
+            election_file.to_str().expect("fixture path"),
+            "--execute",
+        ],
     );
     let described_topic: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
