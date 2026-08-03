@@ -1303,6 +1303,21 @@ fn all_command_families_work_against_kafka_4_3_1() {
         &["client-metrics", "list"],
         "integration-client-metrics-command",
     );
+    assert!(success(&bootstrap, &["features", "describe"]).contains("metadata.version"));
+    assert!(
+        success(&bootstrap, &["features", "describe", "--node-id", "1"],)
+            .contains("metadata.version")
+    );
+    success(
+        &bootstrap,
+        &[
+            "features",
+            "upgrade",
+            "--feature",
+            "metadata.version=30",
+            "--dry-run",
+        ],
+    );
     eventually_contains(
         &bootstrap,
         &[

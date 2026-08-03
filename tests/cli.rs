@@ -10,7 +10,8 @@ fn help_should_list_the_management_suite() {
         .success()
         .stdout(predicate::str::contains("leader-election"))
         .stdout(predicate::str::contains("delete-records"))
-        .stdout(predicate::str::contains("client-metrics"));
+        .stdout(predicate::str::contains("client-metrics"))
+        .stdout(predicate::str::contains("features"));
 }
 
 #[test]
@@ -137,4 +138,21 @@ fn kafka_client_metrics_alias_should_accept_original_action_flags() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Usage:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn kafka_features_alias_should_accept_original_subcommands() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-features.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-features alias");
+
+    Command::new(alias)
+        .args(["version-mapping", "--release-version", "4.3-IV0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("metadata.version"))
+        .stdout(predicate::str::contains("30"));
 }

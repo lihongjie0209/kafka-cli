@@ -14,12 +14,12 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
 use krafka::protocol::{
-    AlterConfigOp, AlterableConfig, ApiKey, ConfigResourceType as ProtocolConfigResourceType,
-    Decode, DescribableLogDirTopic, DescribeClusterRequest, DescribeClusterResponse,
-    DescribeConfigsRequest, DescribeConfigsResource, IncrementalAlterConfigsRequest,
-    IncrementalAlterConfigsResource, KafkaString, ListPartitionReassignmentsTopic,
-    ReassignablePartition, ReassignableTopic, TaggedFields, TryEncode, VersionedDecode,
-    VersionedEncode, versions,
+    AlterConfigOp, AlterableConfig, ApiKey, ApiVersionsRequest,
+    ConfigResourceType as ProtocolConfigResourceType, Decode, DescribableLogDirTopic,
+    DescribeClusterRequest, DescribeClusterResponse, DescribeConfigsRequest,
+    DescribeConfigsResource, IncrementalAlterConfigsRequest, IncrementalAlterConfigsResource,
+    KafkaString, ListPartitionReassignmentsTopic, ReassignablePartition, ReassignableTopic,
+    TaggedFields, TryEncode, VersionedDecode, VersionedEncode, versions,
 };
 use rdkafka::{
     Message, Offset,
@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::{
         AclAction, Cli, ClientMetricsAction, ClusterAction, Command, ConfigAction,
-        ConfigEntityArgs, ConfigEntityType, DescribeTopicArgs, ElectionType, GroupAction,
-        ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs, TopicAction,
+        ConfigEntityArgs, ConfigEntityType, DescribeTopicArgs, ElectionType, FeatureAction,
+        GroupAction, ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs, TopicAction,
     },
     config,
     error::{Error, Result},
@@ -86,6 +86,22 @@ pub async fn execute(cli: Cli) -> Result<()> {
         && let GroupAction::ValidateRegex { regex } = &args.action
     {
         return validate_group_regex(cli.output, regex);
+    }
+    if let Command::Features(args) = &cli.command
+        && matches!(
+            args.action,
+            FeatureAction::VersionMapping { .. } | FeatureAction::FeatureDependencies { .. }
+        )
+    {
+        return features_local(cli.output, &args.action);
+    }
+    if let Command::Features(args) = &cli.command
+        && args.bootstrap_controller.is_some()
+    {
+        return Err(Error::Unsupported(
+            "--bootstrap-controller requires controller-listener bootstrap, which the current native client does not expose"
+                .into(),
+        ));
     }
     let bootstrap = cli.bootstrap_server.as_deref().ok_or_else(|| {
         Error::Usage("--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into())
@@ -172,6 +188,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 timeout,
                 format,
                 args.action,
+            )
+            .await
+        }
+        Command::Features(args) => {
+            features(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                &args.action,
             )
             .await
         }
@@ -3178,6 +3204,644 @@ fn shifted_offset(
                 "cannot shift partition {partition}: no committed offset"
             ))
         })
+}
+
+#[derive(Clone, Copy)]
+struct MetadataVersionSpec {
+    level: i16,
+    release: &'static str,
+    version: &'static str,
+    production: bool,
+}
+
+const METADATA_VERSIONS: &[MetadataVersionSpec] = &[
+    MetadataVersionSpec {
+        level: 7,
+        release: "3.3",
+        version: "3.3-IV3",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 8,
+        release: "3.4",
+        version: "3.4-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 9,
+        release: "3.5",
+        version: "3.5-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 10,
+        release: "3.5",
+        version: "3.5-IV1",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 11,
+        release: "3.5",
+        version: "3.5-IV2",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 12,
+        release: "3.6",
+        version: "3.6-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 13,
+        release: "3.6",
+        version: "3.6-IV1",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 14,
+        release: "3.6",
+        version: "3.6-IV2",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 15,
+        release: "3.7",
+        version: "3.7-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 16,
+        release: "3.7",
+        version: "3.7-IV1",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 17,
+        release: "3.7",
+        version: "3.7-IV2",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 18,
+        release: "3.7",
+        version: "3.7-IV3",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 19,
+        release: "3.7",
+        version: "3.7-IV4",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 20,
+        release: "3.8",
+        version: "3.8-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 21,
+        release: "3.9",
+        version: "3.9-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 22,
+        release: "4.0",
+        version: "4.0-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 23,
+        release: "4.0",
+        version: "4.0-IV1",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 24,
+        release: "4.0",
+        version: "4.0-IV2",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 25,
+        release: "4.0",
+        version: "4.0-IV3",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 26,
+        release: "4.1",
+        version: "4.1-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 27,
+        release: "4.1",
+        version: "4.1-IV1",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 28,
+        release: "4.2",
+        version: "4.2-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 29,
+        release: "4.2",
+        version: "4.2-IV1",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 30,
+        release: "4.3",
+        version: "4.3-IV0",
+        production: true,
+    },
+    MetadataVersionSpec {
+        level: 31,
+        release: "4.4",
+        version: "4.4-IV0",
+        production: false,
+    },
+    MetadataVersionSpec {
+        level: 32,
+        release: "4.4",
+        version: "4.4-IV1",
+        production: false,
+    },
+];
+
+const PRODUCTION_FEATURES: &[&str] = &[
+    "kraft.version",
+    "transaction.version",
+    "group.version",
+    "eligible.leader.replicas.version",
+    "share.version",
+    "streams.version",
+];
+
+fn metadata_version(value: &str) -> Result<MetadataVersionSpec> {
+    if let Some(version) = METADATA_VERSIONS
+        .iter()
+        .find(|version| version.version == value)
+    {
+        return Ok(*version);
+    }
+    let release = value.split('.').take(2).collect::<Vec<_>>().join(".");
+    METADATA_VERSIONS
+        .iter()
+        .rev()
+        .find(|version| version.production && version.release == release)
+        .copied()
+        .ok_or_else(|| Error::Usage(format!("unknown metadata.version '{value}'")))
+}
+
+fn metadata_version_level(level: i16) -> Result<MetadataVersionSpec> {
+    METADATA_VERSIONS
+        .iter()
+        .find(|version| version.level == level)
+        .copied()
+        .ok_or_else(|| Error::Usage(format!("unknown metadata.version {level}")))
+}
+
+fn feature_default_level(feature: &str, metadata_level: i16) -> i16 {
+    match feature {
+        "kraft.version" => i16::from(metadata_level >= 21),
+        "transaction.version" => {
+            if metadata_level >= 24 {
+                2
+            } else {
+                0
+            }
+        }
+        "group.version" => i16::from(metadata_level >= 22),
+        "eligible.leader.replicas.version" => i16::from(metadata_level >= 26),
+        "share.version" => {
+            if metadata_level >= 31 {
+                2
+            } else {
+                i16::from(metadata_level >= 28)
+            }
+        }
+        "streams.version" => i16::from(metadata_level >= 29),
+        _ => 0,
+    }
+}
+
+fn validate_known_feature_level(feature: &str, level: i16) -> Result<()> {
+    let maximum = match feature {
+        "kraft.version"
+        | "group.version"
+        | "eligible.leader.replicas.version"
+        | "streams.version" => 1,
+        "transaction.version" | "share.version" => 2,
+        _ => return Err(Error::Usage(format!("unknown feature: {feature}"))),
+    };
+    if (0..=maximum).contains(&level) {
+        Ok(())
+    } else {
+        Err(Error::Usage(format!(
+            "no feature {feature} with feature level {level}"
+        )))
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureMappingRow {
+    feature: String,
+    level: i16,
+    release_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureDependencyRow {
+    feature: String,
+    level: i16,
+    dependency: Option<String>,
+    dependency_level: Option<i16>,
+    dependency_release: Option<String>,
+}
+
+fn features_local(format: OutputFormat, action: &FeatureAction) -> Result<()> {
+    match action {
+        FeatureAction::VersionMapping { release_version } => {
+            let metadata = metadata_version(release_version.as_deref().unwrap_or("4.3-IV0"))?;
+            let mut rows = vec![FeatureMappingRow {
+                feature: "metadata.version".into(),
+                level: metadata.level,
+                release_version: Some(metadata.version.into()),
+            }];
+            rows.extend(PRODUCTION_FEATURES.iter().map(|feature| FeatureMappingRow {
+                feature: (*feature).into(),
+                level: feature_default_level(feature, metadata.level),
+                release_version: None,
+            }));
+            output::write_value(format, "features.version-mapping", &rows, |rows| {
+                output::table(
+                    ["FEATURE", "LEVEL", "RELEASE_VERSION"],
+                    rows.iter().map(|row| {
+                        [
+                            row.feature.clone(),
+                            row.level.to_string(),
+                            row.release_version.as_deref().unwrap_or("-").to_owned(),
+                        ]
+                    }),
+                )
+            })
+        }
+        FeatureAction::FeatureDependencies { feature } => {
+            let parsed = parse_feature_levels(feature)?;
+            let mut rows = Vec::new();
+            for (name, level) in parsed {
+                if name == "metadata.version" {
+                    let metadata = metadata_version_level(level)?;
+                    rows.push(FeatureDependencyRow {
+                        feature: name,
+                        level,
+                        dependency: None,
+                        dependency_level: None,
+                        dependency_release: Some(metadata.version.into()),
+                    });
+                    continue;
+                }
+                validate_known_feature_level(&name, level)?;
+                let dependency_level =
+                    (name == "eligible.leader.replicas.version" && level == 1).then_some(23);
+                rows.push(FeatureDependencyRow {
+                    feature: name,
+                    level,
+                    dependency: dependency_level.map(|_| "metadata.version".into()),
+                    dependency_level,
+                    dependency_release: dependency_level
+                        .map(metadata_version_level)
+                        .transpose()?
+                        .map(|version| version.version.into()),
+                });
+            }
+            output::write_value(format, "features.feature-dependencies", &rows, |rows| {
+                output::table(
+                    [
+                        "FEATURE",
+                        "LEVEL",
+                        "DEPENDENCY",
+                        "DEPENDENCY_LEVEL",
+                        "RELEASE_VERSION",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.feature.clone(),
+                            row.level.to_string(),
+                            row.dependency.as_deref().unwrap_or("-").to_owned(),
+                            row.dependency_level
+                                .map_or_else(|| "-".into(), |level| level.to_string()),
+                            row.dependency_release.as_deref().unwrap_or("-").to_owned(),
+                        ]
+                    }),
+                )
+            })
+        }
+        _ => Err(Error::Usage(
+            "this features action requires a broker".into(),
+        )),
+    }
+}
+
+fn parse_feature_levels(values: &[String]) -> Result<BTreeMap<String, i16>> {
+    let mut parsed = BTreeMap::new();
+    for value in values {
+        let (name, level) = value.split_once('=').ok_or_else(|| {
+            Error::Usage(format!(
+                "can't parse feature=level string {value}: equals sign not found"
+            ))
+        })?;
+        let name = name.trim();
+        let level = level.trim().parse::<i16>().map_err(|_| {
+            Error::Usage(format!(
+                "can't parse feature=level string {value}: invalid short level"
+            ))
+        })?;
+        if name.is_empty() {
+            return Err(Error::Usage(format!(
+                "feature name cannot be empty in {value}"
+            )));
+        }
+        if parsed.insert(name.to_owned(), level).is_some() {
+            return Err(Error::Usage(format!(
+                "feature {name} was specified more than once"
+            )));
+        }
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug, Serialize)]
+struct FeatureDescriptionRow {
+    feature: String,
+    supported_min_version: i16,
+    supported_max_version: i16,
+    finalized_version_level: i16,
+    epoch: Option<i64>,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "branches mirror Kafka FeatureCommand's describe and mutation result contracts"
+)]
+async fn features(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: &FeatureAction,
+) -> Result<()> {
+    match action {
+        FeatureAction::Describe { node_id } => {
+            if node_id.is_some_and(|node_id| node_id < 0) {
+                return Err(Error::Usage("node ID must be non-negative".into()));
+            }
+            let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+            let (supported, finalized, epoch) = if let Some(node_id) = node_id {
+                let cluster = client.describe_cluster().await?;
+                let endpoint = cluster
+                    .brokers
+                    .iter()
+                    .find(|broker| broker.broker_id == *node_id)
+                    .ok_or_else(|| Error::Usage(format!("node {node_id} was not described")))?;
+                let address = format!("{}:{}", endpoint.host, endpoint.port);
+                let connection = client
+                    .pool()
+                    .get_connection_by_id(*node_id, &address)
+                    .await?;
+                let request = ApiVersionsRequest::new()
+                    .with_client_software("kafka-cli", env!("CARGO_PKG_VERSION"));
+                let version = connection
+                    .negotiate_api_version(ApiKey::ApiVersions, versions::API_VERSIONS_MAX, 3)
+                    .await
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "feature discovery requires broker ApiVersions v3+".into(),
+                        )
+                    })?;
+                let mut bytes = connection
+                    .send_request(ApiKey::ApiVersions, version, |buffer| {
+                        request.encode_v3(buffer)
+                    })
+                    .await?;
+                let response = krafka::protocol::ApiVersionsResponse::decode_v3(&mut bytes)?;
+                drop(connection);
+                (
+                    response.supported_features,
+                    response.finalized_features,
+                    response.finalized_features_epoch,
+                )
+            } else {
+                let result = client.describe_features().await?;
+                (
+                    result.supported_features,
+                    result.finalized_features,
+                    result.finalized_features_epoch,
+                )
+            };
+            drop(client);
+            let finalized = finalized
+                .into_iter()
+                .map(|feature| (feature.name, feature.max_version_level))
+                .collect::<BTreeMap<_, _>>();
+            let mut rows = supported
+                .into_iter()
+                .map(|feature| FeatureDescriptionRow {
+                    finalized_version_level: finalized.get(&feature.name).copied().unwrap_or(0),
+                    feature: feature.name,
+                    supported_min_version: feature.min_version,
+                    supported_max_version: feature.max_version,
+                    epoch: (epoch >= 0).then_some(epoch),
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| left.feature.cmp(&right.feature));
+            output::write_value(format, "features.describe", &rows, |rows| {
+                output::table(
+                    [
+                        "FEATURE",
+                        "SUPPORTED_MIN_VERSION",
+                        "SUPPORTED_MAX_VERSION",
+                        "FINALIZED_VERSION_LEVEL",
+                        "EPOCH",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.feature.clone(),
+                            feature_level_display(&row.feature, row.supported_min_version),
+                            feature_level_display(&row.feature, row.supported_max_version),
+                            feature_level_display(&row.feature, row.finalized_version_level),
+                            row.epoch
+                                .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
+                        ]
+                    }),
+                )
+            })
+        }
+        FeatureAction::Upgrade { .. }
+        | FeatureAction::Downgrade { .. }
+        | FeatureAction::Disable { .. } => {
+            let (operation, updates, dry_run) = feature_updates(action)?;
+            let requested = updates
+                .iter()
+                .map(|update| (update.feature.clone(), update.max_version_level))
+                .collect::<BTreeMap<_, _>>();
+            let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+            let result = client.update_features(updates, dry_run).await?;
+            drop(client);
+            let rows = result
+                .results
+                .into_iter()
+                .map(|result| MutationRow {
+                    resource: result.feature.clone(),
+                    status: if result.error.is_some() {
+                        "FAILED".into()
+                    } else if dry_run {
+                        format!(
+                            "CAN {} TO {}",
+                            operation.to_ascii_uppercase(),
+                            requested.get(&result.feature).copied().unwrap_or_default()
+                        )
+                    } else if operation == "disable" {
+                        "DISABLED".into()
+                    } else {
+                        format!(
+                            "{}D TO {}",
+                            operation.to_ascii_uppercase(),
+                            requested.get(&result.feature).copied().unwrap_or_default()
+                        )
+                    },
+                    error: result.error,
+                })
+                .collect::<Vec<_>>();
+            let failures = rows.iter().filter(|row| row.error.is_some()).count();
+            write_mutation_rows(format, &format!("features.{operation}"), &rows)?;
+            if failures == 0 {
+                Ok(())
+            } else {
+                Err(Error::Partial {
+                    failed: failures,
+                    total: rows.len(),
+                })
+            }
+        }
+        FeatureAction::VersionMapping { .. } | FeatureAction::FeatureDependencies { .. } => {
+            features_local(format, action)
+        }
+    }
+}
+
+fn feature_level_display(feature: &str, level: i16) -> String {
+    if feature == "metadata.version" {
+        metadata_version_level(level).map_or_else(
+            |_| format!("UNKNOWN {level}"),
+            |version| version.version.to_owned(),
+        )
+    } else {
+        level.to_string()
+    }
+}
+
+fn feature_updates(
+    action: &FeatureAction,
+) -> Result<(&'static str, Vec<krafka::protocol::FeatureUpdateKey>, bool)> {
+    let (operation, metadata, release_version, feature, unsafe_downgrade, dry_run) = match action {
+        FeatureAction::Upgrade {
+            metadata,
+            release_version,
+            feature,
+            dry_run,
+        } => (
+            "upgrade",
+            metadata,
+            release_version,
+            feature,
+            false,
+            *dry_run,
+        ),
+        FeatureAction::Downgrade {
+            metadata,
+            release_version,
+            feature,
+            r#unsafe,
+            dry_run,
+        } => (
+            "downgrade",
+            metadata,
+            release_version,
+            feature,
+            *r#unsafe,
+            *dry_run,
+        ),
+        FeatureAction::Disable {
+            feature,
+            r#unsafe,
+            dry_run,
+        } => {
+            let mut seen = BTreeSet::new();
+            let updates = feature
+                .iter()
+                .map(|name| {
+                    if !seen.insert(name) {
+                        return Err(Error::Usage(format!(
+                            "feature {name} was specified more than once"
+                        )));
+                    }
+                    Ok(if *r#unsafe {
+                        krafka::protocol::FeatureUpdateKey::unsafe_downgrade(name, 0)
+                    } else {
+                        krafka::protocol::FeatureUpdateKey::delete(name)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(("disable", updates, *dry_run));
+        }
+        _ => return Err(Error::Usage("invalid feature update action".into())),
+    };
+    let mut levels = if let Some(release_version) = release_version {
+        let metadata = metadata_version(release_version)?;
+        let mut levels = BTreeMap::from([("metadata.version".to_owned(), metadata.level)]);
+        levels.extend(PRODUCTION_FEATURES.iter().filter_map(|feature| {
+            let level = feature_default_level(feature, metadata.level);
+            (operation != "upgrade" || level > 0).then(|| ((*feature).to_owned(), level))
+        }));
+        levels
+    } else {
+        parse_feature_levels(feature)?
+    };
+    if let Some(metadata) = metadata {
+        let version = metadata_version(metadata)?;
+        if levels
+            .insert("metadata.version".into(), version.level)
+            .is_some()
+        {
+            return Err(Error::Usage(
+                "feature metadata.version was specified more than once".into(),
+            ));
+        }
+    }
+    if levels.is_empty() {
+        return Err(Error::Usage(format!(
+            "you must specify at least one feature to {operation}"
+        )));
+    }
+    let updates = levels
+        .into_iter()
+        .map(|(name, level)| {
+            if operation == "upgrade" {
+                krafka::protocol::FeatureUpdateKey::upgrade(name, level)
+            } else if unsafe_downgrade {
+                krafka::protocol::FeatureUpdateKey::unsafe_downgrade(name, level)
+            } else {
+                krafka::protocol::FeatureUpdateKey::safe_downgrade(name, level)
+            }
+        })
+        .collect();
+    Ok((operation, updates, dry_run))
 }
 
 #[derive(Debug, Serialize)]
@@ -7445,6 +8109,35 @@ mod tests {
                 .expect("Kafka UUID encoding")
                 .len(),
             16
+        );
+    }
+
+    #[test]
+    fn metadata_version_should_match_kafka_release_aliases() {
+        assert_eq!(metadata_version("3.7").expect("3.7 alias").level, 19);
+        assert_eq!(metadata_version("3.7.2").expect("3.7 patch").level, 19);
+        assert_eq!(
+            metadata_version("4.4-IV1").expect("unstable exact").level,
+            32
+        );
+        assert!(metadata_version("4.4").is_err());
+    }
+
+    #[test]
+    fn feature_defaults_should_match_kafka_4_4_mapping() {
+        assert_eq!(feature_default_level("transaction.version", 24), 2);
+        assert_eq!(feature_default_level("share.version", 30), 1);
+        assert_eq!(feature_default_level("share.version", 31), 2);
+        assert_eq!(feature_default_level("streams.version", 29), 1);
+    }
+
+    #[test]
+    fn feature_levels_should_trim_and_reject_duplicates() {
+        let parsed = parse_feature_levels(&[" metadata.version = 30 ".into()])
+            .expect("trimmed feature level");
+        assert_eq!(parsed.get("metadata.version"), Some(&30));
+        assert!(
+            parse_feature_levels(&["group.version=0".into(), "group.version=1".into()]).is_err()
         );
     }
 

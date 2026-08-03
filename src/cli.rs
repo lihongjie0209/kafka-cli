@@ -86,6 +86,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-broker-api-versions" => Some("api-versions"),
         "kafka-cluster" => Some("cluster"),
         "kafka-client-metrics" => Some("client-metrics"),
+        "kafka-features" => Some("features"),
         _ => None,
     }
 }
@@ -290,6 +291,69 @@ pub enum Command {
     Cluster(ClusterArgs),
     /// Inspect and manage client metrics subscriptions.
     ClientMetrics(ClientMetricsArgs),
+    /// Inspect and manage Kafka feature levels.
+    Features(FeaturesArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FeaturesArgs {
+    /// Connect directly to a `KRaft` controller listener.
+    #[arg(long, conflicts_with = "bootstrap_server")]
+    pub bootstrap_controller: Option<String>,
+    #[command(subcommand)]
+    pub action: FeatureAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FeatureAction {
+    /// Describe supported and finalized feature levels.
+    Describe {
+        #[arg(long)]
+        node_id: Option<i32>,
+    },
+    /// Upgrade one or more feature levels.
+    Upgrade {
+        #[arg(long, conflicts_with = "release_version")]
+        metadata: Option<String>,
+        #[arg(long, conflicts_with_all = ["metadata", "feature"])]
+        release_version: Option<String>,
+        #[arg(long)]
+        feature: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Downgrade one or more feature levels.
+    Downgrade {
+        #[arg(long, conflicts_with = "release_version")]
+        metadata: Option<String>,
+        #[arg(long, conflicts_with_all = ["metadata", "feature"])]
+        release_version: Option<String>,
+        #[arg(long)]
+        feature: Vec<String>,
+        #[arg(long)]
+        r#unsafe: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Disable features by setting their levels to zero.
+    Disable {
+        #[arg(long, required = true)]
+        feature: Vec<String>,
+        #[arg(long)]
+        r#unsafe: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show feature defaults for a Kafka release version.
+    VersionMapping {
+        #[arg(long)]
+        release_version: Option<String>,
+    },
+    /// Show dependencies for feature levels.
+    FeatureDependencies {
+        #[arg(long, required = true)]
+        feature: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1102,6 +1166,7 @@ mod tests {
             compatibility_command("kafka-client-metrics.sh"),
             Some("client-metrics")
         );
+        assert_eq!(compatibility_command("kafka-features.sh"), Some("features"));
     }
 
     #[test]
@@ -1638,6 +1703,7 @@ mod tests {
     parses_command_family!(api_versions_family_parses, "api-versions");
     parses_command_family!(cluster_family_parses, "cluster", "cluster-id");
     parses_command_family!(client_metrics_family_parses, "client-metrics", "list");
+    parses_command_family!(features_family_parses, "features", "describe");
 
     #[test]
     fn client_metrics_should_collect_repeated_match_and_metrics_values() {
