@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `25a4cd2`。
+- 本项目审计实现基准：`master`，实现提交 `25a4cd2`，报告提交 `3de048f`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 18 个兼容名称，入口覆盖率为 18/44（40.9%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 按本报告的功能口径，18 个兼容入口中 8 个达到核心功能“已支持”，10 个为“部分支持”；另有 26 个原版入口未支持。因此不能把 40.9% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
@@ -289,7 +289,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
 - Rust 单元测试与普通 CLI 测试：201 个通过（189 个 library unit tests + 12 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试：Delegation Tokens PLAINTEXT 安全拒绝已加入当前 CI；此前基准覆盖全部 17 个命令族及 Metadata Quorum v2。
+- Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 18 个命令族，包括 Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -313,7 +313,7 @@ CI workflow 包含：
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
 Metadata Quorum 实现 `1c482f0` 及报告提交 `0262300` 已由 GitHub Actions
-[`30854327394`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30854327394) 完整验证通过：fmt/Clippy/194 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 DescribeQuorum v2 status/replication 和 remove dry-run。两种 musl artifact 均执行 smoke test，ARM64 通过 QEMU user-mode emulator 启动；musl 没有在本地构建。Delegation Tokens `25a4cd2` 的 201 个普通测试和 PLAINTEXT 安全边界将在当前推送 CI 验证。
+[`30854327394`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30854327394) 完整验证通过：fmt/Clippy/194 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 DescribeQuorum v2 status/replication 和 remove dry-run。Delegation Tokens 实现 `25a4cd2` 及报告提交 `3de048f` 又由 GitHub Actions [`30854931372`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30854931372) 完整验证通过：fmt/Clippy/201 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿，Kafka 4.3.1 实际验证 PLAINTEXT 安全拒绝边界。两轮的两种 musl artifact 均执行 smoke test，ARM64 通过 QEMU user-mode emulator 启动；musl 没有在本地构建。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -447,8 +447,8 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | 2026-08-04 | Client Metrics 独立入口 | 新增 `kafka client-metrics` 和 `kafka-client-metrics.sh`；完整实现 list/describe/alter/delete、Kafka UUID generate-name、interval/match/metrics 与空值删除语义，复用 API 74/32/44 后端 | 159 个单元测试、8 个 CLI 测试；Kafka 4.3.1 设置→list→describe→delete 闭环；CI `30851053389` 六项全绿 |
 | 2026-08-04 | Kafka Features 入口 | 新增 `kafka features` 和 `kafka-features.sh`；实现六个原版动作、指定 node describe、UpdateFeatures v0/v1 dry-run/更新，以及按 Kafka 4.4 源码对齐的 metadata/production feature 离线映射 | 163 个单元测试、9 个 CLI 测试；Kafka 4.3.1 任意/指定 node describe 与 metadata upgrade dry-run；CI `30851984283` 六项全绿 |
 | 2026-08-04 | Kafka Transactions 入口 | 新增 `kafka transactions` 和 `kafka-transactions.sh`；实现 list、describe、describe-producers、abort、find-hanging、forceTerminateTransaction，保留 coordinator、指定 broker、两类 abort spec 和 producer fencing 语义 | 176 个单元测试、10 个 CLI 测试；Kafka 4.3.1 list/指定 broker producer state/find-hanging；CI `30853525172` 六项全绿 |
-| 2026-08-04 | Kafka Metadata Quorum 入口 | 新增 `kafka metadata-quorum` 和 `kafka-metadata-quorum.sh`；实现 status/replication、add/remove controller，补足 DescribeQuorum v2 codec 和 Add/RemoveRaftVoter API 80/81 | 183 个单元测试、11 个 CLI 测试；Kafka 4.3.1 status/replication/remove dry-run 已加入当前 CI |
-| 2026-08-04 | Kafka Delegation Tokens 入口 | 新增 `kafka delegation-tokens` 和 `kafka-delegation-tokens.sh`；实现 create/renew/expire/describe、v3 owner/requester、renewer、标准 Base64 HMAC 和 `-1` period sentinel | 189 个单元测试、12 个 CLI 测试；Kafka 4.3.1 PLAINTEXT 安全拒绝已加入当前 CI |
+| 2026-08-04 | Kafka Metadata Quorum 入口 | 新增 `kafka metadata-quorum` 和 `kafka-metadata-quorum.sh`；实现 status/replication、add/remove controller，补足 DescribeQuorum v2 codec 和 Add/RemoveRaftVoter API 80/81 | 183 个单元测试、11 个 CLI 测试；CI `30854327394` 六个 job 全绿，Kafka 4.3.1 验证 status/replication/remove dry-run |
+| 2026-08-04 | Kafka Delegation Tokens 入口 | 新增 `kafka delegation-tokens` 和 `kafka-delegation-tokens.sh`；实现 create/renew/expire/describe、v3 owner/requester、renewer、标准 Base64 HMAC 和 `-1` period sentinel | 189 个单元测试、12 个 CLI 测试；CI `30854931372` 六个 job 全绿，Kafka 4.3.1 验证 PLAINTEXT 安全拒绝边界 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
