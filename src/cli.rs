@@ -11,11 +11,11 @@ use crate::output::OutputFormat;
 #[command(name = "kafka", version, about, propagate_version = true)]
 pub struct Cli {
     /// Comma-separated Kafka bootstrap brokers.
-    #[arg(long, global = true, env = "KAFKA_CLI_BOOTSTRAP_SERVER")]
+    #[arg(short = 'b', long, global = true, env = "KAFKA_CLI_BOOTSTRAP_SERVER")]
     pub bootstrap_server: Option<String>,
 
     /// Kafka Java-compatible client properties file.
-    #[arg(long, global = true, env = "KAFKA_CLI_COMMAND_CONFIG")]
+    #[arg(short = 'c', long, global = true, env = "KAFKA_CLI_COMMAND_CONFIG")]
     pub command_config: Option<PathBuf>,
 
     /// Request timeout in milliseconds.
@@ -700,6 +700,7 @@ pub struct ClusterArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ClusterAction {
+    #[command(name = "cluster-id", visible_alias = "id")]
     Id,
     ListEndpoints {
         /// Include fenced brokers in the endpoint listing (Kafka 4.1+).
@@ -708,7 +709,7 @@ pub enum ClusterAction {
     },
     ApiVersions,
     Unregister {
-        #[arg(long)]
+        #[arg(short = 'i', long)]
         id: i32,
         #[arg(long)]
         execute: bool,
@@ -858,7 +859,23 @@ mod tests {
     );
     parses_command_family!(log_dirs_family_parses, "log-dirs");
     parses_command_family!(api_versions_family_parses, "api-versions");
-    parses_command_family!(cluster_family_parses, "cluster", "id");
+    parses_command_family!(cluster_family_parses, "cluster", "cluster-id");
+
+    #[test]
+    fn cluster_short_options_parse() {
+        let result = Cli::try_parse_from([
+            "kafka",
+            "-b",
+            "localhost:9092",
+            "-c",
+            "client.properties",
+            "cluster",
+            "unregister",
+            "-i",
+            "1",
+        ]);
+        assert!(result.is_ok(), "parse failed: {result:?}");
+    }
 
     parses_command_family!(
         cluster_fenced_endpoints_parses,

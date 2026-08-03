@@ -61,3 +61,19 @@ fn reassignment_preview_should_accept_safety_flags_without_connecting() {
         .success()
         .stdout(predicate::str::contains("PREVIEW EXECUTE"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_cluster_alias_should_accept_original_cluster_id_command() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-cluster.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-cluster alias");
+
+    Command::new(alias)
+        .args(["cluster-id", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage:"));
+}
