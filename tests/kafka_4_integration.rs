@@ -31,6 +31,20 @@ fn success(bootstrap: &str, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("UTF-8 stdout")
 }
 
+fn eventually_contains(bootstrap: &str, arguments: &[&str], expected: &str) -> String {
+    let mut last_output = String::new();
+    for _ in 0..20 {
+        last_output = success(bootstrap, arguments);
+        if last_output.contains(expected) {
+            return last_output;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "kafka {arguments:?} did not contain {expected:?} after bounded retries\nlast stdout: {last_output}"
+    );
+}
+
 #[test]
 #[ignore = "requires Docker and downloads apache/kafka:4.3.1"]
 #[expect(
@@ -163,32 +177,6 @@ fn all_command_families_work_against_kafka_4_3_1() {
             election_file.to_str().expect("fixture path"),
             "--execute",
         ],
-    );
-    success(
-        &bootstrap,
-        &[
-            "configs",
-            "alter",
-            "--entity-type",
-            "brokers",
-            "--entity-default",
-            "--add-config",
-            "message.max.bytes=1048588",
-            "--execute",
-        ],
-    );
-    assert!(
-        success(
-            &bootstrap,
-            &[
-                "configs",
-                "describe",
-                "--entity-type",
-                "brokers",
-                "--entity-default",
-            ],
-        )
-        .contains("message.max.bytes")
     );
     let described_topic: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
@@ -539,19 +527,6 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    success(
-        &bootstrap,
-        &[
-            "configs",
-            "alter",
-            "--entity-type",
-            "brokers",
-            "--entity-default",
-            "--delete-config",
-            "message.max.bytes",
-            "--execute",
-        ],
-    );
     let described_offsets = success(
         &bootstrap,
         &["groups", "describe", "--group", "integration-suite"],
@@ -804,6 +779,43 @@ fn all_command_families_work_against_kafka_4_3_1() {
         &bootstrap,
         &[
             "configs",
+            "alter",
+            "--entity-type",
+            "brokers",
+            "--entity-default",
+            "--add-config",
+            "message.max.bytes=1048588",
+            "--execute",
+        ],
+    );
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "brokers",
+            "--entity-default",
+        ],
+        "message.max.bytes",
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "brokers",
+            "--entity-default",
+            "--delete-config",
+            "message.max.bytes",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
             "describe",
             "--entity-type",
             "topic",
@@ -861,19 +873,17 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    assert!(
-        success(
-            &bootstrap,
-            &[
-                "configs",
-                "describe",
-                "--entity-type",
-                "clients",
-                "--entity-name",
-                "integration-client",
-            ],
-        )
-        .contains("producer_byte_rate")
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "clients",
+            "--entity-name",
+            "integration-client",
+        ],
+        "producer_byte_rate",
     );
     success(
         &bootstrap,
