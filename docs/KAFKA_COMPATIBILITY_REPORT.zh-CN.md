@@ -205,7 +205,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：53 个通过。
+- Rust 单元测试与普通 CLI 测试：62 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -283,3 +283,33 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Consumer Group verbose | offset verbose 输出 librdkafka committed leader epoch；members verbose 输出 current/target assignment，普通视图只显示 partition 数量；明确 group/member epoch 未由 librdkafka 2.12 暴露 | Clippy、61 个普通测试、bundled Kafka 4.3.1 verbose offsets/members 集成测试通过 |
 | 2026-08-03 | Consumer Group reset partition selector | reset-offsets 新增原版 `topic:partition,partition` 选择语法，校验负数、重复和不存在 partition；规划及执行继续使用 librdkafka metadata/ListOffsets/AlterConsumerGroupOffsets | Clippy、62 个普通测试、bundled Kafka 4.3.1 单 partition JSON 规划集成测试通过 |
 | 2026-08-03 | Consumer Group delete-offsets 批量 topic | delete-offsets 支持重复 topic 与 `topic:partition,partition`，校验不存在 partition；librdkafka DeleteConsumerGroupOffsets FFI 扩展为跨 topic partition list，预览改用统一表格/JSON/YAML | Clippy、62 个普通测试、bundled Kafka 4.3.1 跨 topic 删除集成测试通过 |
+
+## 12. librdkafka 2.12 能力闭环审计
+
+对 `rd_kafka_admin_op_t` 的 22 个实际 operation（排除 `ANY` 和计数 sentinel）逐项核对如下。表中的“已覆盖”表示项目存在真实调用路径，而不是只存在绑定或占位命令。
+
+| librdkafka Admin operation | 项目功能 | 状态 |
+|---|---|---|
+| CreateTopics / DeleteTopics / CreatePartitions | topics create/delete/alter | 已覆盖 |
+| DescribeConfigs | configs describe | 已覆盖 |
+| IncrementalAlterConfigs | configs alter | 已覆盖 |
+| AlterConfigs | 被 IncrementalAlterConfigs 完整替代，避免全量覆盖配置 | 有意不单独调用 |
+| DeleteRecords | delete-records | 已覆盖 |
+| DeleteGroups | groups delete | 已覆盖 |
+| DeleteConsumerGroupOffsets | groups delete-offsets | 已覆盖，含跨 topic partition list |
+| CreateAcls / DescribeAcls / DeleteAcls | acls add/list/remove | 已覆盖 |
+| ListConsumerGroups / DescribeConsumerGroups | groups list/describe | 已覆盖 |
+| ListConsumerGroupOffsets / AlterConsumerGroupOffsets | groups describe/reset-offsets | 已覆盖 |
+| DescribeUserScramCredentials / AlterUserScramCredentials | configs users describe/alter | 已覆盖 |
+| DescribeTopics | topics describe/topic-id | 已覆盖 |
+| DescribeCluster | cluster id/list-endpoints | 已覆盖 |
+| ListOffsets | offsets 与 group reset 规划 | 已覆盖 |
+| ElectLeaders | leader-election | 已覆盖，含 JSON 批量目标 |
+
+非 Admin 客户端能力也已接入 console producer/consumer：异步与同步 delivery、主要 producer tuning 配置、正则订阅、空闲 timeout、isolation level、手工 partition/offset、headers 和结构化消息。其他 librdkafka 配置可通过 `--command-property` 传入。
+
+以下 Kafka 原版能力在 librdkafka 2.12 中没有对应 C API，因此不属于本轮可实现集合：partition reassignment、describe/alter log dirs、API version 明细、unregister broker、client quota、broker logger/client metrics config resource、metadata quorum、feature update、transaction listing/abort、delegation token、share/streams group Admin API。项目现有少数同名功能仍由 `krafka` 实现，报告不会把它们误记为 librdkafka 路径。
+
+此外，已通过实际 Kafka 4.3.1 测试确认 broker default config 无法用 librdkafka 表达：Kafka 要求空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在空 name 时返回 NULL。Get Offsets 的 `-4/-5/-6`、consumer group epoch、fenced broker inclusion、Kafka 4.4 user-principal ACL resource和 Delegation Token ACL resource也未由当前版本暴露。
+
+结论：以 librdkafka 2.12 的公开 Admin operation 枚举为边界，除已被增量 API 取代的旧 AlterConfigs 外，当前所有 operation 均已有实际 CLI 调用与测试路径。后续剩余差距需要升级 librdkafka、继续使用独立协议客户端，或属于 Java 插件/服务进程而非 librdkafka 客户端能力。
