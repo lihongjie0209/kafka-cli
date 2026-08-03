@@ -80,37 +80,47 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
 }
 
 fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
-    let candidates: &[(&str, &str)] = match command {
+    let candidates: &[(&str, &str, bool)] = match command {
         "topics" => &[
-            ("--create", "create"),
-            ("--delete", "delete"),
-            ("--describe", "describe"),
-            ("--alter", "alter"),
-            ("--list", "list"),
+            ("--create", "create", false),
+            ("--delete", "delete", false),
+            ("--describe", "describe", false),
+            ("--alter", "alter", false),
+            ("--list", "list", false),
         ],
         "groups" => &[
-            ("--validate-regex", "validate-regex"),
-            ("--describe", "describe"),
-            ("--delete-offsets", "delete-offsets"),
-            ("--reset-offsets", "reset-offsets"),
-            ("--delete", "delete"),
-            ("--list", "list"),
+            ("--validate-regex", "validate-regex", false),
+            ("--describe", "describe", false),
+            ("--delete-offsets", "delete-offsets", true),
+            ("--reset-offsets", "reset-offsets", false),
+            ("--delete", "delete", true),
+            ("--list", "list", false),
         ],
-        "configs" => &[("--describe", "describe"), ("--alter", "alter")],
-        "acls" => &[("--add", "add"), ("--remove", "remove"), ("--list", "list")],
+        "configs" => &[
+            ("--describe", "describe", false),
+            ("--alter", "alter", true),
+        ],
+        "acls" => &[
+            ("--add", "add", true),
+            ("--remove", "remove", false),
+            ("--list", "list", false),
+        ],
         "reassign" => &[
-            ("--generate", "generate"),
-            ("--execute", "execute"),
-            ("--verify", "verify"),
-            ("--cancel", "cancel"),
-            ("--list", "list"),
+            ("--generate", "generate", false),
+            ("--execute", "execute", true),
+            ("--verify", "verify", false),
+            ("--cancel", "cancel", true),
+            ("--list", "list", false),
         ],
         _ => &[],
     };
-    for (flag, action) in candidates {
+    for (flag, action, execute) in candidates {
         if let Some(index) = args.iter().position(|arg| arg == flag) {
             args.remove(index);
             args.insert(2, OsString::from(action));
+            if *execute && !args.iter().any(|arg| arg == "--execute") {
+                args.insert(3, OsString::from("--execute"));
+            }
             return;
         }
     }
@@ -593,7 +603,7 @@ pub struct AclMutationArgs {
     pub allow_host: Vec<String>,
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
-    #[arg(long)]
+    #[arg(long, visible_alias = "force")]
     pub execute: bool,
 }
 
@@ -755,6 +765,39 @@ mod tests {
         assert_eq!(compatibility_command("kafka-topics.sh"), Some("topics"));
     }
 
+    #[test]
+    fn legacy_mutations_should_preserve_immediate_execution() {
+        for (command, flag, action) in [
+            ("groups", "--delete", "delete"),
+            ("groups", "--delete-offsets", "delete-offsets"),
+            ("configs", "--alter", "alter"),
+            ("acls", "--add", "add"),
+            ("reassign", "--execute", "execute"),
+            ("reassign", "--cancel", "cancel"),
+        ] {
+            let mut arguments = vec![
+                OsString::from("kafka-compatible"),
+                OsString::from(command),
+                OsString::from(flag),
+            ];
+            rewrite_legacy_action(&mut arguments, command);
+            assert_eq!(arguments[2], action, "wrong action for {flag}");
+            assert_eq!(arguments[3], "--execute", "{flag} became a preview");
+        }
+    }
+
+    #[test]
+    fn legacy_read_actions_should_not_gain_execution() {
+        let mut arguments = vec![
+            OsString::from("kafka-topics.sh"),
+            OsString::from("topics"),
+            OsString::from("--describe"),
+        ];
+        rewrite_legacy_action(&mut arguments, "topics");
+        assert_eq!(arguments[2], "describe");
+        assert!(!arguments.iter().any(|argument| argument == "--execute"));
+    }
+
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");
     parses_command_family!(consume_family_parses, "consume", "--topic", "events");
     parses_command_family!(
@@ -831,6 +874,7 @@ mod tests {
         "-3"
     );
     parses_command_family!(acls_family_parses, "acls", "list");
+    parses_command_family!(acls_force_alias_parses, "acls", "remove", "--force");
     parses_command_family!(reassign_family_parses, "reassign", "list");
     parses_command_family!(
         configs_user_client_quota_parses,

@@ -93,3 +93,31 @@ fn kafka_log_dirs_alias_should_accept_original_describe_flag() {
         .success()
         .stdout(predicate::str::contains("--describe"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_configs_alias_alter_should_execute_instead_of_previewing() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-configs.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-configs alias");
+
+    Command::new(alias)
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "--timeout-ms",
+            "100",
+            "--alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            "events",
+            "--add-config",
+            "retention.ms=1",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
