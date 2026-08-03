@@ -6,7 +6,10 @@ use std::{
     net::ToSocketAddrs,
     path::Path,
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -47,7 +50,8 @@ use crate::{
         ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
         ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
         ReassignAction, ResetOffsetsArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
-        StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
+        StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
+        TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -85,6 +89,7 @@ fn write_mutation_rows(format: OutputFormat, command: &str, rows: &[MutationRow]
 /// Executes one top-level command.
 #[expect(
     clippy::too_many_lines,
+    clippy::large_stack_frames,
     reason = "top-level dispatch explicitly routes every Kafka command family"
 )]
 pub async fn execute(cli: Cli) -> Result<()> {
@@ -117,11 +122,24 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 .into(),
         ));
     }
-    let bootstrap = cli.bootstrap_server.as_deref().ok_or_else(|| {
-        Error::Usage("--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into())
-    })?;
-    let client_config = config::client_config(bootstrap, cli.command_config.as_deref())?;
-    let command_config = cli.command_config.clone();
+    let is_streams_application_reset = matches!(&cli.command, Command::StreamsApplicationReset(_));
+    let bootstrap = cli
+        .bootstrap_server
+        .as_deref()
+        .or_else(|| is_streams_application_reset.then_some("localhost:9092"))
+        .ok_or_else(|| {
+            Error::Usage(
+                "--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into(),
+            )
+        })?;
+    let command_config = match &cli.command {
+        Command::StreamsApplicationReset(args) => {
+            args.config_file.as_ref().or(cli.command_config.as_ref())
+        }
+        _ => cli.command_config.as_ref(),
+    }
+    .cloned();
+    let client_config = config::client_config(bootstrap, command_config.as_deref())?;
     let timeout = cli.timeout();
     let format = cli.output;
     let verbose = cli.verbose > 0;
@@ -173,6 +191,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 format,
                 args.action,
                 verbose,
+            ))
+            .await
+        }
+        Command::StreamsApplicationReset(args) => {
+            Box::pin(streams_application_reset(
+                &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                &args,
             ))
             .await
         }
@@ -4569,6 +4598,413 @@ async fn streams_groups(
         StreamsGroupAction::ResetOffsets(args) => {
             reset_streams_group_offsets(config, &client, timeout, format, &args).await
         }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StreamsApplicationResetRow {
+    action: String,
+    resource: String,
+    partition: Option<i32>,
+    offset: Option<i64>,
+    status: String,
+    error: Option<String>,
+}
+
+fn write_streams_application_reset_rows(
+    format: OutputFormat,
+    rows: &[StreamsApplicationResetRow],
+) -> Result<()> {
+    output::write_value(format, "streams-application-reset", &rows, |rows| {
+        output::table(
+            [
+                "ACTION",
+                "RESOURCE",
+                "PARTITION",
+                "OFFSET",
+                "STATUS",
+                "ERROR",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.action.clone(),
+                    row.resource.clone(),
+                    row.partition.map_or_else(|| "-".into(), |v| v.to_string()),
+                    row.offset.map_or_else(|| "-".into(), |v| v.to_string()),
+                    row.status.clone(),
+                    row.error.as_deref().unwrap_or("-").to_owned(),
+                ]
+            }),
+        )
+    })
+}
+
+fn matches_streams_internal_topic_format(topic: &str) -> bool {
+    static FOREIGN_KEY_TOPIC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"-KTABLE-FK-JOIN-SUBSCRIPTION-(?:REGISTRATION|RESPONSE)-\d+-topic$")
+            .expect("static Streams internal topic regex")
+    });
+    topic.ends_with("-changelog")
+        || topic.ends_with("-repartition")
+        || topic.ends_with("-subscription-registration-topic")
+        || topic.ends_with("-subscription-response-topic")
+        || FOREIGN_KEY_TOPIC.is_match(topic)
+}
+
+fn inferred_streams_internal_topics(
+    application_id: &str,
+    all_topics: impl IntoIterator<Item = String>,
+    input_topics: &BTreeSet<String>,
+    intermediate_topics: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let prefix = format!("{application_id}-");
+    all_topics
+        .into_iter()
+        .filter(|topic| {
+            topic.starts_with(&prefix)
+                && !input_topics.contains(topic)
+                && !intermediate_topics.contains(topic)
+                && matches_streams_internal_topic_format(topic)
+        })
+        .collect()
+}
+
+fn read_streams_application_reset_plan(path: &Path) -> Result<BTreeMap<(String, i32), i64>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(path)
+        .map_err(|error| Error::Usage(format!("cannot read reset CSV: {error}")))?;
+    let mut rows = BTreeMap::new();
+    for (index, record) in reader.records().enumerate() {
+        let record = record.map_err(|error| {
+            Error::Usage(format!("invalid reset CSV line {}: {error}", index + 1))
+        })?;
+        if record.len() != 3 {
+            return Err(Error::Usage(format!(
+                "reset CSV line {} must contain TOPIC,PARTITION,OFFSET",
+                index + 1
+            )));
+        }
+        let topic = record[0].to_owned();
+        let partition = parse_csv_number::<i32>(&record[1], index, "partition")?;
+        let offset = parse_csv_number::<i64>(&record[2], index, "offset")?;
+        if topic.is_empty() || partition < 0 || offset < 0 {
+            return Err(Error::Usage(format!(
+                "reset CSV line {} requires a topic and non-negative partition/offset",
+                index + 1
+            )));
+        }
+        if rows.insert((topic.clone(), partition), offset).is_some() {
+            return Err(Error::Usage(format!(
+                "duplicate reset CSV target {topic}:{partition}"
+            )));
+        }
+    }
+    if rows.is_empty() {
+        return Err(Error::Usage("reset CSV is empty".into()));
+    }
+    Ok(rows)
+}
+
+async fn force_remove_consumer_group_members(
+    client: &krafka::admin::AdminClient,
+    group_id: &str,
+    members: &[ffi::ConsumerGroupMember],
+) -> Result<()> {
+    let (_, _, connection) = group_coordinator_connection(client, group_id).await?;
+    let version = connection
+        .negotiate_api_version(ApiKey::LeaveGroup, 5, 3)
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support batch LeaveGroup v3+".into()))?;
+    let request = krafka::protocol::LeaveGroupRequest {
+        group_id: group_id.into(),
+        member_id: String::new(),
+        members: members
+            .iter()
+            .map(|member| krafka::protocol::LeaveGroupMember {
+                member_id: member.member_id.clone(),
+                group_instance_id: member.instance_id.clone(),
+                reason: (version >= 5).then(|| "streams application reset --force".into()),
+            })
+            .collect(),
+    };
+    let mut bytes = connection
+        .send_request(ApiKey::LeaveGroup, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    let response = krafka::protocol::LeaveGroupResponse::decode_versioned(version, &mut bytes)?;
+    if !response.error_code.is_ok() {
+        return Err(Error::Config(format!(
+            "LeaveGroup failed for {group_id}: {:?}",
+            response.error_code
+        )));
+    }
+    let failed = response
+        .members
+        .iter()
+        .filter(|member| !member.error_code.is_ok())
+        .map(|member| format!("{}: {:?}", member.member_id, member.error_code))
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "LeaveGroup failed for members: {}",
+            failed.join(", ")
+        )))
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Kafka StreamsResetter deliberately performs member eviction, two offset policies, and internal-topic cleanup as one transaction-like workflow"
+)]
+async fn streams_application_reset(
+    config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    args: &StreamsApplicationResetArgs,
+) -> Result<()> {
+    let admin = admin(config)?;
+    let listings =
+        ffi::list_consumer_groups(admin.inner().native_ptr(), &[], &[], duration_ms(timeout)?)?;
+    if listings
+        .iter()
+        .any(|group| group.group == args.application_id)
+    {
+        let groups = [args.application_id.clone()];
+        let mut descriptions = ffi::describe_consumer_groups(
+            admin.inner().native_ptr(),
+            &groups,
+            duration_ms(timeout)?,
+        )?;
+        let description = descriptions
+            .pop()
+            .ok_or_else(|| Error::Config("broker omitted consumer group description".into()))?;
+        if !description.members.is_empty() {
+            if !args.force {
+                return Err(Error::Usage(format!(
+                    "consumer group '{}' is still active with {} member(s); stop all application instances or use --force",
+                    args.application_id,
+                    description.members.len()
+                )));
+            }
+            let protocol = config::protocol_admin(bootstrap, timeout, command_config).await?;
+            force_remove_consumer_group_members(
+                &protocol,
+                &args.application_id,
+                &description.members,
+            )
+            .await?;
+        }
+    }
+
+    let input_topics = args
+        .input_topics
+        .iter()
+        .map(|topic| topic.trim().to_owned())
+        .filter(|topic| !topic.is_empty())
+        .collect::<BTreeSet<_>>();
+    let intermediate_topics = args
+        .intermediate_topics
+        .iter()
+        .map(|topic| topic.trim().to_owned())
+        .filter(|topic| !topic.is_empty())
+        .collect::<BTreeSet<_>>();
+    let reset_plan = if input_topics.is_empty() {
+        None
+    } else {
+        args.from_file
+            .as_deref()
+            .map(read_streams_application_reset_plan)
+            .transpose()?
+    };
+    let mut consumer_config = config.clone();
+    consumer_config
+        .set("group.id", &args.application_id)
+        .set("enable.auto.commit", "false")
+        .set("group.protocol", "classic");
+    let consumer: BaseConsumer = consumer_config.create()?;
+    let metadata = consumer.fetch_metadata(None, timeout)?;
+    let available = metadata
+        .topics()
+        .iter()
+        .filter(|topic| topic.error().is_none())
+        .map(|topic| topic.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    let inferred_internal = inferred_streams_internal_topics(
+        &args.application_id,
+        available.iter().cloned(),
+        &input_topics,
+        &intermediate_topics,
+    );
+    let internal_topics = if args.internal_topics.is_empty() {
+        inferred_internal.clone()
+    } else {
+        let selected = args
+            .internal_topics
+            .iter()
+            .map(|topic| topic.trim().to_owned())
+            .collect::<BTreeSet<_>>();
+        if let Some(invalid) = selected.difference(&inferred_internal).next() {
+            return Err(Error::Usage(format!(
+                "internal topic '{invalid}' is not an inferred internal topic for application '{}'",
+                args.application_id
+            )));
+        }
+        selected
+    };
+
+    let mut rows = Vec::new();
+    let mut partitions = Vec::new();
+    for topic in input_topics.union(&intermediate_topics) {
+        if !available.contains(topic) {
+            rows.push(StreamsApplicationResetRow {
+                action: if input_topics.contains(topic) {
+                    "RESET-OFFSET".into()
+                } else {
+                    "SEEK-TO-END".into()
+                },
+                resource: topic.clone(),
+                partition: None,
+                offset: None,
+                status: "FAILED".into(),
+                error: Some("topic not found".into()),
+            });
+            continue;
+        }
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|metadata| metadata.name() == topic)
+            .ok_or_else(|| Error::Config(format!("metadata omitted topic {topic}")))?;
+        partitions.extend(
+            topic_metadata
+                .partitions()
+                .iter()
+                .map(|partition| (topic.clone(), partition.id(), input_topics.contains(topic))),
+        );
+    }
+    let mut requested = TopicPartitionList::new();
+    for (topic, partition, _) in &partitions {
+        requested.add_partition(topic, *partition);
+    }
+    let committed = if args.shift_by.is_some() {
+        Some(consumer.committed_offsets(requested.clone(), timeout)?)
+    } else {
+        None
+    };
+    let timestamp = if let Some(value) = args.to_datetime.as_deref() {
+        Some(parse_datetime_millis(value)?)
+    } else if let Some(value) = args.by_duration.as_deref() {
+        Some(
+            Utc::now()
+                .timestamp_millis()
+                .saturating_sub(parse_iso8601_duration_millis(value)?),
+        )
+    } else {
+        None
+    };
+    let timestamp_offsets = if let Some(timestamp) = timestamp {
+        let mut request = TopicPartitionList::new();
+        for (topic, partition, is_input) in &partitions {
+            if *is_input {
+                request.add_partition_offset(topic, *partition, Offset::Offset(timestamp))?;
+            }
+        }
+        Some(consumer.offsets_for_times(request, timeout)?)
+    } else {
+        None
+    };
+    let mut changes = Vec::new();
+    for (topic, partition, is_input) in partitions {
+        let (low, high) = consumer.fetch_watermarks(&topic, partition, timeout)?;
+        let offset = if !is_input {
+            high
+        } else if let Some(plan) = &reset_plan {
+            plan.get(&(topic.clone(), partition))
+                .copied()
+                .ok_or_else(|| {
+                    Error::Usage(format!(
+                        "reset CSV omits input partition {topic}:{partition}"
+                    ))
+                })?
+                .clamp(low, high)
+        } else if let Some(offset) = args.to_offset {
+            offset.clamp(low, high)
+        } else if args.to_latest {
+            high
+        } else if let Some(shift) = args.shift_by {
+            let current = committed_offset(committed.as_ref(), &topic, partition).unwrap_or(high);
+            current.saturating_add(shift).clamp(low, high)
+        } else if timestamp_offsets.is_some() {
+            committed_offset(timestamp_offsets.as_ref(), &topic, partition).unwrap_or(high)
+        } else {
+            low
+        };
+        changes.push((topic.clone(), partition, offset));
+        rows.push(StreamsApplicationResetRow {
+            action: if is_input {
+                "RESET-OFFSET".into()
+            } else {
+                "SEEK-TO-END".into()
+            },
+            resource: topic,
+            partition: Some(partition),
+            offset: Some(offset),
+            status: if args.dry_run { "PREVIEW" } else { "UPDATED" }.into(),
+            error: None,
+        });
+    }
+    if !args.dry_run && !changes.is_empty() {
+        ffi::alter_consumer_group_offsets(
+            admin.inner().native_ptr(),
+            &args.application_id,
+            &changes,
+            duration_ms(timeout)?,
+        )?;
+    }
+    if !internal_topics.is_empty() {
+        let topics = internal_topics.into_iter().collect::<Vec<_>>();
+        if args.dry_run {
+            rows.extend(topics.into_iter().map(|topic| StreamsApplicationResetRow {
+                action: "DELETE-INTERNAL-TOPIC".into(),
+                resource: topic,
+                partition: None,
+                offset: None,
+                status: "PREVIEW".into(),
+                error: None,
+            }));
+        } else {
+            let refs = topics.iter().map(String::as_str).collect::<Vec<_>>();
+            let results = admin
+                .delete_topics(&refs, &AdminOptions::new().request_timeout(Some(timeout)))
+                .await?;
+            for (topic, result) in topics.into_iter().zip(results) {
+                let error = result.err().map(|(_, code)| format!("{code:?}"));
+                rows.push(StreamsApplicationResetRow {
+                    action: "DELETE-INTERNAL-TOPIC".into(),
+                    resource: topic,
+                    partition: None,
+                    offset: None,
+                    status: if error.is_none() { "DELETED" } else { "FAILED" }.into(),
+                    error,
+                });
+            }
+        }
+    }
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_streams_application_reset_rows(format, &rows)?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: failures,
+            total: rows.len(),
+        })
     }
 }
 
@@ -14629,6 +15065,53 @@ mod tests {
         let error = parse_streams_group_states("PreparingRebalance").expect_err("invalid state");
 
         assert!(error.to_string().contains("NotReady"));
+    }
+
+    #[test]
+    fn streams_application_reset_should_match_only_kafka_internal_topic_formats() {
+        let topics = [
+            "app-store-changelog".into(),
+            "app-join-repartition".into(),
+            "app-KTABLE-FK-JOIN-SUBSCRIPTION-RESPONSE-12-topic".into(),
+            "app-output".into(),
+            "other-store-changelog".into(),
+        ];
+
+        let inferred =
+            inferred_streams_internal_topics("app", topics, &BTreeSet::new(), &BTreeSet::new());
+
+        assert_eq!(
+            inferred,
+            BTreeSet::from([
+                "app-KTABLE-FK-JOIN-SUBSCRIPTION-RESPONSE-12-topic".into(),
+                "app-join-repartition".into(),
+                "app-store-changelog".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn streams_application_reset_should_exclude_named_input_from_internal_topics() {
+        let topic = "app-input-changelog".to_owned();
+
+        let inferred = inferred_streams_internal_topics(
+            "app",
+            [topic.clone()],
+            &BTreeSet::from([topic]),
+            &BTreeSet::new(),
+        );
+
+        assert!(inferred.is_empty());
+    }
+
+    #[test]
+    fn streams_application_reset_plan_should_reject_duplicate_partition() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary reset plan");
+        writeln!(file, "input,0,1\ninput,0,2").expect("write reset plan");
+
+        let error = read_streams_application_reset_plan(file.path()).expect_err("duplicate");
+
+        assert!(error.to_string().contains("duplicate reset CSV target"));
     }
 
     #[test]

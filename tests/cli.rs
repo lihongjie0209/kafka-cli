@@ -268,3 +268,21 @@ fn kafka_streams_groups_alias_should_accept_original_actions() {
         .stdout(predicate::str::contains("--all-groups"))
         .stdout(predicate::str::contains("--topology"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_streams_application_reset_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-streams-application-reset.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create Streams reset alias");
+
+    Command::new(alias)
+        .args(["--application-id", "streams-app", "--dry-run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--input-topics"))
+        .stdout(predicate::str::contains("--internal-topics"))
+        .stdout(predicate::str::contains("--force"));
+}

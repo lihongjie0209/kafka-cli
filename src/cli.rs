@@ -79,6 +79,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-groups" => Some("all-groups"),
         "kafka-share-groups" => Some("share-groups"),
         "kafka-streams-groups" => Some("streams-groups"),
+        "kafka-streams-application-reset" => Some("streams-application-reset"),
         "kafka-configs" => Some("configs"),
         "kafka-get-offsets" => Some("offsets"),
         "kafka-acls" => Some("acls"),
@@ -301,6 +302,8 @@ pub enum Command {
     ShareGroups(ShareGroupsArgs),
     /// Inspect and manage Kafka Streams groups.
     StreamsGroups(StreamsGroupsArgs),
+    /// Reset a classic Kafka Streams application's processing state.
+    StreamsApplicationReset(Box<StreamsApplicationResetArgs>),
     /// Inspect and alter dynamic configuration.
     Configs(ConfigsArgs),
     /// Query partition offsets.
@@ -1116,6 +1119,49 @@ pub struct StreamsGroupResetOffsetsArgs {
     pub delete_all_internal_topics: bool,
 }
 
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka StreamsResetter exposes mutually exclusive reset strategy flags"
+)]
+pub struct StreamsApplicationResetArgs {
+    /// Kafka Streams application ID and classic consumer group ID.
+    #[arg(long)]
+    pub application_id: String,
+    /// Comma-separated user input topics whose offsets are reset.
+    #[arg(long, value_delimiter = ',')]
+    pub input_topics: Vec<String>,
+    /// Deprecated comma-separated intermediate topics whose offsets seek to end.
+    #[arg(long, value_delimiter = ',')]
+    pub intermediate_topics: Vec<String>,
+    /// Restrict deletion to this comma-separated subset of inferred internal topics.
+    #[arg(long, value_delimiter = ',')]
+    pub internal_topics: Vec<String>,
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["to_datetime", "by_duration", "to_earliest", "to_latest", "from_file", "shift_by"])]
+    pub to_offset: Option<i64>,
+    #[arg(long, conflicts_with_all = ["to_offset", "by_duration", "to_earliest", "to_latest", "from_file", "shift_by"])]
+    pub to_datetime: Option<String>,
+    #[arg(long, conflicts_with_all = ["to_offset", "to_datetime", "to_earliest", "to_latest", "from_file", "shift_by"])]
+    pub by_duration: Option<String>,
+    #[arg(long, conflicts_with_all = ["to_offset", "to_datetime", "by_duration", "to_latest", "from_file", "shift_by"])]
+    pub to_earliest: bool,
+    #[arg(long, conflicts_with_all = ["to_offset", "to_datetime", "by_duration", "to_earliest", "from_file", "shift_by"])]
+    pub to_latest: bool,
+    #[arg(long, conflicts_with_all = ["to_offset", "to_datetime", "by_duration", "to_earliest", "to_latest", "shift_by"])]
+    pub from_file: Option<PathBuf>,
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["to_offset", "to_datetime", "by_duration", "to_earliest", "to_latest", "from_file"])]
+    pub shift_by: Option<i64>,
+    /// Preview all offset changes and topic deletions.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Remove active classic consumer group members before resetting.
+    #[arg(long)]
+    pub force: bool,
+    /// Deprecated alias for the global command config file.
+    #[arg(long, conflicts_with = "command_config")]
+    pub config_file: Option<PathBuf>,
+}
+
 impl GroupsArgs {
     pub(crate) fn timeout(&self, default: Duration) -> Duration {
         self.timeout_ms.map_or(default, Duration::from_millis)
@@ -1593,11 +1639,29 @@ mod tests {
             Some("streams-groups")
         );
         assert_eq!(
+            compatibility_command("kafka-streams-application-reset.sh"),
+            Some("streams-application-reset")
+        );
+        assert_eq!(
             compatibility_command("kafka-client-metrics.sh"),
             Some("client-metrics")
         );
         assert_eq!(compatibility_command("kafka-features.sh"), Some("features"));
     }
+
+    parses_command_family!(
+        streams_application_reset_family_parses,
+        "streams-application-reset",
+        "--application-id",
+        "word-count",
+        "--input-topics",
+        "input-a,input-b",
+        "--intermediate-topics",
+        "through",
+        "--shift-by",
+        "-2",
+        "--dry-run"
+    );
 
     #[test]
     fn legacy_mutations_should_preserve_immediate_execution() {

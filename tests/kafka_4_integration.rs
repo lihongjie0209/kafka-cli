@@ -46,6 +46,20 @@ fn eventually_contains(bootstrap: &str, arguments: &[&str], expected: &str) -> S
     );
 }
 
+fn eventually_not_contains(bootstrap: &str, arguments: &[&str], unexpected: &str) -> String {
+    let mut last_output = String::new();
+    for _ in 0..20 {
+        last_output = success(bootstrap, arguments);
+        if !last_output.contains(unexpected) {
+            return last_output;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "kafka {arguments:?} still contained {unexpected:?} after bounded retries\nlast stdout: {last_output}"
+    );
+}
+
 #[test]
 #[ignore = "requires Docker and downloads apache/kafka:4.3.1"]
 #[expect(
@@ -784,6 +798,55 @@ fn all_command_families_work_against_kafka_4_3_1() {
         missing_streams_reset["data"][0]["group"],
         "missing-streams-group"
     );
+    for topic in ["legacy-streams-through", "legacy-streams-store-changelog"] {
+        success(
+            &bootstrap,
+            &["topics", "create", "--topic", topic, "--partitions", "1"],
+        );
+    }
+    success(&bootstrap, &["produce", "legacy-streams-through", "--sync"]);
+    let application_reset_preview: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "streams-application-reset",
+            "--application-id",
+            "legacy-streams",
+            "--input-topics",
+            "integration-events",
+            "--intermediate-topics",
+            "legacy-streams-through",
+            "--dry-run",
+        ],
+    ))
+    .expect("Streams application reset preview JSON");
+    assert!(
+        application_reset_preview["data"]
+            .as_array()
+            .expect("reset rows")
+            .iter()
+            .any(|row| row["action"] == "DELETE-INTERNAL-TOPIC"
+                && row["resource"] == "legacy-streams-store-changelog"
+                && row["status"] == "PREVIEW")
+    );
+    success(
+        &bootstrap,
+        &[
+            "streams-application-reset",
+            "--application-id",
+            "legacy-streams",
+            "--input-topics",
+            "integration-events",
+            "--intermediate-topics",
+            "legacy-streams-through",
+        ],
+    );
+    eventually_not_contains(
+        &bootstrap,
+        &["topics", "list"],
+        "legacy-streams-store-changelog",
+    );
     let all_groups = success(&bootstrap, &["all-groups", "list"]);
     assert!(all_groups.contains("integration-suite"));
     assert!(all_groups.contains("Classic"));
@@ -1096,6 +1159,16 @@ fn all_command_families_work_against_kafka_4_3_1() {
             .as_str()
             .expect("reset error")
             .contains("current state is Stable")
+    );
+    success(
+        &bootstrap,
+        &[
+            "streams-application-reset",
+            "--application-id",
+            "active-reset-group",
+            "--force",
+            "--dry-run",
+        ],
     );
     active_consumer.kill().expect("stop active consumer");
     active_consumer.wait().expect("wait for active consumer");

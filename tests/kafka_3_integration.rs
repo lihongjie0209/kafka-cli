@@ -233,6 +233,35 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "topics",
+            "create",
+            "--topic",
+            "kafka-36-app-store-changelog",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "streams-application-reset",
+            "--application-id",
+            "kafka-36-app",
+            "--input-topics",
+            "kafka-36-events",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("RESET-OFFSET"))
+        .stdout(predicate::str::contains("kafka-36-app-store-changelog"))
+        .stdout(predicate::str::contains("PREVIEW"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "configs",
             "alter",
             "--entity-type",

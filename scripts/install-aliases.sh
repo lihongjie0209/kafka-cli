@@ -11,7 +11,10 @@ directory=$(dirname "$binary")
 
 for name in \
     kafka-topics kafka-console-producer kafka-console-consumer \
-    kafka-consumer-groups kafka-configs kafka-get-offsets kafka-acls \
+    kafka-consumer-groups kafka-groups kafka-share-groups kafka-streams-groups \
+    kafka-streams-application-reset kafka-configs kafka-client-metrics \
+    kafka-features kafka-transactions kafka-metadata-quorum \
+    kafka-delegation-tokens kafka-get-offsets kafka-acls \
     kafka-reassign-partitions kafka-delete-records kafka-leader-election \
     kafka-log-dirs kafka-broker-api-versions kafka-cluster
 do

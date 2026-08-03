@@ -38,7 +38,7 @@ compatibility.
 ## Command coverage
 
 The binary exposes `topics`, `produce`, `consume`, `groups`, `all-groups`,
-`share-groups`, `streams-groups`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
+`share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
 `features`, `transactions`, `metadata-quorum`, and `delegation-tokens` command families. Run
 `kafka <command> --help` for details.
@@ -59,6 +59,11 @@ Share and Kafka Streams group management provide their original list,
 describe, delete, reset-offsets, and delete-offsets actions. Streams describe
 includes state, member task assignments, offset lag, and Kafka 4.4 topology
 descriptions; tabular output is rendered through the shared table library.
+The legacy Streams application reset workflow is also available: it guards or
+force-removes active classic group members, resets input offsets, seeks
+intermediate topics to their end offsets, and deletes only inferred Kafka
+Streams internal topics. Use `--dry-run` before executing this irreversible
+workflow.
 
 ## Authentication
 
