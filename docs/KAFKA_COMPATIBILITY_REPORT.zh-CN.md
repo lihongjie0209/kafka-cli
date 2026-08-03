@@ -140,6 +140,8 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 缺少或有差异：
 
 - librdkafka 2.12 未暴露 Kafka consumer protocol 的 group epoch、member epoch 与 target assignment epoch；verbose 无法输出这些原版新列。
+- Kafka 4.4 的 `GroupState` 已包含 `Assigning`、`Reconciling`、`NotReady`，`GroupType` 已包含 `Share`、`Streams`；librdkafka 2.12 的公开 consumer-group 枚举只能表达 `PreparingRebalance`、`CompletingRebalance`、`Stable`、`Dead`、`Empty` 以及 `Consumer`、`Classic`。当前命令因此不能按 Kafka 4.4 的新增状态/类型过滤，返回的未知枚举也只能显示为 `Unknown`。
+- `validate-regex` 的 Kafka 4.4 帮助文案要求 RE2 格式，但原版实现实际调用 Java `Pattern.compile`；本项目使用 Rust `regex`，与 RE2 安全集合接近但并非 Java Pattern 的逐语法等价实现。
 
 ### 4.5 Configs
 
@@ -305,9 +307,10 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 | 优先级 | 位置 | 当前行为 | 原版/期望行为 |
 |---|---|---|---|
-| P2 | groups validate-regex | 仍由 Rust regex 校验，不能覆盖全部 Java Pattern 扩展 | 后续需要 Java-compatible validator；当前输出和报告明确限定方言 |
+| P1 | groups list state/type | 只能过滤 librdkafka 2.12 暴露的 5 种状态与 Consumer/Classic 类型 | Kafka 4.4 还支持 Assigning/Reconciling/NotReady 与 Share/Streams；需升级 librdkafka 或增加协议级实现 |
+| P2 | groups validate-regex | 使用 Rust regex；Kafka 帮助文案称 RE2，实际 Java 实现却调用 `Pattern.compile` | 保持方言边界声明，并用 Kafka 原版测试用例做差分验证；不能笼统宣称任一方言完全一致 |
 
-本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并、groups delete 结构化输出、reassignment 的逐 partition/log-dir 错误结果，以及 console consumer 用 Rust regex 预判 librdkafka POSIX ERE 的错误。当前正则剩余差距收窄为离线 `groups validate-regex` 尚非完整 Java Pattern validator。
+本轮已经修复 reset-offsets 的 active group 安全检查、空 group 批处理中断、重复 topic selector 合并、groups delete 结构化输出、reassignment 的逐 partition/log-dir 错误结果，以及 console consumer 用 Rust regex 预判 librdkafka POSIX ERE 的错误。当前剩余差距包括 Kafka 4.4 新 group state/type 的过滤能力，以及离线 `groups validate-regex` 与原版 Java Pattern/帮助文案 RE2 之间无法同时逐语法一致的问题。
 
 ### 10.2 逐入口验收结论
 
@@ -316,7 +319,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | topics | 完整 | 高 | 高/中 | 常用功能可替代，缺单次响应 partition 限制 |
 | console-producer | 单动作 | 中 | 中 | 可做常规生产，不替代 Java reader 插件体系 |
 | console-consumer | 单动作 | 中 | 中/高 | group、commit、offset 与配置优先级已对齐；不替代 formatter/deserializer 插件体系 |
-| consumer-groups | 完整 | 高 | 高/中 | reset 已对齐 inactive group、空 group、重复 selector 和结构化批量输出；epoch 列仍受 librdkafka 限制 |
+| consumer-groups | 完整 | 高 | 高/中 | reset 已对齐 inactive group、空 group、重复 selector 和结构化批量输出；epoch 列及 Kafka 4.4 新 state/type 过滤仍受 librdkafka 限制 |
 | configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 bootstrap-controller |
 | get-offsets | 单动作 | 高 | 中 | 常用查询和过滤语义较完整；分层存储 OffsetSpec 可解析但受 librdkafka 2.12 执行能力限制 |
 | acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
@@ -418,6 +421,6 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 以下 Kafka 原版能力在 librdkafka 2.12 中没有对应 C API，因此不属于本轮可实现集合：partition reassignment、describe/alter log dirs、API version 明细、unregister broker、client quota、broker logger/client metrics config resource、metadata quorum、feature update、transaction listing/abort、delegation token、share/streams group Admin API。项目现有少数同名功能仍由 `krafka` 实现，报告不会把它们误记为 librdkafka 路径。
 
-此外，已通过实际 Kafka 4.3.1 测试确认 broker default config 无法用 librdkafka 表达：Kafka 要求空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在空 name 时返回 NULL。Get Offsets 的 `-4/-5/-6`、consumer group epoch、fenced broker inclusion、Kafka 4.4 user-principal ACL resource和 Delegation Token ACL resource也未由当前版本暴露；其中 fenced broker inclusion 已通过独立 DescribeCluster v2 协议路径补齐。
+此外，已通过实际 Kafka 4.3.1 测试确认 broker default config 无法用 librdkafka 表达：Kafka 要求空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在空 name 时返回 NULL。Get Offsets 的 `-4/-5/-6`、consumer group epoch、Kafka 4.4 的 Assigning/Reconciling/NotReady group state 与 Share/Streams group type、fenced broker inclusion、Kafka 4.4 user-principal ACL resource 和 Delegation Token ACL resource 也未由当前版本暴露；其中 fenced broker inclusion 已通过独立 DescribeCluster v2 协议路径补齐。
 
 结论：以 librdkafka 2.12 的公开 Admin operation 枚举为边界，除已被增量 API 取代的旧 AlterConfigs 外，当前所有 operation 均已有实际 CLI 调用与测试路径。后续剩余差距需要升级 librdkafka、继续使用独立协议客户端，或属于 Java 插件/服务进程而非 librdkafka 客户端能力。
