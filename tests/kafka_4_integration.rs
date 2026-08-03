@@ -936,23 +936,21 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    assert!(
-        success(
-            &bootstrap,
-            &[
-                "configs",
-                "describe",
-                "--entity-type",
-                "users",
-                "--entity-type",
-                "clients",
-                "--entity-name",
-                "integration-user",
-                "--entity-name",
-                "integration-client",
-            ],
-        )
-        .contains("request_percentage")
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "users",
+            "--entity-type",
+            "clients",
+            "--entity-name",
+            "integration-user",
+            "--entity-name",
+            "integration-client",
+        ],
+        "request_percentage",
     );
     success(
         &bootstrap,
@@ -967,18 +965,16 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    assert!(
-        success(
-            &bootstrap,
-            &[
-                "configs",
-                "describe",
-                "--entity-type",
-                "ips",
-                "--entity-default",
-            ],
-        )
-        .contains("connection_creation_rate")
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "ips",
+            "--entity-default",
+        ],
+        "connection_creation_rate",
     );
     success(
         &bootstrap,
@@ -994,19 +990,17 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    assert!(
-        success(
-            &bootstrap,
-            &[
-                "configs",
-                "describe",
-                "--entity-type",
-                "broker-loggers",
-                "--entity-name",
-                "1",
-            ],
-        )
-        .contains("kafka.server.KafkaApis")
+    eventually_contains(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "broker-loggers",
+            "--entity-name",
+            "1",
+        ],
+        "kafka.server.KafkaApis",
     );
     success(
         &bootstrap,
