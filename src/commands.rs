@@ -2789,8 +2789,18 @@ fn decode_streams_subtopologies(buffer: &mut impl Buf) -> Result<Vec<StreamsSubt
     Ok(subtopologies)
 }
 
+fn decode_nullable_struct_presence(buffer: &mut impl Buf) -> Result<bool> {
+    match i8::decode(buffer)? {
+        -1 => Ok(false),
+        1 => Ok(true),
+        marker => Err(Error::Config(format!(
+            "invalid nullable struct presence marker {marker}"
+        ))),
+    }
+}
+
 fn decode_streams_topology(buffer: &mut impl Buf) -> Result<Option<StreamsTopology>> {
-    if decode_unsigned_varint(buffer)? == 0 {
+    if !decode_nullable_struct_presence(buffer)? {
         return Ok(None);
     }
     let _epoch = i32::decode(buffer)?;
@@ -2849,7 +2859,7 @@ fn decode_streams_member(buffer: &mut impl Buf) -> Result<StreamsGroupMember> {
     let _client_host = decode_compact_string(buffer)?;
     let topology_epoch = i32::decode(buffer)?;
     let process_id = decode_compact_string(buffer)?;
-    if decode_unsigned_varint(buffer)? != 0 {
+    if decode_nullable_struct_presence(buffer)? {
         let _host = decode_compact_string(buffer)?;
         let _port = i16::decode(buffer)?.cast_unsigned();
         skip_tagged_fields(buffer)?;
@@ -2889,7 +2899,7 @@ fn decode_streams_topology_node(buffer: &mut impl Buf) -> Result<StreamsTopology
 fn decode_streams_topology_description(
     buffer: &mut impl Buf,
 ) -> Result<Option<StreamsTopologyDescription>> {
-    if decode_unsigned_varint(buffer)? == 0 {
+    if !decode_nullable_struct_presence(buffer)? {
         return Ok(None);
     }
     let subtopology_count = decode_compact_len(buffer)?;
@@ -14602,6 +14612,23 @@ mod tests {
         assert_eq!(buffer.as_ref(), [0, 2, 2, b'g', 0, 0]);
     }
 
+    #[test]
+    fn streams_group_v0_decoder_should_accept_broker_null_topology_marker() {
+        let bytes = STANDARD
+            .decode("AAAAAAACAEUnR3JvdXAgbWlzc2luZy1zdHJlYW1zLWdyb3VwIG5vdCBmb3VuZC4WbWlzc2luZy1zdHJlYW1zLWdyb3VwAQAAAAAAAAAA/wGAAAAAAAA=")
+            .expect("Kafka 4.3 response fixture");
+        let mut buffer = bytes.as_slice();
+        skip_tagged_fields(&mut buffer).expect("response header tags");
+        i32::decode(&mut buffer).expect("throttle time");
+        assert_eq!(decode_compact_len(&mut buffer).expect("group count"), 1);
+
+        let (error_code, _, description) =
+            decode_streams_group_description(&mut buffer, 0).expect("decode missing group");
+
+        assert_eq!(error_code, 69);
+        assert!(description.topology.is_none());
+    }
+
     fn encode_empty_streams_assignment(buffer: &mut BytesMut) {
         buffer.put_u8(1); // active tasks
         buffer.put_u8(1); // standby tasks
@@ -14643,7 +14670,7 @@ mod tests {
         encode_compact_string("/127.0.0.1", &mut buffer);
         buffer.put_i32(7);
         encode_compact_string("process-1", &mut buffer);
-        buffer.put_u8(0); // endpoint
+        buffer.put_u8(0xff); // null endpoint
         buffer.put_u8(1); // client tags
         buffer.put_u8(1); // task offsets
         buffer.put_u8(1); // task end offsets
@@ -14691,7 +14718,7 @@ mod tests {
         encode_compact_string("Empty", &mut buffer);
         buffer.put_i32(4);
         buffer.put_i32(3);
-        buffer.put_u8(0); // topology metadata
+        buffer.put_u8(0xff); // null topology metadata
         buffer.put_u8(1); // members
         buffer.put_i32(i32::MIN);
         buffer.put_u8(1); // topology description
