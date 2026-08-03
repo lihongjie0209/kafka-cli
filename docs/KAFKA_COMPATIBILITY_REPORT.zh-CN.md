@@ -1,0 +1,251 @@
+# kafka-cli 与 Apache Kafka 原版工具功能对比报告
+
+报告日期：2026-08-03
+
+## 1. 结论摘要
+
+本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
+
+- Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
+- 本项目版本：提交 `ce72ef10e52dd674267fe3109975bea14603dad8`。
+- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（约 30%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
+- Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
+- Connect、Share Group、Streams Group、事务、delegation token、metadata quorum、storage、性能测试、验证工具等原版工具尚未实现。
+- 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API；少数管理路径仍使用 `krafka`，尚未完全统一到 librdkafka。
+
+## 2. 状态定义
+
+| 状态 | 含义 |
+|---|---|
+| 已支持 | 核心动作和主要输入语义已实现，并有自动化测试覆盖 |
+| 部分支持 | 命令可用，但缺少原版的一部分资源类型、选项、输出细节或高级模式 |
+| 未支持 | 没有对应命令入口或实质实现 |
+| 有意差异 | 本项目为了安全或机器可读输出而采用不同默认行为 |
+
+## 3. 顶层脚本覆盖
+
+### 3.1 已提供兼容入口的原版脚本
+
+| Apache Kafka 脚本 | Rust 入口 | 状态 | 说明 |
+|---|---|---|---|
+| `kafka-topics.sh` | `kafka topics` | 已支持 | list、describe、create、alter、delete |
+| `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 常用行输入、key、JSON、headers、partition；未复刻可插拔 reader 全部选项 |
+| `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/group/partition/offset/from-beginning/max-messages；未复刻 formatter/deserializer 全部选项 |
+| `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、describe、delete、delete-offsets、reset-offsets；缺少批量与导入导出模式 |
+| `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group；缺少其他 entity type |
+| `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | topic 正则、partition 模式、earliest/latest/timestamp、排除内部主题 |
+| `kafka-acls.sh` | `kafka acls` | 部分支持 | list/add/remove、常见资源和 producer/consumer 快捷角色 |
+| `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；缺少 throttle 高级参数 |
+| `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件、预览、执行 |
+| `kafka-leader-election.sh` | `kafka leader-election` | 部分支持 | preferred/unclean、单分区或全部；缺少 JSON 文件批量选择 |
+| `kafka-log-dirs.sh` | `kafka log-dirs` | 已支持 | broker/topic 过滤与目录、大小、lag 展示 |
+| `kafka-broker-api-versions.sh` | `kafka api-versions` | 已支持 | 全 broker 或指定 broker 的 API version 范围 |
+| `kafka-cluster.sh` | `kafka cluster` | 部分支持 | cluster ID、endpoints、API versions、unregister；缺少 fenced broker 细节选项 |
+
+兼容入口可以通过软链接名称调用，支持带或不带 `.sh` 后缀。对原版使用 `--create`、`--describe` 等动作 flag 的部分脚本，会自动改写为 Rust 子命令。
+
+### 3.2 尚未实现的原版脚本
+
+| 类别 | 未支持脚本 |
+|---|---|
+| Kafka Connect | `connect-distributed.sh`、`connect-internal-topics.sh`、`connect-mirror-maker.sh`、`connect-plugin-path.sh`、`connect-standalone.sh` |
+| 新消费组模型 | `kafka-console-share-consumer.sh`、`kafka-share-groups.sh`、`kafka-share-consumer-perf-test.sh`、`kafka-verifiable-share-consumer.sh` |
+| Streams | `kafka-streams-application-reset.sh`、`kafka-streams-groups.sh` |
+| 集群与元数据高级工具 | `kafka-client-metrics.sh`、`kafka-features.sh`、`kafka-metadata-quorum.sh`、`kafka-metadata-shell.sh`、`kafka-storage.sh` |
+| 安全与事务 | `kafka-delegation-tokens.sh`、`kafka-transactions.sh` |
+| 性能、校验与诊断 | `kafka-consumer-perf-test.sh`、`kafka-producer-perf-test.sh`、`kafka-e2e-latency.sh`、`kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-verifiable-producer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
+| 服务进程与基础启动器 | `kafka-run-class.sh`、`kafka-server-start.sh`、`kafka-server-stop.sh`、`kafka-jmx.sh` |
+| 其他 Group 工具 | `kafka-groups.sh` |
+
+服务启动、JVM class runner、JMX 和 Trogdor 一类脚本不适合由客户端 CLI 等价替代；如果项目目标仅是 Kafka 客户端管理工具，可以明确将它们排除在范围之外。
+
+## 4. 已覆盖命令的详细对比
+
+### 4.1 Topics
+
+已支持：
+
+- list、describe、create、alter、delete。
+- topic 名称和 Java 风格整串正则匹配。
+- create 的 partitions、replication factor、手工 replica assignment、重复 `--config`、`--if-not-exists`。
+- alter 增加 partition 数量、手工 assignment、`--if-exists`。
+- delete 的正则选择和 `--if-exists`。
+- describe 过滤：under-replicated、unavailable、under-min-ISR、at-min-ISR、topics-with-overrides、exclude-internal。
+- unavailable 判定会核对 leader 是否仍在 live broker 集合中。
+
+缺少或有差异：
+
+- 未支持 `--topic-id` describe。
+- 未支持 `--partition-size-limit-per-response`。
+- 原版未指定 replication factor 时可使用集群默认值；本项目当前默认值为 1，语义不同。
+- 原版废弃的 `--delete-config` 未提供。
+- 表格列名和排版不是原版逐字符复制。
+
+### 4.2 Console Producer
+
+已支持：topic、acks、compression、parse-key、key separator、stdin 行输入、JSON 输入、指定 partition、headers、`--command-property` 及旧名 `--producer-property`。
+
+缺少：sync、batch-size、retry/backoff、request timeout、metadata expiry、buffer/memory、socket buffer、自定义 line reader、reader config/property 等专用 flag。多数底层 producer 配置仍可通过 `--command-property key=value` 传入，但不能替代自定义 Java reader 类。
+
+### 4.3 Console Consumer
+
+已支持：topic、group、partition、offset、from-beginning、max-messages、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`。
+
+缺少：include 正则、timeout-ms、isolation-level 专用 flag、formatter/formatter-config/formatter-property、key/value deserializer、skip-message-on-error、systest events。部分底层 consumer 配置可通过 `--command-property` 传入，但 Java formatter/deserializer 插件不能直接复用。
+
+### 4.4 Consumer Groups
+
+已支持：
+
+- list。
+- describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`。
+- committed offset、log end offset、lag 和错误列。
+- delete group、delete offsets，默认预览并通过 `--execute` 执行。
+- reset offsets：earliest、latest、absolute offset、shift-by、current、datetime、ISO-8601 duration。
+
+缺少或有差异：
+
+- 一次只接受一个 describe/reset 目标 group；缺少 `--all-groups`。
+- reset 一次只接受一个 topic；缺少 `--all-topics` 和原版更丰富的 topic-partition 集合。
+- 缺少 `--dry-run`、`--export`、`--from-file`、`--type`、`--validate-regex`、`--verbose` 细节模式。
+- members assignment 对 classic group 当前主要展示原始 assignment 字节长度，而非完全解码后的 topic-partition 清单。
+
+### 4.5 Configs
+
+已支持：topic、broker、group 的 describe；增量 add/delete config；预览与 `--execute`。
+
+缺少：client、user、user/client 组合、IP、broker-logger、client-metrics、entity-default、`--all`、`--add-config-file`、bootstrap-controller。资源类型覆盖明显少于原版。
+
+### 4.6 Get Offsets
+
+已支持：topic 正则、`topic:partition`、闭区间与开放区间 partition 范围、多个 pattern、exclude-internal、earliest、latest、Unix 毫秒 timestamp。
+
+缺少：Kafka 新版本 `--time` 的 `max-timestamp`、`earliest-local`、`latest-tiered` 等特殊时间关键字。输出采用统一表格/JSON envelope，而非原版 `topic:partition:offset` 文本格式。
+
+### 4.7 ACLs
+
+已支持：list/add/remove；Topic、Group、Cluster、Transactional ID、Delegation Token；Literal/Prefixed/Any；allow/deny principal 与 host；常见 operations；producer、consumer、idempotent 快捷角色；预览与 `--execute`。
+
+缺少或有差异：
+
+- 未支持 Kafka 4.4 的 `--user-principal` 资源语义。
+- 未支持 bootstrap-controller。
+- 原版 remove 会交互确认或使用 `--force`；本项目采用更安全的显式 `--execute`，没有交互确认。
+- 快捷角色当前只允许 allow principal/host，不允许 deny 组合。
+- ACL 网络操作目前仍有手写协议/`krafka` 路径，尚未全部迁移到 librdkafka Admin FFI。
+
+### 4.8 Partition Reassignment
+
+已支持：generate、execute、verify、cancel、list；topics-to-move 与 reassignment JSON；broker list；rack-aware/disable-rack-aware；log directory relocation；预览与 `--execute`。
+
+缺少：`--additional`、`--throttle`、`--replica-alter-log-dirs-throttle`、`--preserve-throttles`、`--disallow-replication-factor-change`、bootstrap-controller。生成算法目标与原版一致，但不承诺在相同输入下产生逐字节相同 assignment。
+
+### 4.9 Delete Records
+
+offset JSON file、请求校验、执行和结果输出均已实现。本项目额外要求 `--execute` 才会修改数据；原版命令本身即执行，这是有意的安全差异。
+
+### 4.10 Leader Election
+
+已支持 preferred、unclean；topic+partition 或 all-topic-partitions；预览与 `--execute`。
+
+缺少：`--path-to-json-file` 批量 partition 输入、旧 `--admin.config` 别名、bootstrap-controller。原版执行命令直接产生变更；本项目要求 `--execute`。
+
+### 4.11 Log Dirs
+
+已支持 broker list、topic list、log directory、partition size、offset lag 和错误展示。原版的 `--describe` 动作在本项目中由 `kafka log-dirs` 直接表示。
+
+### 4.12 Broker API Versions
+
+支持读取 broker API key 的 min/max version，可查询所有 broker 或指定 broker。原版主要只有 bootstrap-server 与 command-config；本项目额外提供结构化 JSON 输出。
+
+### 4.13 Cluster
+
+已支持 cluster ID、broker endpoints、API versions、unregister broker。
+
+缺少或有差异：bootstrap-controller、list-endpoints 的 `--include-fenced-brokers`、原版短参数和废弃 config 别名。unregister 要求 `--execute`，避免误操作。
+
+## 5. 全局行为差异
+
+| 项目 | Apache Kafka 原版 | kafka-cli |
+|---|---|---|
+| 运行时 | JVM/Scala/Java | Rust 原生二进制 |
+| Kafka 客户端 | Apache Java client | `rdkafka`/librdkafka 为主，少数路径为 `krafka` |
+| 输出 | 各脚本分别定义纯文本 | 统一 `comfy-table` 表格或稳定 JSON envelope |
+| 破坏性操作 | 不同工具行为不一致，部分交互确认 | 多数操作先预览，要求 `--execute` |
+| 动作语法 | 常见 `--list`、`--describe` flag | 原生子命令；兼容入口会改写部分旧 flag |
+| 配置文件 | Java properties | 支持 Java-compatible properties，并映射常见 librdkafka key |
+| Java 插件 | formatter、reader、deserializer 可加载类 | 不支持加载 Java 类 |
+| 超时 | 各工具分别定义 | 全局 `--timeout-ms`，部分命令有原版语义差异 |
+
+JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出已全部使用 `comfy-table`，没有继续手工拼接 table 文本。
+
+## 6. 客户端实现架构
+
+推荐并正在采用的依赖边界：
+
+1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现。
+2. `rdkafka-sys`：只包装 `rdkafka` 尚未暴露的 librdkafka Admin API，例如 leader election、部分 group offset/config API。
+3. `krafka`：当前仍用于 API versions、unregister、部分 ACL/reassignment/log-dir 协议路径。为确保认证、重试、协议协商和错误行为一致，应逐步迁移到 librdkafka/`rdkafka-sys`，最后评估删除该依赖。
+
+不建议全量直接使用 `rdkafka-sys`：它与 `rdkafka` 使用同一个 librdkafka，但会把 C 指针、回调、队列和资源生命周期全部暴露为 `unsafe`，不会获得额外协议权威性。
+
+## 7. 测试与验证现状
+
+本地验证：
+
+- `cargo fmt --check`：通过。
+- `cargo clippy --all-targets --locked -- -D warnings`：通过。
+- Rust 单元测试与普通 CLI 测试：48 个通过。
+- Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
+- Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
+- GitHub Actions workflow 经 `actionlint` 校验通过。
+
+测试仍有不足：
+
+- 集成测试是单 broker，不能充分验证多 broker reassignment、rack awareness、ISR 变化和 failover。
+- 未覆盖 TLS、mTLS、SASL/PLAIN、SCRAM、OAuth/OIDC 和 Kerberos 组合。
+- 未覆盖真实 ARM64 机器运行；ARM64 当前只由 CI 交叉编译。
+- 没有逐个原版选项的 golden test，也没有与 Java CLI 输出做逐命令差分测试。
+- ACL 快捷角色和复杂 deny/host/prefix 组合仍需更完整矩阵。
+
+## 8. CI 与发布目标
+
+CI workflow 包含：
+
+- fmt、Clippy、单元测试。
+- bundled glibc release build。
+- Kafka 4.3.1 集成测试。
+- Kafka 3.6.2 集成测试。
+- `x86_64-unknown-linux-musl` 静态构建及 artifact。
+- `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
+
+musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
+
+## 9. 建议的后续优先级
+
+### P0：统一客户端与保证现有功能可靠
+
+1. 将 ACL、API versions、unregister、reassignment/log-dir 等剩余 `krafka` 路径迁移至 `rdkafka` 或窄范围 `rdkafka-sys` RAII 封装。
+2. 增加 TLS/SASL 集成测试。
+3. 增加多 broker Kafka 4 集成环境，验证 reassignment、leader election、ISR 和 rack-aware 分配。
+4. 在 CI 对两个 musl artifact 执行 `--help`/`--version` smoke test；ARM64 使用 QEMU 或原生 ARM runner。
+
+### P1：补齐已支持脚本的主要差距
+
+1. Configs 增加 user、client、IP、broker-logger、client-metrics 和 default entity。
+2. Consumer Groups 增加 all-groups、all-topics、from-file、export、dry-run 和完整 member assignment 解码。
+3. Reassignment 增加 throttle、preserve-throttles、additional 等参数。
+4. Get Offsets 增加 max-timestamp、earliest-local、latest-tiered。
+5. Leader Election 增加 JSON 文件批量输入。
+6. Topics 支持 topic ID，并使未指定 replication factor 时遵循集群默认值。
+
+### P2：扩大原版工具覆盖面
+
+优先考虑 `kafka-features.sh`、`kafka-metadata-quorum.sh`、`kafka-transactions.sh`、`kafka-delegation-tokens.sh` 和 `kafka-client-metrics.sh`。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
+
+## 10. 最终评估
+
+当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
+
+在对外发布时，建议使用“兼容 13 个常用 Kafka CLI 入口的 Rust 工具”表述，不应使用“100% 兼容 Apache Kafka CLI”。完成 P0 和 P1 后，才适合将已覆盖的 13 个脚本声明为主要功能兼容。
