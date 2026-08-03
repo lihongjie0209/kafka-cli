@@ -638,6 +638,20 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("integration-suite")
     );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "groups",
+                "describe",
+                "--group",
+                "integration-suite",
+                "--state",
+                "--verbose",
+            ]
+        )
+        .contains("GROUP_EPOCH")
+    );
     let verbose_members = success(
         &bootstrap,
         &[
@@ -649,6 +663,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--verbose",
         ],
     );
+    assert!(verbose_members.contains("CURRENT_EPOCH"));
+    assert!(verbose_members.contains("TARGET_EPOCH"));
     assert!(verbose_members.contains("ASSIGNMENT"));
     assert!(
         success(

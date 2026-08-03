@@ -1725,7 +1725,11 @@ async fn groups(
                 GroupDescribeMode::Offsets
             };
             let groups = resolve_group_names(config, timeout, &group, all_groups)?;
-            describe_group_details(config, timeout, format, &groups, mode, verbose)
+            let protocol = GroupProtocolContext {
+                bootstrap,
+                command_config,
+            };
+            describe_group_details(config, protocol, timeout, format, &groups, mode, verbose).await
         }
         GroupAction::Delete {
             group,
@@ -2139,8 +2143,43 @@ struct GroupMemberRow {
     client_id: String,
     host: String,
     partitions: usize,
+    current_epoch: Option<i32>,
     assignment: String,
+    target_epoch: Option<i32>,
     target_assignment: String,
+}
+
+#[derive(Default)]
+struct ProtocolGroupEpochs {
+    group_epoch: Option<i32>,
+    target_assignment_epoch: Option<i32>,
+    member_epochs: BTreeMap<String, Option<i32>>,
+}
+
+async fn protocol_group_epochs(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    groups: &[String],
+) -> Result<BTreeMap<String, ProtocolGroupEpochs>> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let descriptions = client.describe_consumer_groups(groups.to_vec()).await?;
+    drop(client);
+    Ok(descriptions
+        .into_iter()
+        .map(|description| {
+            let epochs = ProtocolGroupEpochs {
+                group_epoch: description.group_epoch,
+                target_assignment_epoch: description.assignment_epoch,
+                member_epochs: description
+                    .members
+                    .into_iter()
+                    .map(|member| (member.member_id, member.member_epoch))
+                    .collect(),
+            };
+            (description.group_id, epochs)
+        })
+        .collect())
 }
 
 #[derive(Clone, Copy)]
@@ -2150,8 +2189,15 @@ enum GroupDescribeMode {
     State,
 }
 
-fn describe_group_details(
+#[derive(Clone, Copy)]
+struct GroupProtocolContext<'a> {
+    bootstrap: &'a str,
+    command_config: Option<&'a Path>,
+}
+
+async fn describe_group_details(
     config: &rdkafka::ClientConfig,
+    protocol: GroupProtocolContext<'_>,
     timeout: Duration,
     format: OutputFormat,
     groups: &[String],
@@ -2163,10 +2209,28 @@ fn describe_group_details(
     }
     match mode {
         GroupDescribeMode::State => {
-            return describe_groups(config, timeout, format, groups);
+            return describe_groups(
+                config,
+                protocol.bootstrap,
+                protocol.command_config,
+                timeout,
+                format,
+                groups,
+                verbose,
+            )
+            .await;
         }
         GroupDescribeMode::Members => {
-            return describe_group_members(config, timeout, format, groups, verbose);
+            return describe_group_members(
+                config,
+                protocol.bootstrap,
+                protocol.command_config,
+                timeout,
+                format,
+                groups,
+                verbose,
+            )
+            .await;
         }
         GroupDescribeMode::Offsets => {}
     }
@@ -2271,8 +2335,10 @@ fn group_offsets_table(rows: &[GroupOffsetRow], verbose: bool) -> String {
     }
 }
 
-fn describe_group_members(
+async fn describe_group_members(
     config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
     groups: &[String],
@@ -2281,9 +2347,25 @@ fn describe_group_members(
     let client = admin(config)?;
     let groups =
         ffi::describe_consumer_groups(client.inner().native_ptr(), groups, duration_ms(timeout)?)?;
+    drop(client);
+    let epochs = if verbose {
+        protocol_group_epochs(
+            bootstrap,
+            command_config,
+            timeout,
+            &groups
+                .iter()
+                .map(|group| group.group.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await?
+    } else {
+        BTreeMap::new()
+    };
     let rows = groups
         .iter()
         .flat_map(|description| {
+            let group_epochs = epochs.get(&description.group);
             description
                 .members
                 .iter()
@@ -2294,7 +2376,11 @@ fn describe_group_members(
                     client_id: member.client_id.clone(),
                     host: member.host.clone(),
                     partitions: member.assignment.len(),
+                    current_epoch: group_epochs
+                        .and_then(|group| group.member_epochs.get(&member.member_id).copied())
+                        .flatten(),
                     assignment: group_partitions(&member.assignment),
+                    target_epoch: group_epochs.and_then(|group| group.target_assignment_epoch),
                     target_assignment: group_partitions(&member.target_assignment),
                 })
         })
@@ -2314,7 +2400,9 @@ fn group_members_table(rows: &[GroupMemberRow], verbose: bool) -> String {
                 "CLIENT_ID",
                 "HOST",
                 "PARTITIONS",
+                "CURRENT_EPOCH",
                 "ASSIGNMENT",
+                "TARGET_EPOCH",
                 "TARGET_ASSIGNMENT",
             ],
             rows.iter().map(|row| {
@@ -2325,7 +2413,11 @@ fn group_members_table(rows: &[GroupMemberRow], verbose: bool) -> String {
                     row.client_id.clone(),
                     row.host.clone(),
                     row.partitions.to_string(),
+                    row.current_epoch
+                        .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
                     row.assignment.clone(),
+                    row.target_epoch
+                        .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
                     row.target_assignment.clone(),
                 ]
             }),
@@ -2369,16 +2461,90 @@ fn group_offset_lag(committed_offset: i64, log_end_offset: Option<i64>) -> Optio
         .map(|end| end.saturating_sub(committed_offset).max(0))
 }
 
-fn describe_groups(
+#[derive(Serialize)]
+struct GroupStateRow {
+    group: String,
+    group_type: String,
+    state: String,
+    assignor: String,
+    members: usize,
+    coordinator_id: i32,
+    coordinator: String,
+    group_epoch: Option<i32>,
+    target_assignment_epoch: Option<i32>,
+}
+
+async fn describe_groups(
     config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
     groups: &[String],
+    verbose: bool,
 ) -> Result<()> {
     let client = admin(config)?;
-    let rows =
+    let descriptions =
         ffi::describe_consumer_groups(client.inner().native_ptr(), groups, duration_ms(timeout)?)?;
+    drop(client);
+    let epochs = if verbose {
+        protocol_group_epochs(bootstrap, command_config, timeout, groups).await?
+    } else {
+        BTreeMap::new()
+    };
+    let rows = descriptions
+        .into_iter()
+        .map(|description| {
+            let epoch = epochs.get(&description.group);
+            GroupStateRow {
+                group: description.group,
+                group_type: description.group_type,
+                state: description.state,
+                assignor: description.assignor,
+                members: description.members.len(),
+                coordinator_id: description.coordinator_id,
+                coordinator: description.coordinator,
+                group_epoch: epoch.and_then(|value| value.group_epoch),
+                target_assignment_epoch: epoch.and_then(|value| value.target_assignment_epoch),
+            }
+        })
+        .collect::<Vec<_>>();
     output::write_value(format, "groups.describe.state", &rows, |rows| {
+        group_states_table(rows, verbose)
+    })
+}
+
+fn group_states_table(rows: &[GroupStateRow], verbose: bool) -> String {
+    if verbose {
+        output::table(
+            [
+                "GROUP",
+                "TYPE",
+                "STATE",
+                "ASSIGNOR",
+                "GROUP_EPOCH",
+                "TARGET_ASSIGNMENT_EPOCH",
+                "MEMBERS",
+                "COORDINATOR_ID",
+                "COORDINATOR",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.group_type.clone(),
+                    row.state.clone(),
+                    row.assignor.clone(),
+                    row.group_epoch
+                        .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
+                    row.target_assignment_epoch
+                        .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
+                    row.members.to_string(),
+                    row.coordinator_id.to_string(),
+                    row.coordinator.clone(),
+                ]
+            }),
+        )
+    } else {
         output::table(
             [
                 "GROUP",
@@ -2395,13 +2561,13 @@ fn describe_groups(
                     row.group_type.clone(),
                     row.state.clone(),
                     row.assignor.clone(),
-                    row.members.len().to_string(),
+                    row.members.to_string(),
                     row.coordinator_id.to_string(),
                     row.coordinator.clone(),
                 ]
             }),
         )
-    })
+    }
 }
 
 #[expect(
@@ -7952,6 +8118,47 @@ mod tests {
             parse_group_states("NotReady"),
             Err(Error::Usage(message)) if message.contains("NotReady")
         ));
+    }
+
+    #[test]
+    fn group_state_verbose_table_should_include_consumer_protocol_epochs() {
+        let table = group_states_table(
+            &[GroupStateRow {
+                group: "orders".into(),
+                group_type: "Consumer".into(),
+                state: "Stable".into(),
+                assignor: "uniform".into(),
+                members: 1,
+                coordinator_id: 1,
+                coordinator: "broker:9092".into(),
+                group_epoch: Some(7),
+                target_assignment_epoch: Some(6),
+            }],
+            true,
+        );
+
+        assert!(table.contains("GROUP_EPOCH") && table.contains('7'));
+    }
+
+    #[test]
+    fn group_member_verbose_table_should_include_current_and_target_epochs() {
+        let table = group_members_table(
+            &[GroupMemberRow {
+                group: "orders".into(),
+                member_id: "member-1".into(),
+                instance_id: None,
+                client_id: "client-1".into(),
+                host: "/127.0.0.1".into(),
+                partitions: 1,
+                current_epoch: Some(9),
+                assignment: "orders:0".into(),
+                target_epoch: Some(8),
+                target_assignment: "orders:0".into(),
+            }],
+            true,
+        );
+
+        assert!(table.contains("CURRENT_EPOCH") && table.contains('9'));
     }
 
     #[test]
