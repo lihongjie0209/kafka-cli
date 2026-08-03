@@ -20,7 +20,7 @@ use rdkafka::{
         ResourceSpecifier, TopicReplication,
     },
     client::DefaultClientContext,
-    consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer},
+    consumer::{BaseConsumer, Consumer, StreamConsumer},
     message::{BorrowedHeaders, Header, Headers, OwnedHeaders},
     producer::{FutureProducer, FutureRecord},
     topic_partition_list::TopicPartitionList,
@@ -1189,7 +1189,7 @@ fn reset_offsets(
     } else {
         None
     };
-    let mut offsets = TopicPartitionList::new();
+    let mut planned_offsets = Vec::with_capacity(topic.partitions().len());
     for partition in topic.partitions() {
         let (low, high) = consumer.fetch_watermarks(&args.topic, partition.id(), timeout)?;
         let target = if args.to_earliest {
@@ -1228,10 +1228,16 @@ fn reset_offsets(
             return Err(Error::Usage("choose one reset target".into()));
         };
         println!("{}:{} -> {}", args.topic, partition.id(), target);
-        offsets.add_partition_offset(&args.topic, partition.id(), Offset::Offset(target))?;
+        planned_offsets.push((args.topic.clone(), partition.id(), target));
     }
     if args.execute {
-        consumer.commit(&offsets, CommitMode::Sync)?;
+        let admin = admin(&config)?;
+        ffi::alter_consumer_group_offsets(
+            admin.inner().native_ptr(),
+            &args.group,
+            &planned_offsets,
+            duration_ms(timeout)?,
+        )?;
     }
     Ok(())
 }

@@ -79,6 +79,13 @@ impl Drop for ListGroupOffsets {
     }
 }
 
+struct AlterGroupOffsets(*mut sys::rd_kafka_AlterConsumerGroupOffsets_t);
+impl Drop for AlterGroupOffsets {
+    fn drop(&mut self) {
+        unsafe { sys::rd_kafka_AlterConsumerGroupOffsets_destroy(self.0) };
+    }
+}
+
 struct NativeAcl(*mut sys::rd_kafka_AclBinding_t);
 impl Drop for NativeAcl {
     fn drop(&mut self) {
@@ -1581,6 +1588,104 @@ pub fn list_consumer_group_offsets(
         });
     }
     Ok(rows)
+}
+
+/// Alters committed offsets for one consumer group through librdkafka Admin API.
+pub fn alter_consumer_group_offsets(
+    client: *mut sys::rd_kafka_t,
+    group: &str,
+    offsets: &[(String, i32, i64)],
+    timeout_ms: i32,
+) -> Result<()> {
+    let group = CString::new(group)
+        .map_err(|_| Error::Usage("consumer group contains a NUL byte".into()))?;
+    let capacity = i32::try_from(offsets.len())
+        .map_err(|_| Error::Usage("too many consumer-group offsets".into()))?;
+    let list = unsafe { sys::rd_kafka_topic_partition_list_new(capacity) };
+    if list.is_null() {
+        return Err(Error::Config(
+            "failed to allocate consumer-group offset list".into(),
+        ));
+    }
+    let list = PartitionList(list);
+    for (topic, partition, offset) in offsets {
+        let topic = CString::new(topic.as_str())
+            .map_err(|_| Error::Usage("topic contains a NUL byte".into()))?;
+        let element =
+            unsafe { sys::rd_kafka_topic_partition_list_add(list.0, topic.as_ptr(), *partition) };
+        if element.is_null() {
+            return Err(Error::Config(
+                "failed to add a consumer-group offset".into(),
+            ));
+        }
+        unsafe { (*element).offset = *offset };
+    }
+    let request = unsafe { sys::rd_kafka_AlterConsumerGroupOffsets_new(group.as_ptr(), list.0) };
+    if request.is_null() {
+        return Err(Error::Config(
+            "failed to construct AlterConsumerGroupOffsets request".into(),
+        ));
+    }
+    let request = AlterGroupOffsets(request);
+    let mut requests = [request.0];
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_ALTERCONSUMERGROUPOFFSETS,
+        timeout_ms,
+    )?;
+    unsafe {
+        sys::rd_kafka_AlterConsumerGroupOffsets(
+            client,
+            requests.as_mut_ptr(),
+            requests.len(),
+            options.0,
+            queue.0,
+        );
+    }
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_AlterConsumerGroupOffsets_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid AlterConsumerGroupOffsets response".into(),
+        ));
+    }
+    let mut count = 0;
+    let groups =
+        unsafe { sys::rd_kafka_AlterConsumerGroupOffsets_result_groups(result, &raw mut count) };
+    if count > 0 && groups.is_null() {
+        return Err(Error::Config(
+            "broker returned a null altered group-offset array".into(),
+        ));
+    }
+    for index in 0..count {
+        let group = unsafe { *groups.add(index) };
+        if group.is_null() {
+            return Err(Error::Config(
+                "broker returned a null altered group-offset result".into(),
+            ));
+        }
+        let error = unsafe { sys::rd_kafka_group_result_error(group) };
+        if native_error_failed(error) {
+            return Err(Error::Config(unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            }));
+        }
+        let partitions = unsafe { sys::rd_kafka_group_result_partitions(group) };
+        if !partitions.is_null() {
+            let partition_count = usize::try_from(unsafe { (*partitions).cnt })
+                .map_err(|_| Error::Config("invalid altered offset count".into()))?;
+            for partition_index in 0..partition_count {
+                let partition = unsafe { &*(*partitions).elems.add(partition_index) };
+                if partition.err != sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR {
+                    return Err(Error::Config(unsafe {
+                        c_string(sys::rd_kafka_err2str(partition.err))
+                    }));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Triggers preferred or unclean leader election for one partition or all partitions.
