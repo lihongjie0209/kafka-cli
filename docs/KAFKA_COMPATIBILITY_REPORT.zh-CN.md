@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `f76d8c8bc38bd8688f7fb190fc2867d30d224a10`。
+- 本项目基准：`master`，提交 `ec8ae4aab6851b8d5ba38afdbefda88bf3a90a0f`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -59,7 +59,7 @@
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group，以及 librdkafka SCRAM user credential；缺少其他 entity type |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
-| `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流与安全参数，缺 throttle 自动清理/preserve |
+| `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流/安全参数及 verify/cancel throttle 生命周期；缺 controller 模式 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件、预览、执行 |
 | `kafka-leader-election.sh` | `kafka leader-election` | 已支持 | preferred/unclean、单分区、JSON 文件批量选择或全部分区 |
 | `kafka-log-dirs.sh` | `kafka log-dirs` | 已支持 | broker/topic 过滤与目录、大小、lag 展示 |
@@ -169,9 +169,9 @@
 
 ### 4.8 Partition Reassignment
 
-已支持：generate、execute、verify、cancel、list；topics-to-move 与 reassignment JSON；broker list；rack-aware/disable-rack-aware；log directory relocation；预览与 `--execute`。execute 支持原版 `--additional` 的全局活动迁移保护、`--disallow-replication-factor-change` 的逐分区复制因子校验、`--throttle` 的 topic/broker leader/follower replication throttle，以及 `--replica-alter-log-dirs-throttle` 的 broker log-dir throttle。throttle 通过 librdkafka `IncrementalAlterConfigs` 写入，并把已有迁移和新增计划合并计算 source/destination replicas。
+已支持：generate、execute、verify、cancel、list；topics-to-move 与 reassignment JSON；broker list；rack-aware/disable-rack-aware；log directory relocation；预览与 `--execute`。execute 支持原版 `--additional` 的全局活动迁移保护、`--disallow-replication-factor-change` 的逐分区复制因子校验、`--throttle` 的 topic/broker leader/follower replication throttle，以及 `--replica-alter-log-dirs-throttle` 的 broker log-dir throttle。throttle 通过 librdkafka `IncrementalAlterConfigs` 写入，并把已有迁移和新增计划合并计算 source/destination replicas。verify 在全局 partition reassignment 与目标 log-dir move 均结束后自动清理 throttle；cancel 成功后也会清理；两者均支持 `--preserve-throttles` 跳过清理。
 
-缺少：verify/cancel 的 `--preserve-throttles` 以及自动清理 throttle、bootstrap-controller。生成算法目标与原版一致，但不承诺在相同输入下产生逐字节相同 assignment。
+缺少：bootstrap-controller。生成算法目标与原版一致，但不承诺在相同输入下产生逐字节相同 assignment。
 
 ### 4.9 Delete Records
 
@@ -253,7 +253,7 @@ CI workflow 包含：
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
 上一个实现基准 `c36a3e9` 的 GitHub Actions 运行记录
-[`30826585429`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30826585429) 已全部通过：fmt/Clippy/单元测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。当前 reassignment 增强提交 `f76d8c8` 的最终状态以对应 CI 运行记录为准。
+[`30826585429`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30826585429) 已全部通过：fmt/Clippy/单元测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。当前 reassignment 增强提交 `ec8ae4a` 的最终状态以对应 CI 运行记录为准。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -269,7 +269,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 ### P1：补齐已支持脚本的主要差距
 
 1. Configs 增加 user、client、IP、broker-logger、client-metrics 和 default entity。
-2. Reassignment 增加 verify/cancel 的 preserve-throttles 和安全的 throttle 自动清理。
+2. Reassignment 增加 bootstrap-controller，并补多 broker 长时间迁移的限流差分测试。
 3. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
 4. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
 
@@ -304,7 +304,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | configs | 完整 | 低/中 | 中 | topic/broker/group/SCRAM 可用，entity 覆盖明显不足 |
 | get-offsets | 单动作 | 高 | 中 | 查询能力较完整，缺分层存储相关 OffsetSpec |
 | acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
-| reassign-partitions | 完整 | 中/高 | 中 | 支持追加迁移、复制因子保护和两类生产限流；仍缺 throttle 自动清理/preserve 与 controller |
+| reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；仍缺 controller |
 | delete-records | 单动作 | 高 | 高/中 | 核心功能完整，额外 `--execute` 是安全差异 |
 | leader-election | 单动作 | 高 | 高/中 | 核心功能完整，额外 `--execute` 是安全差异 |
 | log-dirs | 单动作 | 高 | 高/中 | 常用 describe 能力完整 |
@@ -344,6 +344,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Reassignment partial failure | execute/cancel 将 top-level 和 partition error 映射到具体 mutation 行；AlterReplicaLogDirs 错误包含 broker/topic/partition，不再只返回汇总数量 | all-features Clippy、67 个普通测试、Kafka 4.3.1 失败请求 JSON 与非零退出码集成测试通过 |
 | 2026-08-03 | Console 默认 reader/formatter property | 完整实现原版默认 LineMessageReader 的 8 个解析属性，以及 DefaultMessageFormatter 的 12 个输出属性；保留 header 顺序/重复 key 和原始消息 bytes，Java class/deserializer 明确 unsupported | all-features Clippy、69 个普通测试、Kafka 4.3.1 header/key/null/separator 数据闭环通过 |
 | 2026-08-03 | Reassignment 安全与限流 | execute 新增 additional 全局活动迁移保护、复制因子变化保护，以及 inter-broker/log-dir throttle；topic/broker throttle 由 librdkafka IncrementalAlterConfigs 写入，并合并已有迁移计算限流副本集合 | all-features Clippy、73 个普通测试通过；Kafka 4.3.1 与 musl 由当前 CI 验证 |
+| 2026-08-03 | Reassignment throttle 生命周期 | verify 同时核对全局活动 partition reassignment 与目标 future log-dir replica，结束后清理目标 topic、集群及计划 broker 的全部 throttle；cancel 成功后同样清理，preserve-throttles 可显式保留 | all-features Clippy、73 个普通测试通过；Kafka 4.3.1 集成增加设置→describe→verify→清理闭环 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
