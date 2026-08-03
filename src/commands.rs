@@ -11,6 +11,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::{Buf, BufMut, BytesMut};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
 use krafka::protocol::{
@@ -41,8 +42,8 @@ use crate::{
     cli::{
         AclAction, Cli, ClientMetricsAction, ClusterAction, Command, ConfigAction,
         ConfigEntityArgs, ConfigEntityType, DescribeTopicArgs, ElectionType, FeatureAction,
-        GroupAction, ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs, TopicAction,
-        TransactionAction,
+        GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime, ReassignAction,
+        ResetOffsetsArgs, TopicAction, TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -95,6 +96,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
         )
     {
         return features_local(cli.output, &args.action);
+    }
+    if let Command::MetadataQuorum(args) = &cli.command
+        && args.bootstrap_controller.is_some()
+    {
+        return Err(Error::Unsupported(
+            "--bootstrap-controller requires controller-listener bootstrap, which the current native client does not expose"
+                .into(),
+        ));
     }
     if let Command::Features(args) = &cli.command
         && args.bootstrap_controller.is_some()
@@ -205,6 +214,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Transactions(args) => {
             transactions(
                 &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                &args.action,
+            )
+            .await
+        }
+        Command::MetadataQuorum(args) => {
+            metadata_quorum(
                 bootstrap,
                 command_config.as_deref(),
                 timeout,
@@ -4435,6 +4454,732 @@ async fn transactions(
                             row.duration_minutes.to_string(),
                         ]
                     }),
+                )
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QuorumReplica {
+    node_id: i32,
+    directory_id: String,
+    log_end_offset: i64,
+    last_fetch_timestamp: Option<i64>,
+    last_caught_up_timestamp: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct QuorumNode {
+    node_id: i32,
+    endpoints: Vec<String>,
+}
+
+#[derive(Debug)]
+struct QuorumDescription {
+    leader_id: i32,
+    leader_epoch: i32,
+    high_watermark: i64,
+    voters: Vec<QuorumReplica>,
+    observers: Vec<QuorumReplica>,
+    nodes: Vec<QuorumNode>,
+}
+
+fn decode_unsigned_varint(buffer: &mut impl Buf) -> Result<usize> {
+    let mut value = 0usize;
+    for shift in (0..35).step_by(7) {
+        if !buffer.has_remaining() {
+            return Err(Error::Config("truncated unsigned varint".into()));
+        }
+        let byte = buffer.get_u8();
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(Error::Config("unsigned varint is too long".into()))
+}
+
+fn decode_compact_len(buffer: &mut impl Buf) -> Result<usize> {
+    decode_unsigned_varint(buffer)?
+        .checked_sub(1)
+        .ok_or_else(|| Error::Config("unexpected null compact value".into()))
+}
+
+fn decode_compact_string(buffer: &mut impl Buf) -> Result<String> {
+    let length = decode_compact_len(buffer)?;
+    if buffer.remaining() < length {
+        return Err(Error::Config("truncated compact string".into()));
+    }
+    String::from_utf8(buffer.copy_to_bytes(length).to_vec())
+        .map_err(|error| Error::Config(format!("invalid UTF-8: {error}")))
+}
+
+fn decode_nullable_compact_string(buffer: &mut impl Buf) -> Result<Option<String>> {
+    let encoded = decode_unsigned_varint(buffer)?;
+    if encoded == 0 {
+        return Ok(None);
+    }
+    let length = encoded - 1;
+    if buffer.remaining() < length {
+        return Err(Error::Config("truncated nullable compact string".into()));
+    }
+    String::from_utf8(buffer.copy_to_bytes(length).to_vec())
+        .map(Some)
+        .map_err(|error| Error::Config(format!("invalid UTF-8: {error}")))
+}
+
+fn skip_tagged_fields(buffer: &mut impl Buf) -> Result<()> {
+    let count = decode_unsigned_varint(buffer)?;
+    for _ in 0..count {
+        let _tag = decode_unsigned_varint(buffer)?;
+        let size = decode_unsigned_varint(buffer)?;
+        if buffer.remaining() < size {
+            return Err(Error::Config("truncated tagged field".into()));
+        }
+        buffer.advance(size);
+    }
+    Ok(())
+}
+
+fn decode_kafka_uuid(buffer: &mut impl Buf) -> Result<String> {
+    if buffer.remaining() < 16 {
+        return Err(Error::Config("truncated Kafka UUID".into()));
+    }
+    Ok(URL_SAFE_NO_PAD.encode(buffer.copy_to_bytes(16)))
+}
+
+fn decode_quorum_replicas(buffer: &mut impl Buf, version: i16) -> Result<Vec<QuorumReplica>> {
+    let count = decode_compact_len(buffer)?;
+    let mut replicas = Vec::with_capacity(count);
+    for _ in 0..count {
+        if buffer.remaining() < 4 {
+            return Err(Error::Config("truncated quorum replica".into()));
+        }
+        let node_id = buffer.get_i32();
+        let directory_id = if version >= 2 {
+            decode_kafka_uuid(buffer)?
+        } else {
+            ZERO_TOPIC_ID.into()
+        };
+        if buffer.remaining() < 8 {
+            return Err(Error::Config("truncated quorum replica offset".into()));
+        }
+        let log_end_offset = buffer.get_i64();
+        let (last_fetch_timestamp, last_caught_up_timestamp) = if version >= 1 {
+            if buffer.remaining() < 16 {
+                return Err(Error::Config("truncated quorum replica timestamps".into()));
+            }
+            let fetch = buffer.get_i64();
+            let caught_up = buffer.get_i64();
+            (
+                (fetch >= 0).then_some(fetch),
+                (caught_up >= 0).then_some(caught_up),
+            )
+        } else {
+            (None, None)
+        };
+        skip_tagged_fields(buffer)?;
+        replicas.push(QuorumReplica {
+            node_id,
+            directory_id,
+            log_end_offset,
+            last_fetch_timestamp,
+            last_caught_up_timestamp,
+        });
+    }
+    Ok(replicas)
+}
+
+fn decode_quorum_response(mut buffer: impl Buf, version: i16) -> Result<QuorumDescription> {
+    if buffer.remaining() < 2 {
+        return Err(Error::Config("truncated DescribeQuorum response".into()));
+    }
+    let top_error = buffer.get_i16();
+    let top_message = if version >= 2 {
+        decode_nullable_compact_string(&mut buffer)?
+    } else {
+        None
+    };
+    if top_error != 0 {
+        return Err(Error::Config(top_message.unwrap_or_else(|| {
+            format!("DescribeQuorum failed with error code {top_error}")
+        })));
+    }
+    let topic_count = decode_compact_len(&mut buffer)?;
+    let mut description = None;
+    for _ in 0..topic_count {
+        let topic = decode_compact_string(&mut buffer)?;
+        let partition_count = decode_compact_len(&mut buffer)?;
+        for _ in 0..partition_count {
+            if buffer.remaining() < 6 {
+                return Err(Error::Config("truncated quorum partition".into()));
+            }
+            let partition = buffer.get_i32();
+            let error_code = buffer.get_i16();
+            let error_message = if version >= 2 {
+                decode_nullable_compact_string(&mut buffer)?
+            } else {
+                None
+            };
+            if error_code != 0 {
+                return Err(Error::Config(error_message.unwrap_or_else(|| {
+                    format!(
+                        "DescribeQuorum failed for {topic}-{partition}: error code {error_code}"
+                    )
+                })));
+            }
+            if buffer.remaining() < 16 {
+                return Err(Error::Config("truncated quorum partition state".into()));
+            }
+            let leader_id = buffer.get_i32();
+            let leader_epoch = buffer.get_i32();
+            let high_watermark = buffer.get_i64();
+            let voters = decode_quorum_replicas(&mut buffer, version)?;
+            let observers = decode_quorum_replicas(&mut buffer, version)?;
+            skip_tagged_fields(&mut buffer)?;
+            if topic == "__cluster_metadata" && partition == 0 {
+                description = Some(QuorumDescription {
+                    leader_id,
+                    leader_epoch,
+                    high_watermark,
+                    voters,
+                    observers,
+                    nodes: Vec::new(),
+                });
+            }
+        }
+        skip_tagged_fields(&mut buffer)?;
+    }
+    let mut nodes = Vec::new();
+    if version >= 2 {
+        for _ in 0..decode_compact_len(&mut buffer)? {
+            if buffer.remaining() < 4 {
+                return Err(Error::Config("truncated quorum node".into()));
+            }
+            let node_id = buffer.get_i32();
+            let mut endpoints = Vec::new();
+            for _ in 0..decode_compact_len(&mut buffer)? {
+                let name = decode_compact_string(&mut buffer)?;
+                let host = decode_compact_string(&mut buffer)?;
+                if buffer.remaining() < 2 {
+                    return Err(Error::Config("truncated quorum listener port".into()));
+                }
+                let port = buffer.get_u16();
+                skip_tagged_fields(&mut buffer)?;
+                let host = if host.contains(':') {
+                    format!("[{host}]")
+                } else {
+                    host
+                };
+                endpoints.push(format!("{name}://{host}:{port}"));
+            }
+            skip_tagged_fields(&mut buffer)?;
+            nodes.push(QuorumNode { node_id, endpoints });
+        }
+    }
+    skip_tagged_fields(&mut buffer)?;
+    let mut description = description
+        .ok_or_else(|| Error::Config("metadata quorum partition was not returned".into()))?;
+    description.nodes = nodes;
+    Ok(description)
+}
+
+async fn describe_metadata_quorum(
+    client: &krafka::admin::AdminClient,
+) -> Result<QuorumDescription> {
+    let connection = client.get_controller_connection().await?;
+    let version = connection
+        .negotiate_api_version(ApiKey::DescribeQuorum, 2, 0)
+        .await
+        .ok_or_else(|| Error::Unsupported("controller does not support DescribeQuorum".into()))?;
+    let request = krafka::protocol::DescribeQuorumRequest {
+        topics: vec![krafka::protocol::DescribeQuorumTopicRequest {
+            topic_name: "__cluster_metadata".into(),
+            partitions: vec![krafka::protocol::DescribeQuorumPartitionRequest {
+                partition_index: 0,
+            }],
+        }],
+    };
+    let bytes = connection
+        .send_request(ApiKey::DescribeQuorum, version, |buffer| {
+            request.encode_v0(buffer)
+        })
+        .await?;
+    drop(connection);
+    decode_quorum_response(bytes, version)
+}
+
+fn encode_unsigned_varint(mut value: usize, buffer: &mut BytesMut) {
+    loop {
+        let mut byte = u8::try_from(value & 0x7f).unwrap_or_default();
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buffer.put_u8(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+fn encode_compact_string(value: &str, buffer: &mut BytesMut) {
+    encode_unsigned_varint(value.len() + 1, buffer);
+    buffer.put_slice(value.as_bytes());
+}
+
+fn encode_nullable_compact_string(value: Option<&str>, buffer: &mut BytesMut) {
+    if let Some(value) = value {
+        encode_compact_string(value, buffer);
+    } else {
+        buffer.put_u8(0);
+    }
+}
+
+fn parse_kafka_uuid(value: &str, field: &str) -> Result<[u8; 16]> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|error| Error::Usage(format!("failed to parse {field}: {error}")))?;
+    decoded
+        .try_into()
+        .map_err(|_| Error::Usage(format!("failed to parse {field}: expected a Kafka UUID")))
+}
+
+#[derive(Debug, Clone)]
+struct ControllerEndpoint {
+    name: String,
+    host: String,
+    port: u16,
+}
+
+fn parse_controller_endpoint(value: &str) -> Result<ControllerEndpoint> {
+    let (name, address) = value
+        .split_once("://")
+        .ok_or_else(|| Error::Config(format!("invalid controller listener: {value}")))?;
+    let (host, port) = address
+        .rsplit_once(':')
+        .ok_or_else(|| Error::Config(format!("controller listener has no port: {value}")))?;
+    let host = host.trim_matches(['[', ']']);
+    let port = port
+        .parse::<u16>()
+        .map_err(|error| Error::Config(format!("invalid controller listener port: {error}")))?;
+    Ok(ControllerEndpoint {
+        name: name.to_ascii_uppercase(),
+        host: if host.is_empty() {
+            "localhost".into()
+        } else {
+            host.into()
+        },
+        port,
+    })
+}
+
+fn controller_from_properties(path: &Path) -> Result<(i32, [u8; 16], Vec<ControllerEndpoint>)> {
+    let properties = config::load_properties(path)?;
+    let controller_id = properties
+        .get("node.id")
+        .ok_or_else(|| Error::Config("node.id not found in controller configuration".into()))?
+        .parse::<i32>()
+        .map_err(|error| Error::Config(format!("invalid node.id: {error}")))?;
+    if controller_id < 0 {
+        return Err(Error::Config("node.id was negative".into()));
+    }
+    if !properties
+        .get("process.roles")
+        .is_some_and(|roles| roles.split(',').any(|role| role.trim() == "controller"))
+    {
+        return Err(Error::Config(
+            "process.roles did not contain controller".into(),
+        ));
+    }
+    let metadata_directory = properties
+        .get("metadata.log.dir")
+        .cloned()
+        .or_else(|| {
+            properties
+                .get("log.dirs")
+                .and_then(|dirs| dirs.split(',').next().map(str::trim).map(str::to_owned))
+        })
+        .ok_or_else(|| Error::Config("neither metadata.log.dir nor log.dirs was found".into()))?;
+    let meta_properties =
+        config::load_properties(&Path::new(&metadata_directory).join("meta.properties"))?;
+    let directory_id = parse_kafka_uuid(
+        meta_properties
+            .get("directory.id")
+            .ok_or_else(|| Error::Config("directory.id not found in meta.properties".into()))?,
+        "directory.id",
+    )?;
+    let listener_names = properties
+        .get("controller.listener.names")
+        .ok_or_else(|| Error::Config("controller.listener.names was not found".into()))?
+        .split(',')
+        .map(|name| name.trim().to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    let mut listeners = BTreeMap::new();
+    for key in ["listeners", "advertised.listeners"] {
+        if let Some(values) = properties.get(key) {
+            for value in values.split(',') {
+                let endpoint = parse_controller_endpoint(value.trim())?;
+                listeners.insert(endpoint.name.clone(), endpoint);
+            }
+        }
+    }
+    let endpoints = listener_names
+        .into_iter()
+        .map(|name| {
+            listeners.get(&name).cloned().ok_or_else(|| {
+                Error::Config(format!(
+                    "cannot find controller listener information for {name}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((controller_id, directory_id, endpoints))
+}
+
+async fn alter_raft_voter(
+    client: &krafka::admin::AdminClient,
+    api_key: i16,
+    timeout: Duration,
+    encode: impl FnOnce(&mut BytesMut, i16),
+) -> Result<()> {
+    let connection = client.get_controller_connection().await?;
+    let key = ApiKey::Unknown(api_key);
+    let maximum = i16::from(api_key == 80);
+    let version = connection
+        .negotiate_api_version(key, maximum, 0)
+        .await
+        .ok_or_else(|| Error::Unsupported(format!("controller does not support API {api_key}")))?;
+    let mut bytes = connection
+        .send_request_with_timeout(key, version, timeout, |buffer| {
+            encode(buffer, version);
+            Ok(())
+        })
+        .await?;
+    drop(connection);
+    if bytes.remaining() < 6 {
+        return Err(Error::Config("truncated raft voter response".into()));
+    }
+    let _throttle_time_ms = bytes.get_i32();
+    let error_code = bytes.get_i16();
+    let message = decode_nullable_compact_string(&mut bytes)?;
+    skip_tagged_fields(&mut bytes)?;
+    if error_code != 0 {
+        return Err(Error::Config(message.unwrap_or_else(|| {
+            format!("raft voter request failed with error code {error_code}")
+        })));
+    }
+    Ok(())
+}
+
+fn relative_timestamp(timestamp: Option<i64>, human_readable: bool, now: i64) -> Result<String> {
+    let Some(timestamp) = timestamp else {
+        return Ok("-1".into());
+    };
+    if !human_readable {
+        return Ok(timestamp.to_string());
+    }
+    if timestamp <= 0 || timestamp > now {
+        return Err(Error::Config(format!(
+            "cannot compute relative quorum timestamp {timestamp}; possible system clock drift"
+        )));
+    }
+    Ok(format!("{} ms ago", now - timestamp))
+}
+
+#[derive(Debug, Serialize)]
+struct QuorumReplicationRow {
+    node_id: i32,
+    directory_id: String,
+    log_end_offset: i64,
+    lag: i64,
+    last_fetch_timestamp: String,
+    last_caught_up_timestamp: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct QuorumMutationRow {
+    action: String,
+    controller_id: i32,
+    directory_id: String,
+    endpoints: Vec<String>,
+    dry_run: bool,
+}
+
+fn quorum_member_json(description: &QuorumDescription, members: &[QuorumReplica]) -> String {
+    let values = members
+        .iter()
+        .map(|member| {
+            let endpoints = description
+                .nodes
+                .iter()
+                .find(|node| node.node_id == member.node_id)
+                .map_or(&[][..], |node| node.endpoints.as_slice());
+            serde_json::json!({
+                "id": member.node_id,
+                "directoryId": (member.directory_id != ZERO_TOPIC_ID).then_some(&member.directory_id),
+                "endpoints": endpoints,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&values).unwrap_or_else(|_| "[]".into())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening,
+    reason = "branches mirror Kafka MetadataQuorumCommand actions and share one protocol client"
+)]
+async fn metadata_quorum(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: &MetadataQuorumAction,
+) -> Result<()> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    match action {
+        MetadataQuorumAction::Describe {
+            status,
+            replication,
+            human_readable,
+        } => {
+            let description = describe_metadata_quorum(&client).await?;
+            if *status {
+                let cluster_id = client.describe_cluster().await?.cluster_id;
+                let leader = description
+                    .voters
+                    .iter()
+                    .find(|voter| voter.node_id == description.leader_id)
+                    .ok_or_else(|| Error::Config("quorum leader was not in voter set".into()))?;
+                let slowest = description
+                    .voters
+                    .iter()
+                    .min_by_key(|voter| voter.log_end_offset)
+                    .ok_or_else(|| Error::Config("metadata quorum has no voters".into()))?;
+                let max_lag_time = if leader.node_id == slowest.node_id {
+                    0
+                } else {
+                    leader
+                        .last_caught_up_timestamp
+                        .zip(slowest.last_caught_up_timestamp)
+                        .map_or(-1, |(leader, follower)| leader - follower)
+                };
+                let rows = vec![
+                    ("ClusterId".to_owned(), cluster_id),
+                    ("LeaderId".into(), description.leader_id.to_string()),
+                    ("LeaderEpoch".into(), description.leader_epoch.to_string()),
+                    (
+                        "HighWatermark".into(),
+                        description.high_watermark.to_string(),
+                    ),
+                    (
+                        "MaxFollowerLag".into(),
+                        (leader.log_end_offset - slowest.log_end_offset).to_string(),
+                    ),
+                    ("MaxFollowerLagTimeMs".into(), max_lag_time.to_string()),
+                    (
+                        "CurrentVoters".into(),
+                        quorum_member_json(&description, &description.voters),
+                    ),
+                    (
+                        "CurrentObservers".into(),
+                        quorum_member_json(&description, &description.observers),
+                    ),
+                ];
+                output::write_value(format, "metadata-quorum.describe-status", &rows, |rows| {
+                    output::table(["FIELD", "VALUE"], rows.iter().cloned().map(Into::into))
+                })
+            } else if *replication {
+                let leader = description
+                    .voters
+                    .iter()
+                    .find(|voter| voter.node_id == description.leader_id)
+                    .ok_or_else(|| Error::Config("quorum leader was not in voter set".into()))?;
+                let now = Utc::now().timestamp_millis();
+                let mut replicas = description
+                    .voters
+                    .iter()
+                    .map(|voter| {
+                        (
+                            voter,
+                            if voter.node_id == description.leader_id {
+                                "Leader"
+                            } else {
+                                "Follower"
+                            },
+                        )
+                    })
+                    .chain(
+                        description
+                            .observers
+                            .iter()
+                            .map(|observer| (observer, "Observer")),
+                    )
+                    .collect::<Vec<_>>();
+                replicas.sort_by_key(|(replica, status)| (*status != "Leader", replica.node_id));
+                let rows = replicas
+                    .into_iter()
+                    .map(|(replica, status)| {
+                        Ok(QuorumReplicationRow {
+                            node_id: replica.node_id,
+                            directory_id: replica.directory_id.clone(),
+                            log_end_offset: replica.log_end_offset,
+                            lag: leader.log_end_offset - replica.log_end_offset,
+                            last_fetch_timestamp: relative_timestamp(
+                                replica.last_fetch_timestamp,
+                                *human_readable,
+                                now,
+                            )?,
+                            last_caught_up_timestamp: relative_timestamp(
+                                replica.last_caught_up_timestamp,
+                                *human_readable,
+                                now,
+                            )?,
+                            status: status.into(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                output::write_value(
+                    format,
+                    "metadata-quorum.describe-replication",
+                    &rows,
+                    |rows| {
+                        output::table(
+                            [
+                                "NodeId",
+                                "DirectoryId",
+                                "LogEndOffset",
+                                "Lag",
+                                "LastFetchTimestamp",
+                                "LastCaughtUpTimestamp",
+                                "Status",
+                            ],
+                            rows.iter().map(|row| {
+                                [
+                                    row.node_id.to_string(),
+                                    row.directory_id.clone(),
+                                    row.log_end_offset.to_string(),
+                                    row.lag.to_string(),
+                                    row.last_fetch_timestamp.clone(),
+                                    row.last_caught_up_timestamp.clone(),
+                                    row.status.clone(),
+                                ]
+                            }),
+                        )
+                    },
+                )
+            } else {
+                Err(Error::Usage(
+                    "one of --status or --replication is required".into(),
+                ))
+            }
+        }
+        MetadataQuorumAction::AddController { dry_run } => {
+            let path = command_config.ok_or_else(|| {
+                Error::Usage("--command-config is required for add-controller".into())
+            })?;
+            let (controller_id, directory_id, endpoints) = controller_from_properties(path)?;
+            let cluster_id = client.describe_cluster().await?.cluster_id;
+            if !dry_run {
+                alter_raft_voter(&client, 80, timeout, |buffer, version| {
+                    encode_nullable_compact_string(Some(&cluster_id), buffer);
+                    buffer.put_i32(i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX));
+                    buffer.put_i32(controller_id);
+                    buffer.put_slice(&directory_id);
+                    encode_unsigned_varint(endpoints.len() + 1, buffer);
+                    for endpoint in &endpoints {
+                        encode_compact_string(&endpoint.name, buffer);
+                        encode_compact_string(&endpoint.host, buffer);
+                        buffer.put_u16(endpoint.port);
+                        buffer.put_u8(0);
+                    }
+                    if version >= 1 {
+                        buffer.put_u8(1);
+                    }
+                    buffer.put_u8(0);
+                })
+                .await?;
+            }
+            let row = QuorumMutationRow {
+                action: "add".into(),
+                controller_id,
+                directory_id: URL_SAFE_NO_PAD.encode(directory_id),
+                endpoints: endpoints
+                    .iter()
+                    .map(|endpoint| {
+                        format!("{}://{}:{}", endpoint.name, endpoint.host, endpoint.port)
+                    })
+                    .collect(),
+                dry_run: *dry_run,
+            };
+            output::write_value(format, "metadata-quorum.add-controller", &row, |row| {
+                output::table(
+                    [
+                        "ACTION",
+                        "CONTROLLER_ID",
+                        "DIRECTORY_ID",
+                        "ENDPOINTS",
+                        "STATUS",
+                    ],
+                    [[
+                        row.action.clone(),
+                        row.controller_id.to_string(),
+                        row.directory_id.clone(),
+                        row.endpoints.join(", "),
+                        if row.dry_run {
+                            "DRY_RUN".into()
+                        } else {
+                            "ADDED".into()
+                        },
+                    ]],
+                )
+            })
+        }
+        MetadataQuorumAction::RemoveController {
+            controller_id,
+            controller_directory_id,
+            dry_run,
+        } => {
+            if *controller_id < 0 {
+                return Err(Error::Usage(format!(
+                    "invalid negative --controller-id: {controller_id}"
+                )));
+            }
+            let directory_id =
+                parse_kafka_uuid(controller_directory_id, "--controller-directory-id")?;
+            let cluster_id = client.describe_cluster().await?.cluster_id;
+            if !dry_run {
+                alter_raft_voter(&client, 81, timeout, |buffer, _| {
+                    encode_nullable_compact_string(Some(&cluster_id), buffer);
+                    buffer.put_i32(*controller_id);
+                    buffer.put_slice(&directory_id);
+                    buffer.put_u8(0);
+                })
+                .await?;
+            }
+            let row = QuorumMutationRow {
+                action: "remove".into(),
+                controller_id: *controller_id,
+                directory_id: controller_directory_id.clone(),
+                endpoints: Vec::new(),
+                dry_run: *dry_run,
+            };
+            output::write_value(format, "metadata-quorum.remove-controller", &row, |row| {
+                output::table(
+                    ["ACTION", "CONTROLLER_ID", "DIRECTORY_ID", "STATUS"],
+                    [[
+                        row.action.clone(),
+                        row.controller_id.to_string(),
+                        row.directory_id.clone(),
+                        if row.dry_run {
+                            "DRY_RUN".into()
+                        } else {
+                            "REMOVED".into()
+                        },
+                    ]],
                 )
             })
         }
@@ -8806,6 +9551,92 @@ mod tests {
                 dry_run: false,
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn quorum_v2_decoder_should_preserve_timestamps_directory_and_endpoints() {
+        let mut buffer = BytesMut::new();
+        buffer.put_i16(0);
+        buffer.put_u8(0);
+        buffer.put_u8(2);
+        encode_compact_string("__cluster_metadata", &mut buffer);
+        buffer.put_u8(2);
+        buffer.put_i32(0);
+        buffer.put_i16(0);
+        buffer.put_u8(0);
+        buffer.put_i32(1);
+        buffer.put_i32(9);
+        buffer.put_i64(42);
+        buffer.put_u8(2);
+        buffer.put_i32(1);
+        buffer.put_slice(&[7; 16]);
+        buffer.put_i64(44);
+        buffer.put_i64(1_000);
+        buffer.put_i64(900);
+        buffer.put_u8(0);
+        buffer.put_u8(1);
+        buffer.put_u8(0);
+        buffer.put_u8(0);
+        buffer.put_u8(2);
+        buffer.put_i32(1);
+        buffer.put_u8(2);
+        encode_compact_string("CONTROLLER", &mut buffer);
+        encode_compact_string("controller.example", &mut buffer);
+        buffer.put_u16(9093);
+        buffer.put_u8(0);
+        buffer.put_u8(0);
+        buffer.put_u8(0);
+
+        let description = decode_quorum_response(buffer.freeze(), 2).expect("quorum v2");
+
+        assert_eq!(description.leader_id, 1);
+        assert_eq!(description.voters[0].log_end_offset, 44);
+        assert_eq!(description.voters[0].last_fetch_timestamp, Some(1_000));
+        assert_eq!(description.voters[0].directory_id, "BwcHBwcHBwcHBwcHBwcHBw");
+        assert_eq!(
+            description.nodes[0].endpoints,
+            ["CONTROLLER://controller.example:9093"]
+        );
+    }
+
+    #[test]
+    fn controller_properties_should_match_kafka_server_config_precedence() {
+        let directory = tempfile::TempDir::new().expect("controller directory");
+        std::fs::write(
+            directory.path().join("meta.properties"),
+            "directory.id=AAAAAAAAAAAAAAAAAAAAAA\n",
+        )
+        .expect("meta.properties");
+        let config = tempfile::NamedTempFile::new().expect("controller config");
+        std::fs::write(
+            config.path(),
+            format!(
+                "node.id=2\nprocess.roles=broker,controller\nmetadata.log.dir={}\ncontroller.listener.names=CONTROLLER\nlisteners=CONTROLLER://:9093\nadvertised.listeners=CONTROLLER://controller.example:19093\n",
+                directory.path().display()
+            ),
+        )
+        .expect("controller config");
+
+        let (node_id, directory_id, endpoints) =
+            controller_from_properties(config.path()).expect("controller properties");
+
+        assert_eq!(node_id, 2);
+        assert_eq!(directory_id, [0; 16]);
+        assert_eq!(endpoints[0].host, "controller.example");
+        assert_eq!(endpoints[0].port, 19093);
+    }
+
+    #[test]
+    fn quorum_relative_timestamp_should_reject_clock_drift() {
+        assert_eq!(
+            relative_timestamp(Some(900), true, 1_000).expect("relative timestamp"),
+            "100 ms ago"
+        );
+        assert!(relative_timestamp(Some(1_001), true, 1_000).is_err());
+        assert_eq!(
+            relative_timestamp(None, false, 1_000).expect("missing timestamp"),
+            "-1"
         );
     }
 

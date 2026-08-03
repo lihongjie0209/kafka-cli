@@ -88,6 +88,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-client-metrics" => Some("client-metrics"),
         "kafka-features" => Some("features"),
         "kafka-transactions" => Some("transactions"),
+        "kafka-metadata-quorum" => Some("metadata-quorum"),
         _ => None,
     }
 }
@@ -296,6 +297,48 @@ pub enum Command {
     Features(FeaturesArgs),
     /// Analyze and recover transactional producer state.
     Transactions(TransactionsArgs),
+    /// Inspect and modify the `KRaft` metadata quorum.
+    MetadataQuorum(MetadataQuorumArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MetadataQuorumArgs {
+    /// Connect directly to a `KRaft` controller listener.
+    #[arg(long, conflicts_with = "bootstrap_server")]
+    pub bootstrap_controller: Option<String>,
+    #[command(subcommand)]
+    pub action: MetadataQuorumAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MetadataQuorumAction {
+    /// Describe quorum status or replication state.
+    Describe {
+        #[arg(
+            long,
+            required_unless_present = "replication",
+            conflicts_with = "replication"
+        )]
+        status: bool,
+        #[arg(long, required_unless_present = "status", conflicts_with = "status")]
+        replication: bool,
+        #[arg(long, requires = "replication")]
+        human_readable: bool,
+    },
+    /// Add the controller described by the command config file.
+    AddController {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a controller from the voter set.
+    RemoveController {
+        #[arg(short = 'i', long)]
+        controller_id: i32,
+        #[arg(short = 'd', long)]
+        controller_directory_id: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1771,6 +1814,35 @@ mod tests {
     parses_command_family!(client_metrics_family_parses, "client-metrics", "list");
     parses_command_family!(features_family_parses, "features", "describe");
     parses_command_family!(transactions_list_family_parses, "transactions", "list");
+    parses_command_family!(
+        metadata_quorum_status_family_parses,
+        "metadata-quorum",
+        "describe",
+        "--status"
+    );
+    parses_command_family!(
+        metadata_quorum_replication_family_parses,
+        "metadata-quorum",
+        "describe",
+        "--replication",
+        "--human-readable"
+    );
+    parses_command_family!(
+        metadata_quorum_add_family_parses,
+        "metadata-quorum",
+        "add-controller",
+        "--dry-run"
+    );
+    parses_command_family!(
+        metadata_quorum_remove_family_parses,
+        "metadata-quorum",
+        "remove-controller",
+        "-i",
+        "2",
+        "-d",
+        "AAAAAAAAAAAAAAAAAAAAAA",
+        "--dry-run"
+    );
     parses_command_family!(
         transactions_describe_family_parses,
         "transactions",

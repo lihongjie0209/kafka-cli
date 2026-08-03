@@ -172,3 +172,19 @@ fn kafka_transactions_alias_should_accept_original_subcommands() {
         .success()
         .stdout(predicate::str::contains("--duration-filter"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_metadata_quorum_alias_should_accept_original_subcommands() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-metadata-quorum.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-metadata-quorum alias");
+
+    Command::new(alias)
+        .args(["describe", "--status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--replication"));
+}

@@ -2078,6 +2078,31 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("Duration(min)")
     );
+    assert!(
+        success(&bootstrap, &["metadata-quorum", "describe", "--status"]).contains("HighWatermark")
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &["metadata-quorum", "describe", "--replication"],
+        )
+        .contains("DirectoryId")
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "metadata-quorum",
+                "remove-controller",
+                "--controller-id",
+                "2",
+                "--controller-directory-id",
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                "--dry-run",
+            ],
+        )
+        .contains("DRY_RUN")
+    );
 
     success(
         &bootstrap,
