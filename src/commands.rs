@@ -47,7 +47,7 @@ use crate::{
         ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
         ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
         ReassignAction, ResetOffsetsArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
-        TopicAction, TransactionAction,
+        StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -154,6 +154,18 @@ pub async fn execute(cli: Cli) -> Result<()> {
         }
         Command::ShareGroups(args) => {
             Box::pin(share_groups(
+                &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                Duration::from_millis(args.timeout_ms),
+                format,
+                args.action,
+                verbose,
+            ))
+            .await
+        }
+        Command::StreamsGroups(args) => {
+            Box::pin(streams_groups(
                 &client_config,
                 bootstrap,
                 command_config.as_deref(),
@@ -2028,7 +2040,149 @@ struct ShareGroupListRow {
     state: Option<String>,
 }
 
+#[derive(Debug)]
+struct StreamsGroupDescriptionWithCoordinator {
+    coordinator_id: i32,
+    coordinator: String,
+    description: StreamsGroupDescription,
+}
+
+#[derive(Debug)]
+struct StreamsGroupDescription {
+    group_id: String,
+    group_state: String,
+    group_epoch: i32,
+    assignment_epoch: i32,
+    topology: Option<StreamsTopology>,
+    members: Vec<StreamsGroupMember>,
+    topology_description: Option<StreamsTopologyDescription>,
+    topology_description_status: Option<i8>,
+    assignor: Option<String>,
+}
+
+#[derive(Debug)]
+struct StreamsTopology {
+    subtopologies: Vec<StreamsSubtopology>,
+}
+
+#[derive(Debug)]
+struct StreamsSubtopology {
+    id: String,
+    source_topics: Vec<String>,
+    repartition_source_topics: Vec<String>,
+    state_changelog_topics: Vec<String>,
+}
+
+#[derive(Debug)]
+struct StreamsGroupMember {
+    member_id: String,
+    member_epoch: i32,
+    client_id: String,
+    topology_epoch: i32,
+    process_id: String,
+    assignment: StreamsTaskAssignment,
+    target_assignment: StreamsTaskAssignment,
+    is_classic: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamsTaskAssignment {
+    active: Vec<StreamsTaskIds>,
+    standby: Vec<StreamsTaskIds>,
+    warmup: Vec<StreamsTaskIds>,
+}
+
+#[derive(Debug)]
+struct StreamsTaskIds {
+    subtopology_id: String,
+    partitions: Vec<i32>,
+}
+
+#[derive(Debug)]
+struct StreamsTopologyDescription {
+    subtopologies: Vec<StreamsTopologyDescriptionSubtopology>,
+    global_stores: Vec<StreamsTopologyGlobalStore>,
+}
+
+#[derive(Debug)]
+struct StreamsTopologyDescriptionSubtopology {
+    id: String,
+    nodes: Vec<StreamsTopologyNode>,
+}
+
+#[derive(Debug)]
+struct StreamsTopologyGlobalStore {
+    source: StreamsTopologyNode,
+    processor: StreamsTopologyNode,
+}
+
+#[derive(Debug)]
+struct StreamsTopologyNode {
+    name: String,
+    node_type: i8,
+    source_topics: Vec<String>,
+    sink_topic: Option<String>,
+    stores: Vec<String>,
+    successors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamsGroupStateRow {
+    group: String,
+    coordinator: String,
+    coordinator_id: i32,
+    assignor: String,
+    state: String,
+    group_epoch: Option<i32>,
+    assignment_epoch: Option<i32>,
+    members: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamsGroupMemberRow {
+    group: String,
+    member: String,
+    process: String,
+    client_id: String,
+    assignments: String,
+    member_protocol: Option<String>,
+    member_epoch: Option<i32>,
+    topology_epoch: Option<i32>,
+    assignment_epoch: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamsGroupOffsetRow {
+    group: String,
+    topic: String,
+    partition: i32,
+    current_offset: Option<i64>,
+    leader_epoch: Option<i32>,
+    log_end_offset: i64,
+    lag: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamsTopologyRow {
+    group: String,
+    scope: String,
+    topology: String,
+    node: String,
+    node_type: String,
+    source_topics: String,
+    sink_topic: Option<String>,
+    stores: String,
+    successors: String,
+}
+
 async fn share_group_ids(client: &krafka::admin::AdminClient) -> Result<Vec<String>> {
+    group_ids_by_type(client, "share").await
+}
+
+async fn group_ids_by_type(
+    client: &krafka::admin::AdminClient,
+    expected_type: &str,
+) -> Result<Vec<String>> {
     let mut groups = client
         .list_consumer_groups()
         .await?
@@ -2037,12 +2191,514 @@ async fn share_group_ids(client: &krafka::admin::AdminClient) -> Result<Vec<Stri
             group
                 .group_type
                 .as_ref()
-                .is_some_and(|kind| kind.to_string().eq_ignore_ascii_case("share"))
+                .is_some_and(|kind| kind.to_string().eq_ignore_ascii_case(expected_type))
         })
         .map(|group| group.group_id)
         .collect::<Vec<_>>();
     groups.sort();
     Ok(groups)
+}
+
+async fn list_streams_groups(
+    client: &krafka::admin::AdminClient,
+    format: OutputFormat,
+    state: Option<&str>,
+) -> Result<()> {
+    let group_ids = group_ids_by_type(client, "streams").await?;
+    let rows = if let Some(state_filter) = state {
+        let states = if state_filter.is_empty() {
+            BTreeSet::new()
+        } else {
+            parse_streams_group_states(state_filter)?
+        };
+        describe_streams_groups(client, &group_ids, false)
+            .await?
+            .into_iter()
+            .filter(|group| states.is_empty() || states.contains(&group.description.group_state))
+            .map(|group| ShareGroupListRow {
+                group: group.description.group_id,
+                state: Some(group.description.group_state),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        group_ids
+            .into_iter()
+            .map(|group| ShareGroupListRow { group, state: None })
+            .collect()
+    };
+    output::write_value(format, "streams-groups.list", &rows, |rows| {
+        if rows.iter().any(|row| row.state.is_some()) {
+            output::table(
+                ["GROUP", "STATE"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.state.as_deref().unwrap_or("-").to_owned(),
+                    ]
+                }),
+            )
+        } else {
+            output::table(["GROUP"], rows.iter().map(|row| [row.group.clone()]))
+        }
+    })
+}
+
+fn parse_streams_group_states(value: &str) -> Result<BTreeSet<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|state| match state.to_ascii_lowercase().as_str() {
+            "empty" => Ok("Empty".into()),
+            "notready" => Ok("NotReady".into()),
+            "stable" => Ok("Stable".into()),
+            "assigning" => Ok("Assigning".into()),
+            "reconciling" => Ok("Reconciling".into()),
+            "dead" => Ok("Dead".into()),
+            _ => Err(Error::Usage(format!(
+                "invalid Streams group state '{state}'; expected Empty, NotReady, Stable, Assigning, Reconciling, or Dead"
+            ))),
+        })
+        .collect()
+}
+
+fn streams_tasks(tasks: &[StreamsTaskIds], label: &str) -> String {
+    tasks
+        .iter()
+        .map(|task| {
+            let partitions = task
+                .partitions
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{label}: {}:[{partitions}]", task.subtopology_id)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn streams_assignment(
+    assignment: &StreamsTaskAssignment,
+    target: Option<&StreamsTaskAssignment>,
+) -> String {
+    let mut values = [
+        streams_tasks(&assignment.active, "ACTIVE"),
+        streams_tasks(&assignment.standby, "STANDBY"),
+        streams_tasks(&assignment.warmup, "WARMUP"),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>();
+    if let Some(target) = target {
+        values.extend(
+            [
+                streams_tasks(&target.active, "TARGET-ACTIVE"),
+                streams_tasks(&target.standby, "TARGET-STANDBY"),
+                streams_tasks(&target.warmup, "TARGET-WARMUP"),
+            ]
+            .into_iter()
+            .filter(|value| !value.is_empty()),
+        );
+    }
+    values.join("; ")
+}
+
+fn write_streams_group_states(
+    format: OutputFormat,
+    descriptions: Vec<StreamsGroupDescriptionWithCoordinator>,
+    verbose: bool,
+) -> Result<()> {
+    let rows = descriptions
+        .into_iter()
+        .map(|group| StreamsGroupStateRow {
+            group: group.description.group_id,
+            coordinator: group.coordinator,
+            coordinator_id: group.coordinator_id,
+            assignor: group.description.assignor.unwrap_or_default(),
+            state: group.description.group_state,
+            group_epoch: verbose.then_some(group.description.group_epoch),
+            assignment_epoch: verbose.then_some(group.description.assignment_epoch),
+            members: group.description.members.len(),
+        })
+        .collect::<Vec<_>>();
+    output::write_value(format, "streams-groups.describe.state", &rows, |rows| {
+        if verbose {
+            output::table(
+                [
+                    "GROUP",
+                    "COORDINATOR (ID)",
+                    "ASSIGNOR",
+                    "STATE",
+                    "GROUP-EPOCH",
+                    "TARGET-ASSIGNMENT-EPOCH",
+                    "#MEMBERS",
+                ],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        format!("{} ({})", row.coordinator, row.coordinator_id),
+                        row.assignor.clone(),
+                        row.state.clone(),
+                        row.group_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.assignment_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.members.to_string(),
+                    ]
+                }),
+            )
+        } else {
+            output::table(
+                ["GROUP", "COORDINATOR (ID)", "ASSIGNOR", "STATE", "#MEMBERS"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        format!("{} ({})", row.coordinator, row.coordinator_id),
+                        row.assignor.clone(),
+                        row.state.clone(),
+                        row.members.to_string(),
+                    ]
+                }),
+            )
+        }
+    })
+}
+
+fn write_streams_group_members(
+    format: OutputFormat,
+    descriptions: Vec<StreamsGroupDescriptionWithCoordinator>,
+    verbose: bool,
+) -> Result<()> {
+    let rows = descriptions
+        .into_iter()
+        .flat_map(|group| {
+            let group_id = group.description.group_id;
+            let assignment_epoch = group.description.assignment_epoch;
+            group.description.members.into_iter().map(move |member| {
+                let target = verbose.then_some(&member.target_assignment);
+                StreamsGroupMemberRow {
+                    group: group_id.clone(),
+                    member: member.member_id,
+                    process: member.process_id,
+                    client_id: member.client_id,
+                    assignments: streams_assignment(&member.assignment, target),
+                    member_protocol: verbose.then(|| {
+                        if member.is_classic {
+                            "classic"
+                        } else {
+                            "streams"
+                        }
+                        .into()
+                    }),
+                    member_epoch: verbose.then_some(member.member_epoch),
+                    topology_epoch: verbose.then_some(member.topology_epoch),
+                    assignment_epoch: verbose.then_some(assignment_epoch),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    output::write_value(format, "streams-groups.describe.members", &rows, |rows| {
+        if verbose {
+            output::table(
+                [
+                    "GROUP",
+                    "TARGET-ASSIGNMENT-EPOCH",
+                    "TOPOLOGY-EPOCH",
+                    "MEMBER",
+                    "MEMBER-PROTOCOL",
+                    "MEMBER-EPOCH",
+                    "PROCESS",
+                    "CLIENT-ID",
+                    "ASSIGNMENTS",
+                ],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.assignment_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.topology_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.member.clone(),
+                        row.member_protocol.as_deref().unwrap_or("-").into(),
+                        row.member_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.process.clone(),
+                        row.client_id.clone(),
+                        row.assignments.clone(),
+                    ]
+                }),
+            )
+        } else {
+            output::table(
+                ["GROUP", "MEMBER", "PROCESS", "CLIENT-ID", "ASSIGNMENTS"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.member.clone(),
+                        row.process.clone(),
+                        row.client_id.clone(),
+                        row.assignments.clone(),
+                    ]
+                }),
+            )
+        }
+    })
+}
+
+fn streams_active_partitions(description: &StreamsGroupDescription) -> BTreeSet<(String, i32)> {
+    let Some(topology) = &description.topology else {
+        return BTreeSet::new();
+    };
+    let source_topics = topology
+        .subtopologies
+        .iter()
+        .map(|subtopology| (&subtopology.id, &subtopology.source_topics))
+        .collect::<BTreeMap<_, _>>();
+    description
+        .members
+        .iter()
+        .flat_map(|member| &member.assignment.active)
+        .flat_map(|task| {
+            source_topics
+                .get(&task.subtopology_id)
+                .into_iter()
+                .flat_map(move |topics| {
+                    topics.iter().flat_map(move |topic| {
+                        task.partitions
+                            .iter()
+                            .map(move |partition| (topic.clone(), *partition))
+                    })
+                })
+        })
+        .collect()
+}
+
+fn streams_internal_topics(description: &StreamsGroupDescription) -> BTreeSet<String> {
+    let Some(topology) = &description.topology else {
+        return BTreeSet::new();
+    };
+    let sources = topology
+        .subtopologies
+        .iter()
+        .flat_map(|subtopology| &subtopology.source_topics)
+        .collect::<BTreeSet<_>>();
+    topology
+        .subtopologies
+        .iter()
+        .flat_map(|subtopology| {
+            subtopology
+                .repartition_source_topics
+                .iter()
+                .chain(&subtopology.state_changelog_topics)
+        })
+        .filter(|topic| !sources.contains(topic))
+        .filter(|topic| {
+            topic.starts_with(&format!("{}-", description.group_id))
+                && (topic.ends_with("-repartition") || topic.ends_with("-changelog"))
+        })
+        .cloned()
+        .collect()
+}
+
+fn write_streams_group_offsets(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    format: OutputFormat,
+    descriptions: Vec<StreamsGroupDescriptionWithCoordinator>,
+    verbose: bool,
+) -> Result<()> {
+    let admin = admin(config)?;
+    let committed = descriptions
+        .iter()
+        .map(|group| {
+            ffi::list_consumer_group_offsets(
+                admin.inner().native_ptr(),
+                &group.description.group_id,
+                duration_ms(timeout)?,
+            )
+            .map(|offsets| (group.description.group_id.clone(), offsets))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    drop(admin);
+    let consumer = base_consumer(config)?;
+    let mut rows = Vec::new();
+    for group in descriptions {
+        let committed = committed
+            .get(&group.description.group_id)
+            .into_iter()
+            .flatten()
+            .map(|offset| ((offset.topic.as_str(), offset.partition), offset))
+            .collect::<BTreeMap<_, _>>();
+        for (topic, partition) in streams_active_partitions(&group.description) {
+            let (low, high) = consumer.fetch_watermarks(&topic, partition, timeout)?;
+            let offset = committed.get(&(topic.as_str(), partition));
+            let current_offset = offset
+                .filter(|entry| entry.offset >= 0)
+                .map(|entry| entry.offset);
+            let leader_epoch = offset.and_then(|entry| entry.leader_epoch);
+            let lag = high.saturating_sub(current_offset.unwrap_or(low));
+            rows.push(StreamsGroupOffsetRow {
+                group: group.description.group_id.clone(),
+                topic,
+                partition,
+                current_offset,
+                leader_epoch,
+                log_end_offset: high,
+                lag,
+            });
+        }
+    }
+    output::write_value(format, "streams-groups.describe.offsets", &rows, |rows| {
+        if verbose {
+            output::table(
+                [
+                    "GROUP",
+                    "TOPIC",
+                    "PARTITION",
+                    "CURRENT-OFFSET",
+                    "LEADER-EPOCH",
+                    "LOG-END-OFFSET",
+                    "OFFSET-LAG",
+                ],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.topic.clone(),
+                        row.partition.to_string(),
+                        row.current_offset
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.leader_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.log_end_offset.to_string(),
+                        row.lag.to_string(),
+                    ]
+                }),
+            )
+        } else {
+            output::table(
+                ["GROUP", "TOPIC", "PARTITION", "OFFSET-LAG"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.topic.clone(),
+                        row.partition.to_string(),
+                        row.lag.to_string(),
+                    ]
+                }),
+            )
+        }
+    })
+}
+
+fn streams_topology_node_row(
+    group: &str,
+    scope: &str,
+    topology: &str,
+    node: StreamsTopologyNode,
+) -> StreamsTopologyRow {
+    StreamsTopologyRow {
+        group: group.into(),
+        scope: scope.into(),
+        topology: topology.into(),
+        node: node.name,
+        node_type: match node.node_type {
+            1 => "SOURCE",
+            2 => "PROCESSOR",
+            3 => "SINK",
+            _ => "UNKNOWN",
+        }
+        .into(),
+        source_topics: node.source_topics.join(","),
+        sink_topic: node.sink_topic,
+        stores: node.stores.join(","),
+        successors: node.successors.join(","),
+    }
+}
+
+fn write_streams_topologies(
+    format: OutputFormat,
+    descriptions: Vec<StreamsGroupDescriptionWithCoordinator>,
+) -> Result<()> {
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for group in descriptions {
+        let group_id = group.description.group_id;
+        match (
+            group.description.topology_description_status,
+            group.description.topology_description,
+        ) {
+            (Some(3), Some(topology)) => {
+                for subtopology in topology.subtopologies {
+                    rows.extend(subtopology.nodes.into_iter().map(|node| {
+                        streams_topology_node_row(
+                            &group_id,
+                            "SUBTOPOLOGY",
+                            &subtopology.id,
+                            node,
+                        )
+                    }));
+                }
+                for (index, store) in topology.global_stores.into_iter().enumerate() {
+                    let id = index.to_string();
+                    rows.push(streams_topology_node_row(
+                        &group_id,
+                        "GLOBAL-SOURCE",
+                        &id,
+                        store.source,
+                    ));
+                    rows.push(streams_topology_node_row(
+                        &group_id,
+                        "GLOBAL-PROCESSOR",
+                        &id,
+                        store.processor,
+                    ));
+                }
+            }
+            (Some(1), _) => errors.push(format!(
+                "no topology description is stored for Streams group '{group_id}'"
+            )),
+            (Some(2), _) => errors.push(format!(
+                "broker failed to fetch the topology description for Streams group '{group_id}'"
+            )),
+            (status, _) => errors.push(format!(
+                "no topology description is available for Streams group '{group_id}' (status: {status:?})"
+            )),
+        }
+    }
+    output::write_value_with_errors(
+        format,
+        "streams-groups.describe.topology",
+        &rows,
+        &errors,
+        |rows| {
+            output::table(
+                [
+                    "GROUP",
+                    "SCOPE",
+                    "TOPOLOGY",
+                    "NODE",
+                    "TYPE",
+                    "SOURCE-TOPICS",
+                    "SINK-TOPIC",
+                    "STORES",
+                    "SUCCESSORS",
+                ],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.scope.clone(),
+                        row.topology.clone(),
+                        row.node.clone(),
+                        row.node_type.clone(),
+                        row.source_topics.clone(),
+                        row.sink_topic.as_deref().unwrap_or("-").into(),
+                        row.stores.clone(),
+                        row.successors.clone(),
+                    ]
+                }),
+            )
+        },
+    )
 }
 
 async fn group_coordinator_connection(
@@ -2080,6 +2736,287 @@ async fn group_coordinator_connection(
         .get_connection_by_id(response.node_id, &address)
         .await?;
     Ok((response.node_id, address, connection))
+}
+
+fn decode_compact_strings(buffer: &mut impl Buf) -> Result<Vec<String>> {
+    let count = decode_compact_len(buffer)?;
+    (0..count).map(|_| decode_compact_string(buffer)).collect()
+}
+
+fn decode_streams_key_values(buffer: &mut impl Buf) -> Result<()> {
+    let count = decode_compact_len(buffer)?;
+    for _ in 0..count {
+        let _key = decode_compact_string(buffer)?;
+        let _value = decode_compact_string(buffer)?;
+        skip_tagged_fields(buffer)?;
+    }
+    Ok(())
+}
+
+fn decode_streams_topic_infos(buffer: &mut impl Buf) -> Result<Vec<String>> {
+    let count = decode_compact_len(buffer)?;
+    let mut topics = Vec::with_capacity(count);
+    for _ in 0..count {
+        topics.push(decode_compact_string(buffer)?);
+        let _partitions = i32::decode(buffer)?;
+        let _replication_factor = i16::decode(buffer)?;
+        decode_streams_key_values(buffer)?;
+        skip_tagged_fields(buffer)?;
+    }
+    Ok(topics)
+}
+
+fn decode_streams_subtopologies(buffer: &mut impl Buf) -> Result<Vec<StreamsSubtopology>> {
+    let encoded = decode_unsigned_varint(buffer)?;
+    if encoded == 0 {
+        return Ok(Vec::new());
+    }
+    let mut subtopologies = Vec::with_capacity(encoded - 1);
+    for _ in 0..encoded - 1 {
+        let id = decode_compact_string(buffer)?;
+        let source_topics = decode_compact_strings(buffer)?;
+        let _repartition_sink_topics = decode_compact_strings(buffer)?;
+        let state_changelog_topics = decode_streams_topic_infos(buffer)?;
+        let repartition_source_topics = decode_streams_topic_infos(buffer)?;
+        skip_tagged_fields(buffer)?;
+        subtopologies.push(StreamsSubtopology {
+            id,
+            source_topics,
+            repartition_source_topics,
+            state_changelog_topics,
+        });
+    }
+    Ok(subtopologies)
+}
+
+fn decode_streams_topology(buffer: &mut impl Buf) -> Result<Option<StreamsTopology>> {
+    if decode_unsigned_varint(buffer)? == 0 {
+        return Ok(None);
+    }
+    let _epoch = i32::decode(buffer)?;
+    let subtopologies = decode_streams_subtopologies(buffer)?;
+    skip_tagged_fields(buffer)?;
+    Ok(Some(StreamsTopology { subtopologies }))
+}
+
+fn decode_streams_task_ids(buffer: &mut impl Buf) -> Result<Vec<StreamsTaskIds>> {
+    let count = decode_compact_len(buffer)?;
+    let mut tasks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let subtopology_id = decode_compact_string(buffer)?;
+        let partition_count = decode_compact_len(buffer)?;
+        let partitions = (0..partition_count)
+            .map(|_| i32::decode(buffer).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        skip_tagged_fields(buffer)?;
+        tasks.push(StreamsTaskIds {
+            subtopology_id,
+            partitions,
+        });
+    }
+    Ok(tasks)
+}
+
+fn decode_streams_assignment(buffer: &mut impl Buf) -> Result<StreamsTaskAssignment> {
+    let active = decode_streams_task_ids(buffer)?;
+    let standby = decode_streams_task_ids(buffer)?;
+    let warmup = decode_streams_task_ids(buffer)?;
+    skip_tagged_fields(buffer)?;
+    Ok(StreamsTaskAssignment {
+        active,
+        standby,
+        warmup,
+    })
+}
+
+fn skip_streams_task_offsets(buffer: &mut impl Buf) -> Result<()> {
+    let count = decode_compact_len(buffer)?;
+    for _ in 0..count {
+        let _subtopology_id = decode_compact_string(buffer)?;
+        let _partition = i32::decode(buffer)?;
+        let _offset = i64::decode(buffer)?;
+        skip_tagged_fields(buffer)?;
+    }
+    Ok(())
+}
+
+fn decode_streams_member(buffer: &mut impl Buf) -> Result<StreamsGroupMember> {
+    let member_id = decode_compact_string(buffer)?;
+    let member_epoch = i32::decode(buffer)?;
+    let _instance_id = decode_nullable_compact_string(buffer)?;
+    let _rack_id = decode_nullable_compact_string(buffer)?;
+    let client_id = decode_compact_string(buffer)?;
+    let _client_host = decode_compact_string(buffer)?;
+    let topology_epoch = i32::decode(buffer)?;
+    let process_id = decode_compact_string(buffer)?;
+    if decode_unsigned_varint(buffer)? != 0 {
+        let _host = decode_compact_string(buffer)?;
+        let _port = i16::decode(buffer)?.cast_unsigned();
+        skip_tagged_fields(buffer)?;
+    }
+    decode_streams_key_values(buffer)?;
+    skip_streams_task_offsets(buffer)?;
+    skip_streams_task_offsets(buffer)?;
+    let assignment = decode_streams_assignment(buffer)?;
+    let target_assignment = decode_streams_assignment(buffer)?;
+    let is_classic = bool::decode(buffer)?;
+    skip_tagged_fields(buffer)?;
+    Ok(StreamsGroupMember {
+        member_id,
+        member_epoch,
+        client_id,
+        topology_epoch,
+        process_id,
+        assignment,
+        target_assignment,
+        is_classic,
+    })
+}
+
+fn decode_streams_topology_node(buffer: &mut impl Buf) -> Result<StreamsTopologyNode> {
+    let node = StreamsTopologyNode {
+        name: decode_compact_string(buffer)?,
+        node_type: i8::decode(buffer)?,
+        source_topics: decode_compact_strings(buffer)?,
+        sink_topic: decode_nullable_compact_string(buffer)?,
+        stores: decode_compact_strings(buffer)?,
+        successors: decode_compact_strings(buffer)?,
+    };
+    skip_tagged_fields(buffer)?;
+    Ok(node)
+}
+
+fn decode_streams_topology_description(
+    buffer: &mut impl Buf,
+) -> Result<Option<StreamsTopologyDescription>> {
+    if decode_unsigned_varint(buffer)? == 0 {
+        return Ok(None);
+    }
+    let subtopology_count = decode_compact_len(buffer)?;
+    let mut subtopologies = Vec::with_capacity(subtopology_count);
+    for _ in 0..subtopology_count {
+        let id = decode_compact_string(buffer)?;
+        let node_count = decode_compact_len(buffer)?;
+        let nodes = (0..node_count)
+            .map(|_| decode_streams_topology_node(buffer))
+            .collect::<Result<Vec<_>>>()?;
+        skip_tagged_fields(buffer)?;
+        subtopologies.push(StreamsTopologyDescriptionSubtopology { id, nodes });
+    }
+    let store_count = decode_compact_len(buffer)?;
+    let mut global_stores = Vec::with_capacity(store_count);
+    for _ in 0..store_count {
+        let source = decode_streams_topology_node(buffer)?;
+        let processor = decode_streams_topology_node(buffer)?;
+        skip_tagged_fields(buffer)?;
+        global_stores.push(StreamsTopologyGlobalStore { source, processor });
+    }
+    skip_tagged_fields(buffer)?;
+    Ok(Some(StreamsTopologyDescription {
+        subtopologies,
+        global_stores,
+    }))
+}
+
+fn decode_streams_group_description(
+    buffer: &mut impl Buf,
+    version: i16,
+) -> Result<(i16, Option<String>, StreamsGroupDescription)> {
+    let error_code = i16::decode(buffer)?;
+    let error_message = decode_nullable_compact_string(buffer)?;
+    let group_id = decode_compact_string(buffer)?;
+    let group_state = decode_compact_string(buffer)?;
+    let group_epoch = i32::decode(buffer)?;
+    let assignment_epoch = i32::decode(buffer)?;
+    let topology = decode_streams_topology(buffer)?;
+    let member_count = decode_compact_len(buffer)?;
+    let members = (0..member_count)
+        .map(|_| decode_streams_member(buffer))
+        .collect::<Result<Vec<_>>>()?;
+    let _authorized_operations = i32::decode(buffer)?;
+    let (topology_description, topology_description_status, assignor) = if version >= 1 {
+        (
+            decode_streams_topology_description(buffer)?,
+            Some(i8::decode(buffer)?),
+            decode_nullable_compact_string(buffer)?,
+        )
+    } else {
+        (None, None, None)
+    };
+    skip_tagged_fields(buffer)?;
+    Ok((
+        error_code,
+        error_message,
+        StreamsGroupDescription {
+            group_id,
+            group_state,
+            group_epoch,
+            assignment_epoch,
+            topology,
+            members,
+            topology_description,
+            topology_description_status,
+            assignor,
+        },
+    ))
+}
+
+async fn describe_streams_groups(
+    client: &krafka::admin::AdminClient,
+    group_ids: &[String],
+    include_topology_description: bool,
+) -> Result<Vec<StreamsGroupDescriptionWithCoordinator>> {
+    let mut descriptions = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        let (coordinator_id, coordinator, connection) =
+            group_coordinator_connection(client, group_id).await?;
+        let api_key = ApiKey::Unknown(89);
+        let version = connection
+            .negotiate_api_version(api_key, i16::from(include_topology_description), 0)
+            .await
+            .ok_or_else(|| {
+                Error::Unsupported("broker does not support StreamsGroupDescribe v0".into())
+            })?;
+        let mut response = connection
+            .send_request(api_key, version, |buffer| {
+                buffer.put_u8(0); // flexible request-header tagged fields
+                encode_unsigned_varint(2, buffer);
+                encode_compact_string(group_id, buffer);
+                buffer.put_u8(0); // group ID array tagged fields
+                buffer.put_u8(0); // include authorized operations
+                if version >= 1 {
+                    buffer.put_u8(u8::from(include_topology_description));
+                }
+                buffer.put_u8(0); // request tagged fields
+                Ok(())
+            })
+            .await?;
+        drop(connection);
+        skip_tagged_fields(&mut response)?; // flexible response-header tagged fields
+        let _throttle_time_ms = i32::decode(&mut response)?;
+        let count = decode_compact_len(&mut response)?;
+        if count != 1 {
+            return Err(Error::Config(format!(
+                "StreamsGroupDescribe returned {count} groups for one requested group"
+            )));
+        }
+        let (error_code, error_message, description) =
+            decode_streams_group_description(&mut response, version)?;
+        skip_tagged_fields(&mut response)?;
+        if error_code != 0 {
+            return Err(Error::Config(format!(
+                "StreamsGroupDescribe failed for {group_id}: {}",
+                error_message.unwrap_or_else(|| format!("Kafka error {error_code}"))
+            )));
+        }
+        descriptions.push(StreamsGroupDescriptionWithCoordinator {
+            coordinator_id,
+            coordinator,
+            description,
+        });
+    }
+    descriptions.sort_by(|left, right| left.description.group_id.cmp(&right.description.group_id));
+    Ok(descriptions)
 }
 
 async fn describe_share_groups(
@@ -2376,7 +3313,7 @@ fn write_share_group_offsets(
     })
 }
 
-async fn delete_one_share_group(
+async fn delete_one_group(
     client: &krafka::admin::AdminClient,
     group_id: &str,
 ) -> Result<Option<String>> {
@@ -2454,7 +3391,7 @@ async fn delete_share_groups(
                 error: None,
             });
         } else {
-            let error = delete_one_share_group(client, &group).await?;
+            let error = delete_one_group(client, &group).await?;
             rows.push(MutationRow {
                 resource: group,
                 status: if error.is_some() { "FAILED" } else { "DELETED" }.into(),
@@ -2472,6 +3409,471 @@ async fn delete_share_groups(
             total: rows.len(),
         })
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Kafka Streams delete exposes independent selection, internal-topic, and execution controls"
+)]
+async fn delete_streams_groups(
+    config: &rdkafka::ClientConfig,
+    client: &krafka::admin::AdminClient,
+    timeout: Duration,
+    format: OutputFormat,
+    requested: Vec<String>,
+    all_groups: bool,
+    delete_all_internal_topics: bool,
+    execute: bool,
+) -> Result<()> {
+    let available = group_ids_by_type(client, "streams").await?;
+    let groups = if all_groups {
+        available.clone()
+    } else {
+        requested
+    };
+    if groups.is_empty() {
+        return Err(Error::Usage("no Streams groups matched".into()));
+    }
+    let available = available.into_iter().collect::<BTreeSet<_>>();
+    let existing = groups
+        .iter()
+        .filter(|group| available.contains(*group))
+        .cloned()
+        .collect::<Vec<_>>();
+    let descriptions = describe_streams_groups(client, &existing, false).await?;
+    let details = descriptions
+        .into_iter()
+        .map(|group| (group.description.group_id.clone(), group.description))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for group in groups {
+        let validation_error = details.get(&group).map_or_else(
+            || Some(format!("Group '{group}' is not a Streams group")),
+            |description| {
+                (description.group_state != "Empty").then(|| {
+                    format!(
+                        "Streams group is not EMPTY (state: {})",
+                        description.group_state
+                    )
+                })
+            },
+        );
+        if let Some(error) = validation_error {
+            rows.push(MutationRow {
+                resource: group,
+                status: "FAILED".into(),
+                error: Some(error),
+            });
+            continue;
+        }
+        let internal_topics = if delete_all_internal_topics {
+            streams_internal_topics(&details[&group])
+        } else {
+            BTreeSet::new()
+        };
+        if !execute {
+            rows.push(MutationRow {
+                resource: group.clone(),
+                status: "PREVIEW".into(),
+                error: None,
+            });
+            rows.extend(internal_topics.into_iter().map(|topic| MutationRow {
+                resource: topic,
+                status: "PREVIEW".into(),
+                error: None,
+            }));
+            continue;
+        }
+        let error = delete_one_group(client, &group).await?;
+        rows.push(MutationRow {
+            resource: group,
+            status: if error.is_some() { "FAILED" } else { "DELETED" }.into(),
+            error,
+        });
+        if !internal_topics.is_empty() {
+            let topics = internal_topics.into_iter().collect::<Vec<_>>();
+            let topic_refs = topics.iter().map(String::as_str).collect::<Vec<_>>();
+            let options = AdminOptions::new().request_timeout(Some(timeout));
+            let results = admin(config)?.delete_topics(&topic_refs, &options).await?;
+            for (topic, result) in topics.into_iter().zip(results) {
+                let error = result.err().map(|(_, code)| format!("{code:?}"));
+                rows.push(MutationRow {
+                    resource: topic,
+                    status: if error.is_none() { "DELETED" } else { "FAILED" }.into(),
+                    error,
+                });
+            }
+        }
+    }
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_mutation_rows(format, "streams-groups.delete", &rows)?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: failures,
+            total: rows.len(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StreamsOffsetMutationRow {
+    group: String,
+    topic: String,
+    partition: i32,
+    status: String,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Kafka Streams offset deletion combines clients, selection scope, and execution controls"
+)]
+async fn delete_streams_group_offsets(
+    config: &rdkafka::ClientConfig,
+    client: &krafka::admin::AdminClient,
+    timeout: Duration,
+    format: OutputFormat,
+    group: &str,
+    input_topics: &[String],
+    all_input_topics: bool,
+    execute: bool,
+) -> Result<()> {
+    let admin = admin(config)?;
+    let committed =
+        ffi::list_consumer_group_offsets(admin.inner().native_ptr(), group, duration_ms(timeout)?)?;
+    let committed_set = committed
+        .iter()
+        .map(|offset| (offset.topic.clone(), offset.partition))
+        .collect::<BTreeSet<_>>();
+    let selections = if all_input_topics {
+        let group_ids = [group.to_owned()];
+        let description = describe_streams_groups(client, &group_ids, false)
+            .await?
+            .pop()
+            .ok_or_else(|| Error::Config(format!("broker omitted Streams group {group}")))?;
+        let source_topics = description
+            .description
+            .topology
+            .into_iter()
+            .flat_map(|topology| topology.subtopologies)
+            .flat_map(|subtopology| subtopology.source_topics)
+            .collect::<BTreeSet<_>>();
+        let mut selections = BTreeMap::<String, Vec<i32>>::new();
+        for (topic, partition) in &committed_set {
+            if source_topics.contains(topic) {
+                selections
+                    .entry(topic.clone())
+                    .or_default()
+                    .push(*partition);
+            }
+        }
+        selections.into_iter().collect::<Vec<_>>()
+    } else {
+        let selections = resolve_topic_partition_selections(config, timeout, input_topics)?;
+        let missing = selections
+            .iter()
+            .flat_map(|(topic, partitions)| {
+                partitions
+                    .iter()
+                    .map(move |partition| (topic.clone(), *partition))
+            })
+            .filter(|partition| !committed_set.contains(partition))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(Error::Usage(format!(
+                "one or more partitions are not part of Streams group '{group}': {missing:?}"
+            )));
+        }
+        selections
+    };
+    if selections.is_empty() {
+        return Err(Error::Usage(format!(
+            "no input-topic offsets matched Streams group '{group}'"
+        )));
+    }
+    let status = if execute { "DELETED" } else { "PREVIEW" };
+    if execute {
+        ffi::delete_group_offsets(
+            admin.inner().native_ptr(),
+            group,
+            &selections,
+            duration_ms(timeout)?,
+        )?;
+    }
+    drop(admin);
+    let rows = selections
+        .into_iter()
+        .flat_map(|(topic, partitions)| {
+            partitions
+                .into_iter()
+                .map(move |partition| StreamsOffsetMutationRow {
+                    group: group.into(),
+                    topic: topic.clone(),
+                    partition,
+                    status: status.into(),
+                })
+        })
+        .collect::<Vec<_>>();
+    output::write_value(format, "streams-groups.delete-offsets", &rows, |rows| {
+        output::table(
+            ["GROUP", "TOPIC", "PARTITION", "STATUS"],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.topic.clone(),
+                    row.partition.to_string(),
+                    row.status.clone(),
+                ]
+            }),
+        )
+    })
+}
+
+fn streams_reset_target_args(args: &StreamsGroupResetOffsetsArgs) -> ResetOffsetsArgs {
+    ResetOffsetsArgs {
+        group: args.group.clone(),
+        all_groups: args.all_groups,
+        topic: args.input_topic.clone(),
+        all_topics: args.all_input_topics,
+        to_earliest: args.to_earliest,
+        to_latest: args.to_latest,
+        to_offset: args.to_offset,
+        shift_by: args.shift_by,
+        to_current: args.to_current,
+        to_datetime: args.to_datetime.clone(),
+        by_duration: args.by_duration.clone(),
+        from_file: args.from_file.clone(),
+        export: args.export,
+        execute: args.execute,
+        dry_run: args.dry_run,
+    }
+}
+
+fn write_streams_reset_rows(
+    format: OutputFormat,
+    rows: &[ResetOffsetRow],
+    export: bool,
+    single_group: bool,
+    errors: &[String],
+) -> Result<()> {
+    if export {
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Vec::new());
+        for row in rows {
+            let result = if single_group {
+                writer.serialize((&row.topic, row.partition, row.new_offset))
+            } else {
+                writer.serialize((&row.group, &row.topic, row.partition, row.new_offset))
+            };
+            result.map_err(|error| Error::Usage(format!("cannot export reset CSV: {error}")))?;
+        }
+        let csv = String::from_utf8(
+            writer
+                .into_inner()
+                .map_err(|error| Error::Usage(format!("cannot finish reset CSV: {error}")))?,
+        )
+        .map_err(|error| Error::Usage(format!("reset CSV is not UTF-8: {error}")))?;
+        print!("{csv}");
+        return Ok(());
+    }
+    output::write_value_with_errors(
+        format,
+        "streams-groups.reset-offsets",
+        &rows,
+        errors,
+        |rows| {
+            output::table(
+                ["GROUP", "TOPIC", "PARTITION", "NEW-OFFSET"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.topic.clone(),
+                        row.partition.to_string(),
+                        row.new_offset.to_string(),
+                    ]
+                }),
+            )
+        },
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Streams reset keeps Kafka's mutually exclusive strategies and per-group topology scope together"
+)]
+async fn reset_streams_group_offsets(
+    config: &rdkafka::ClientConfig,
+    client: &krafka::admin::AdminClient,
+    timeout: Duration,
+    format: OutputFormat,
+    args: &StreamsGroupResetOffsetsArgs,
+) -> Result<()> {
+    let target_args = streams_reset_target_args(args);
+    validate_reset_target(&target_args)?;
+    let groups = if args.all_groups {
+        group_ids_by_type(client, "streams").await?
+    } else {
+        args.group.clone()
+    };
+    if groups.is_empty() {
+        return Err(Error::Usage("no Streams groups matched".into()));
+    }
+    let descriptions = describe_streams_groups(client, &groups, false).await?;
+    let mut errors = Vec::new();
+    let mut inactive = BTreeMap::new();
+    for group in descriptions {
+        if matches!(group.description.group_state.as_str(), "Empty" | "Dead") {
+            inactive.insert(group.description.group_id.clone(), group.description);
+        } else {
+            errors.push(format!(
+                "assignments can only be reset if Streams group '{}' is inactive; current state is {}",
+                group.description.group_id, group.description.group_state
+            ));
+        }
+    }
+    let inactive_ids = inactive.keys().cloned().collect::<Vec<_>>();
+    if let Some(path) = args.from_file.as_deref() {
+        let rows = read_reset_plan(path, &inactive_ids, args.group.len() == 1, config, timeout)?;
+        if args.execute {
+            execute_reset_rows(config, timeout, &rows)?;
+        }
+        return write_streams_reset_rows(
+            format,
+            &rows,
+            args.export,
+            args.group.len() == 1,
+            &errors,
+        );
+    }
+    let timestamp = if let Some(datetime) = args.to_datetime.as_deref() {
+        Some(parse_datetime_millis(datetime)?)
+    } else if let Some(duration) = args.by_duration.as_deref() {
+        Some(
+            Utc::now()
+                .timestamp_millis()
+                .saturating_sub(parse_iso8601_duration_millis(duration)?),
+        )
+    } else {
+        None
+    };
+    let mut rows = Vec::new();
+    for (group_id, description) in &inactive {
+        let topics = if args.all_input_topics {
+            description
+                .topology
+                .as_ref()
+                .into_iter()
+                .flat_map(|topology| &topology.subtopologies)
+                .flat_map(|subtopology| &subtopology.source_topics)
+                .cloned()
+                .map(|topic| (topic, None))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            parse_reset_topics(&args.input_topic)?
+        };
+        let mut consumer_config = config.clone();
+        consumer_config.set("group.id", group_id);
+        let consumer: BaseConsumer = consumer_config.create()?;
+        let mut planned = Vec::new();
+        for (topic_name, selected) in topics {
+            let metadata = consumer.fetch_metadata(Some(&topic_name), timeout)?;
+            let topic = metadata
+                .topics()
+                .iter()
+                .find(|topic| topic.name() == topic_name && topic.error().is_none())
+                .ok_or_else(|| Error::Usage(format!("topic {topic_name} not found")))?;
+            let partitions = topic
+                .partitions()
+                .iter()
+                .filter(|partition| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.contains(&partition.id()))
+                })
+                .collect::<Vec<_>>();
+            if let Some(selected) = &selected {
+                let existing = partitions
+                    .iter()
+                    .map(|partition| partition.id())
+                    .collect::<BTreeSet<_>>();
+                if let Some(missing) = selected.difference(&existing).next() {
+                    return Err(Error::Usage(format!(
+                        "partition {topic_name}:{missing} does not exist"
+                    )));
+                }
+            }
+            let mut requested = TopicPartitionList::new();
+            for partition in &partitions {
+                requested.add_partition(&topic_name, partition.id());
+            }
+            let committed = if args.shift_by.is_some() || args.to_current {
+                Some(consumer.committed_offsets(requested.clone(), timeout)?)
+            } else {
+                None
+            };
+            let timestamp_offsets = if let Some(timestamp) = timestamp {
+                let mut request = TopicPartitionList::new();
+                for partition in &partitions {
+                    request.add_partition_offset(
+                        &topic_name,
+                        partition.id(),
+                        Offset::Offset(timestamp),
+                    )?;
+                }
+                Some(consumer.offsets_for_times(request, timeout)?)
+            } else {
+                None
+            };
+            for partition in partitions {
+                let (low, high) =
+                    consumer.fetch_watermarks(&topic_name, partition.id(), timeout)?;
+                let new_offset = reset_target(
+                    &target_args,
+                    committed.as_ref(),
+                    timestamp_offsets.as_ref(),
+                    &topic_name,
+                    partition.id(),
+                    low,
+                    high,
+                )?;
+                rows.push(ResetOffsetRow {
+                    group: group_id.clone(),
+                    topic: topic_name.clone(),
+                    partition: partition.id(),
+                    new_offset,
+                });
+                planned.push((topic_name.clone(), partition.id(), new_offset));
+            }
+        }
+        if args.execute {
+            let admin = admin(config)?;
+            ffi::alter_consumer_group_offsets(
+                admin.inner().native_ptr(),
+                group_id,
+                &planned,
+                duration_ms(timeout)?,
+            )?;
+        }
+    }
+    if args.execute && (!args.delete_internal_topic.is_empty() || args.delete_all_internal_topics) {
+        let admin = admin(config)?;
+        for description in inactive.values() {
+            let topics = if args.delete_all_internal_topics {
+                streams_internal_topics(description)
+            } else {
+                args.delete_internal_topic.iter().cloned().collect()
+            };
+            if !topics.is_empty() {
+                let topics = topics.iter().map(String::as_str).collect::<Vec<_>>();
+                admin
+                    .delete_topics(&topics, &AdminOptions::new().request_timeout(Some(timeout)))
+                    .await?;
+            }
+        }
+    }
+    write_streams_reset_rows(format, &rows, args.export, args.group.len() == 1, &errors)
 }
 
 #[derive(Debug, Serialize)]
@@ -3027,6 +4429,90 @@ async fn share_groups(
             topic,
             execute,
         } => delete_share_group_offsets(&client, format, &group, &topic, execute).await,
+    }
+}
+
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the protocol client remains available across every async command branch"
+)]
+async fn streams_groups(
+    config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: StreamsGroupAction,
+    verbose: bool,
+) -> Result<()> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    match action {
+        StreamsGroupAction::List { state } => {
+            list_streams_groups(&client, format, state.as_deref()).await
+        }
+        StreamsGroupAction::Describe {
+            group,
+            all_groups,
+            members,
+            state,
+            offsets: _,
+            topology,
+        } => {
+            let group_ids = if all_groups {
+                group_ids_by_type(&client, "streams").await?
+            } else {
+                group
+            };
+            let descriptions = describe_streams_groups(&client, &group_ids, topology).await?;
+            if topology {
+                write_streams_topologies(format, descriptions)
+            } else if members {
+                write_streams_group_members(format, descriptions, verbose)
+            } else if state {
+                write_streams_group_states(format, descriptions, verbose)
+            } else {
+                write_streams_group_offsets(config, timeout, format, descriptions, verbose)
+            }
+        }
+        StreamsGroupAction::Delete {
+            group,
+            all_groups,
+            delete_all_internal_topics,
+            execute,
+        } => {
+            delete_streams_groups(
+                config,
+                &client,
+                timeout,
+                format,
+                group,
+                all_groups,
+                delete_all_internal_topics,
+                execute,
+            )
+            .await
+        }
+        StreamsGroupAction::DeleteOffsets {
+            group,
+            input_topic,
+            all_input_topics,
+            execute,
+        } => {
+            delete_streams_group_offsets(
+                config,
+                &client,
+                timeout,
+                format,
+                &group,
+                &input_topic,
+                all_input_topics,
+                execute,
+            )
+            .await
+        }
+        StreamsGroupAction::ResetOffsets(args) => {
+            reset_streams_group_offsets(config, &client, timeout, format, &args).await
+        }
     }
 }
 
@@ -13055,6 +14541,140 @@ mod tests {
         assert_eq!(
             share_assignment_parts(std::iter::once(("events", partitions.as_slice()))),
             "events:0,1,2"
+        );
+    }
+
+    #[test]
+    fn streams_group_states_should_accept_all_original_values_case_insensitively() {
+        let states = parse_streams_group_states("empty,NOTREADY,Stable,Assigning,reconciling,DEAD")
+            .expect("valid states");
+
+        assert_eq!(states.len(), 6);
+    }
+
+    #[test]
+    fn streams_group_states_should_reject_consumer_only_state() {
+        let error = parse_streams_group_states("PreparingRebalance").expect_err("invalid state");
+
+        assert!(error.to_string().contains("NotReady"));
+    }
+
+    fn encode_empty_streams_assignment(buffer: &mut BytesMut) {
+        buffer.put_u8(1); // active tasks
+        buffer.put_u8(1); // standby tasks
+        buffer.put_u8(1); // warmup tasks
+        buffer.put_u8(0); // assignment tagged fields
+    }
+
+    #[test]
+    fn streams_group_v0_decoder_should_preserve_topology_and_member_assignment() {
+        let mut buffer = BytesMut::new();
+        buffer.put_i16(0);
+        buffer.put_u8(0);
+        encode_compact_string("streams-app", &mut buffer);
+        encode_compact_string("Stable", &mut buffer);
+        buffer.put_i32(4);
+        buffer.put_i32(3);
+        buffer.put_u8(1); // non-null topology
+        buffer.put_i32(7);
+        buffer.put_u8(2); // one subtopology
+        encode_compact_string("sub-0", &mut buffer);
+        buffer.put_u8(2);
+        encode_compact_string("input", &mut buffer);
+        buffer.put_u8(1); // no repartition sink topics
+        buffer.put_u8(2); // one changelog topic
+        encode_compact_string("streams-app-store-changelog", &mut buffer);
+        buffer.put_i32(0);
+        buffer.put_i16(1);
+        buffer.put_u8(1); // no topic configs
+        buffer.put_u8(0);
+        buffer.put_u8(1); // no repartition source topics
+        buffer.put_u8(0); // subtopology tagged fields
+        buffer.put_u8(0); // topology tagged fields
+        buffer.put_u8(2); // one member
+        encode_compact_string("member-1", &mut buffer);
+        buffer.put_i32(2);
+        buffer.put_u8(0); // instance ID
+        buffer.put_u8(0); // rack ID
+        encode_compact_string("client-1", &mut buffer);
+        encode_compact_string("/127.0.0.1", &mut buffer);
+        buffer.put_i32(7);
+        encode_compact_string("process-1", &mut buffer);
+        buffer.put_u8(0); // endpoint
+        buffer.put_u8(1); // client tags
+        buffer.put_u8(1); // task offsets
+        buffer.put_u8(1); // task end offsets
+        buffer.put_u8(2); // one active task
+        encode_compact_string("sub-0", &mut buffer);
+        buffer.put_u8(2); // one partition
+        buffer.put_i32(0);
+        buffer.put_u8(0); // task tagged fields
+        buffer.put_u8(1); // standby tasks
+        buffer.put_u8(1); // warmup tasks
+        buffer.put_u8(0); // assignment tagged fields
+        encode_empty_streams_assignment(&mut buffer);
+        buffer.put_u8(0); // is classic
+        buffer.put_u8(0); // member tagged fields
+        buffer.put_i32(i32::MIN);
+        buffer.put_u8(0); // group tagged fields
+
+        let (_, _, description) =
+            decode_streams_group_description(&mut buffer, 0).expect("decode v0 description");
+
+        assert_eq!(
+            description.topology.expect("topology").subtopologies[0].source_topics,
+            ["input"]
+        );
+        assert_eq!(description.members[0].assignment.active[0].partitions, [0]);
+    }
+
+    fn encode_streams_topology_node(buffer: &mut BytesMut, name: &str, node_type: i8) {
+        encode_compact_string(name, buffer);
+        buffer.put_i8(node_type);
+        buffer.put_u8(2);
+        encode_compact_string("input", buffer);
+        buffer.put_u8(0); // sink topic
+        buffer.put_u8(1); // stores
+        buffer.put_u8(1); // successors
+        buffer.put_u8(0); // tagged fields
+    }
+
+    #[test]
+    fn streams_group_v1_decoder_should_preserve_topology_description_and_assignor() {
+        let mut buffer = BytesMut::new();
+        buffer.put_i16(0);
+        buffer.put_u8(0);
+        encode_compact_string("streams-app", &mut buffer);
+        encode_compact_string("Empty", &mut buffer);
+        buffer.put_i32(4);
+        buffer.put_i32(3);
+        buffer.put_u8(0); // topology metadata
+        buffer.put_u8(1); // members
+        buffer.put_i32(i32::MIN);
+        buffer.put_u8(1); // topology description
+        buffer.put_u8(2); // one subtopology
+        encode_compact_string("sub-0", &mut buffer);
+        buffer.put_u8(2); // one node
+        encode_streams_topology_node(&mut buffer, "source", 1);
+        buffer.put_u8(0); // subtopology tagged fields
+        buffer.put_u8(1); // global stores
+        buffer.put_u8(0); // topology description tagged fields
+        buffer.put_i8(3);
+        encode_compact_string("uniform", &mut buffer);
+        buffer.put_u8(0); // group tagged fields
+
+        let (_, _, description) =
+            decode_streams_group_description(&mut buffer, 1).expect("decode v1 description");
+
+        assert_eq!(description.assignor.as_deref(), Some("uniform"));
+        assert_eq!(
+            description
+                .topology_description
+                .expect("topology description")
+                .subtopologies[0]
+                .nodes[0]
+                .name,
+            "source"
         );
     }
 }

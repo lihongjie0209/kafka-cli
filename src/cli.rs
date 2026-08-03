@@ -78,6 +78,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-consumer-groups" => Some("groups"),
         "kafka-groups" => Some("all-groups"),
         "kafka-share-groups" => Some("share-groups"),
+        "kafka-streams-groups" => Some("streams-groups"),
         "kafka-configs" => Some("configs"),
         "kafka-get-offsets" => Some("offsets"),
         "kafka-acls" => Some("acls"),
@@ -143,7 +144,7 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             ("--list", "list", false),
         ],
         "all-groups" => &[("--list", "list", false)],
-        "share-groups" => &[
+        "share-groups" | "streams-groups" => &[
             ("--delete-offsets", "delete-offsets", true),
             ("--reset-offsets", "reset-offsets", false),
             ("--describe", "describe", false),
@@ -298,6 +299,8 @@ pub enum Command {
     AllGroups(AllGroupsArgs),
     /// Inspect and manage Share groups.
     ShareGroups(ShareGroupsArgs),
+    /// Inspect and manage Kafka Streams groups.
+    StreamsGroups(StreamsGroupsArgs),
     /// Inspect and alter dynamic configuration.
     Configs(ConfigsArgs),
     /// Query partition offsets.
@@ -997,6 +1000,122 @@ pub struct ShareGroupResetOffsetsArgs {
     pub export: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct StreamsGroupsArgs {
+    /// `StreamsGroupCommand` request/stabilization timeout in milliseconds.
+    #[arg(long = "timeout", global = true, default_value_t = 30_000)]
+    pub timeout_ms: u64,
+    #[command(subcommand)]
+    pub action: StreamsGroupAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StreamsGroupAction {
+    /// List all Kafka Streams groups.
+    List {
+        /// Include state and optionally filter by comma-separated states.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        state: Option<String>,
+    },
+    /// Describe Streams group offsets, members, state, or topology.
+    Describe {
+        #[arg(
+            long,
+            required_unless_present = "all_groups",
+            conflicts_with = "all_groups"
+        )]
+        group: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
+        #[arg(long, conflicts_with_all = ["state", "offsets", "topology"])]
+        members: bool,
+        #[arg(long, conflicts_with_all = ["members", "offsets", "topology"])]
+        state: bool,
+        #[arg(long, conflicts_with_all = ["members", "state", "topology"])]
+        offsets: bool,
+        #[arg(long, conflicts_with_all = ["members", "state", "offsets"])]
+        topology: bool,
+    },
+    /// Delete inactive Streams groups and optionally their internal topics.
+    Delete {
+        #[arg(
+            long,
+            required_unless_present = "all_groups",
+            conflicts_with = "all_groups"
+        )]
+        group: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
+        #[arg(long)]
+        delete_all_internal_topics: bool,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Reset offsets for inactive Streams groups.
+    ResetOffsets(StreamsGroupResetOffsetsArgs),
+    /// Delete offsets for selected input topics in one inactive Streams group.
+    DeleteOffsets {
+        #[arg(long)]
+        group: String,
+        #[arg(long = "input-topic", required_unless_present = "all_input_topics")]
+        input_topic: Vec<String>,
+        #[arg(long, conflicts_with = "input_topic")]
+        all_input_topics: bool,
+        #[arg(long)]
+        execute: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka-compatible Streams reset flags mirror the original command"
+)]
+pub struct StreamsGroupResetOffsetsArgs {
+    #[arg(
+        long,
+        required_unless_present = "all_groups",
+        conflicts_with = "all_groups"
+    )]
+    pub group: Vec<String>,
+    #[arg(long)]
+    pub all_groups: bool,
+    #[arg(long = "input-topic", required_unless_present_any = ["all_input_topics", "from_file"], conflicts_with_all = ["all_input_topics", "from_file"])]
+    pub input_topic: Vec<String>,
+    #[arg(long, conflicts_with_all = ["input_topic", "from_file"])]
+    pub all_input_topics: bool,
+    #[arg(long, conflicts_with_all = ["to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration", "from_file"])]
+    pub to_earliest: bool,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration", "from_file"])]
+    pub to_latest: bool,
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["to_earliest", "to_latest", "shift_by", "to_current", "to_datetime", "by_duration", "from_file"])]
+    pub to_offset: Option<i64>,
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_current", "to_datetime", "by_duration", "from_file"])]
+    pub shift_by: Option<i64>,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_datetime", "by_duration", "from_file"])]
+    pub to_current: bool,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "by_duration", "from_file"])]
+    pub to_datetime: Option<String>,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "from_file"])]
+    pub by_duration: Option<String>,
+    #[arg(long, conflicts_with_all = ["input_topic", "all_input_topics", "to_earliest", "to_latest", "to_offset", "shift_by", "to_current", "to_datetime", "by_duration"])]
+    pub from_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "execute", required_unless_present = "execute")]
+    pub dry_run: bool,
+    #[arg(long, conflicts_with = "dry_run", required_unless_present = "dry_run")]
+    pub execute: bool,
+    #[arg(long)]
+    pub export: bool,
+    #[arg(
+        long,
+        requires = "execute",
+        conflicts_with = "delete_all_internal_topics"
+    )]
+    pub delete_internal_topic: Vec<String>,
+    #[arg(long, requires = "execute", conflicts_with = "delete_internal_topic")]
+    pub delete_all_internal_topics: bool,
+}
+
 impl GroupsArgs {
     pub(crate) fn timeout(&self, default: Duration) -> Duration {
         self.timeout_ms.map_or(default, Duration::from_millis)
@@ -1470,6 +1589,10 @@ mod tests {
             Some("share-groups")
         );
         assert_eq!(
+            compatibility_command("kafka-streams-groups.sh"),
+            Some("streams-groups")
+        );
+        assert_eq!(
             compatibility_command("kafka-client-metrics.sh"),
             Some("client-metrics")
         );
@@ -1487,6 +1610,8 @@ mod tests {
             ("reassign", "--cancel", "cancel"),
             ("client-metrics", "--alter", "alter"),
             ("client-metrics", "--delete", "delete"),
+            ("streams-groups", "--delete", "delete"),
+            ("streams-groups", "--delete-offsets", "delete-offsets"),
         ] {
             let mut arguments = vec![
                 OsString::from("kafka-compatible"),
@@ -1883,6 +2008,27 @@ mod tests {
         "--topic",
         "events:0,1",
         "--to-earliest",
+        "--dry-run",
+        "--export"
+    );
+    parses_command_family!(
+        streams_groups_describe_parses,
+        "streams-groups",
+        "describe",
+        "--group",
+        "streams-app",
+        "--topology"
+    );
+    parses_command_family!(
+        streams_groups_reset_parses,
+        "streams-groups",
+        "reset-offsets",
+        "--group",
+        "streams-app",
+        "--input-topic",
+        "events:0,1",
+        "--shift-by",
+        "-2",
         "--dry-run",
         "--export"
     );

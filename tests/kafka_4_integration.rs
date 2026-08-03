@@ -744,6 +744,23 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
+    success(&bootstrap, &["streams-groups", "list"]);
+    success(&bootstrap, &["streams-groups", "list", "--state"]);
+    let missing_streams_group = kafka(
+        &bootstrap,
+        &[
+            "streams-groups",
+            "describe",
+            "--group",
+            "missing-streams-group",
+            "--state",
+        ],
+    );
+    assert!(!missing_streams_group.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_streams_group.stderr)
+            .contains("StreamsGroupDescribe failed")
+    );
     let all_groups = success(&bootstrap, &["all-groups", "list"]);
     assert!(all_groups.contains("integration-suite"));
     assert!(all_groups.contains("Classic"));

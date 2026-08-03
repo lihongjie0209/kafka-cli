@@ -245,3 +245,26 @@ fn kafka_share_groups_alias_should_accept_original_actions() {
         .stdout(predicate::str::contains("--all-groups"))
         .stdout(predicate::str::contains("--offsets"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_streams_groups_alias_should_accept_original_actions() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-streams-groups.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-streams-groups alias");
+
+    Command::new(alias)
+        .args([
+            "--describe",
+            "--group",
+            "streams-app",
+            "--topology",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--all-groups"))
+        .stdout(predicate::str::contains("--topology"));
+}

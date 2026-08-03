@@ -38,7 +38,7 @@ compatibility.
 ## Command coverage
 
 The binary exposes `topics`, `produce`, `consume`, `groups`, `all-groups`,
-`share-groups`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
+`share-groups`, `streams-groups`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
 `features`, `transactions`, `metadata-quorum`, and `delegation-tokens` command families. Run
 `kafka <command> --help` for details.
@@ -54,6 +54,11 @@ Topic creation and partition expansion accept Kafka-compatible manual
 `--replica-assignment` values. Consumer-group resets support earliest/latest,
 absolute and shifted offsets as well as `--to-current`, `--to-datetime`, and
 ISO-8601 `--by-duration` targets.
+
+Share and Kafka Streams group management provide their original list,
+describe, delete, reset-offsets, and delete-offsets actions. Streams describe
+includes state, member task assignments, offset lag, and Kafka 4.4 topology
+descriptions; tabular output is rendered through the shared table library.
 
 ## Authentication
 
