@@ -37,8 +37,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{
-        AclAction, Cli, ClusterAction, Command, ConfigAction, ConfigEntityType, ElectionType,
-        GroupAction, OffsetTime, ReassignAction, ResetOffsetsArgs, TopicAction, TopicSelector,
+        AclAction, Cli, ClusterAction, Command, ConfigAction, ConfigEntityType, DescribeTopicArgs,
+        ElectionType, GroupAction, ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs,
+        TopicAction,
     },
     config,
     error::{Error, Result},
@@ -197,14 +198,61 @@ struct PartitionSummary {
     topic_id: String,
     partition: i32,
     leader: i32,
+    replication_factor: usize,
     replicas: Vec<i32>,
     isr: Vec<i32>,
+    configs: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct TopicConfigSummary {
     topic: String,
     configs: Vec<String>,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "internal normalized form of Kafka's independent topic describe filters"
+)]
+struct TopicSelector {
+    topic: Option<String>,
+    topic_id: Option<String>,
+    exclude_internal: bool,
+    under_replicated_partitions: bool,
+    unavailable_partitions: bool,
+    under_min_isr_partitions: bool,
+    at_min_isr_partitions: bool,
+    topics_with_overrides: bool,
+}
+
+impl From<ListTopicArgs> for TopicSelector {
+    fn from(args: ListTopicArgs) -> Self {
+        Self {
+            topic: args.topic,
+            topic_id: None,
+            exclude_internal: args.exclude_internal,
+            under_replicated_partitions: false,
+            unavailable_partitions: false,
+            under_min_isr_partitions: false,
+            at_min_isr_partitions: false,
+            topics_with_overrides: false,
+        }
+    }
+}
+
+impl From<&DescribeTopicArgs> for TopicSelector {
+    fn from(args: &DescribeTopicArgs) -> Self {
+        Self {
+            topic: args.topic.clone(),
+            topic_id: args.topic_id.clone(),
+            exclude_internal: args.exclude_internal,
+            under_replicated_partitions: args.under_replicated_partitions,
+            unavailable_partitions: args.unavailable_partitions,
+            under_min_isr_partitions: args.under_min_isr_partitions,
+            at_min_isr_partitions: args.at_min_isr_partitions,
+            topics_with_overrides: args.topics_with_overrides,
+        }
+    }
 }
 
 // This dispatcher mirrors the five Kafka topic actions; splitting it would
@@ -217,12 +265,8 @@ async fn topics(
     action: TopicAction,
 ) -> Result<()> {
     match action {
-        TopicAction::List(selector) => {
-            if selector.topic_id.is_some() {
-                return Err(Error::Usage(
-                    "--topic-id is only supported by topics describe".into(),
-                ));
-            }
+        TopicAction::List(args) => {
+            let selector = TopicSelector::from(args);
             let consumer = base_consumer(config)?;
             let metadata = consumer.fetch_metadata(None, timeout)?;
             let topics = select_topics(&metadata, &selector)?
@@ -240,7 +284,9 @@ async fn topics(
                 output::table(["TOPIC"], rows.iter().map(|row| [row.name.clone()]))
             })
         }
-        TopicAction::Describe(selector) => {
+        TopicAction::Describe(args) => {
+            let selector = TopicSelector::from(&args);
+            validate_topic_id(selector.topic_id.as_deref())?;
             let consumer = base_consumer(config)?;
             let candidate_topic_names = {
                 let metadata = consumer.fetch_metadata(None, timeout)?;
@@ -264,23 +310,39 @@ async fn topics(
                 .filter(|identity| {
                     selector
                         .topic_id
-                        .as_ref()
-                        .is_none_or(|topic_id| topic_id == &identity.id)
+                        .as_deref()
+                        .filter(|topic_id| is_nonzero_topic_id(topic_id))
+                        .is_none_or(|topic_id| topic_id == identity.id)
                 })
                 .map(|identity| (identity.name, identity.id))
                 .collect::<BTreeMap<_, _>>();
-            if selector.topic_id.is_some() && topic_ids.is_empty() {
+            if selector
+                .topic_id
+                .as_deref()
+                .is_some_and(is_nonzero_topic_id)
+                && topic_ids.is_empty()
+                && !args.if_exists
+            {
                 return Err(Error::Usage("no topic matched --topic-id".into()));
             }
-            let selected_topic_names = topic_ids.keys().cloned().collect::<Vec<_>>();
-            let topic_configs = if selector.under_min_isr_partitions
-                || selector.at_min_isr_partitions
-                || selector.topics_with_overrides
+            if selector.topic.is_some()
+                && !selector
+                    .topic_id
+                    .as_deref()
+                    .is_some_and(is_nonzero_topic_id)
+                && topic_ids.is_empty()
+                && !args.if_exists
             {
-                let resources = selected_topic_names
-                    .iter()
-                    .map(|topic| ResourceSpecifier::Topic(topic))
-                    .collect::<Vec<_>>();
+                return Err(Error::Usage("no topic matched --topic".into()));
+            }
+            let selected_topic_names = topic_ids.keys().cloned().collect::<Vec<_>>();
+            let resources = selected_topic_names
+                .iter()
+                .map(|topic| ResourceSpecifier::Topic(topic))
+                .collect::<Vec<_>>();
+            let topic_configs = if resources.is_empty() {
+                Vec::new()
+            } else {
                 admin(config)?
                     .describe_configs(
                         &resources,
@@ -290,8 +352,6 @@ async fn topics(
                     .into_iter()
                     .map(|result| result.map_err(|code| Error::Config(code.to_string())))
                     .collect::<Result<Vec<_>>>()?
-            } else {
-                Vec::new()
             };
             if selector.topics_with_overrides {
                 let rows = topic_configs
@@ -342,6 +402,28 @@ async fn topics(
                         .map(|value| (topic.as_str(), value))
                 })
                 .collect::<BTreeMap<_, _>>();
+            let effective_configs = topic_configs
+                .iter()
+                .filter_map(|resource| {
+                    let OwnedResourceSpecifier::Topic(topic) = &resource.specifier else {
+                        return None;
+                    };
+                    let mut configs = resource
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.source != ConfigSource::Default)
+                        .map(|entry| {
+                            format!(
+                                "{}={}",
+                                entry.name,
+                                entry.value.as_deref().unwrap_or("null")
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    configs.sort();
+                    Some((topic.as_str(), configs))
+                })
+                .collect::<BTreeMap<_, _>>();
             let live_brokers = metadata
                 .brokers()
                 .iter()
@@ -349,6 +431,7 @@ async fn topics(
                 .collect::<BTreeSet<_>>();
             let selector = &selector;
             let live_brokers = &live_brokers;
+            let effective_configs = &effective_configs;
             let rows = select_topics(&metadata, selector)?
                 .into_iter()
                 .filter(|topic| topic_ids.contains_key(topic.name()))
@@ -371,8 +454,13 @@ async fn topics(
                             topic_id: topic_ids.get(topic.name()).cloned().unwrap_or_default(),
                             partition: partition.id(),
                             leader: partition.leader(),
+                            replication_factor: partition.replicas().len(),
                             replicas: partition.replicas().to_vec(),
                             isr: partition.isr().to_vec(),
+                            configs: effective_configs
+                                .get(topic.name())
+                                .cloned()
+                                .unwrap_or_default(),
                         })
                 })
                 .collect::<Vec<_>>();
@@ -383,8 +471,10 @@ async fn topics(
                         "TOPIC_ID",
                         "PARTITION",
                         "LEADER",
+                        "REPLICATION_FACTOR",
                         "REPLICAS",
                         "ISR",
+                        "CONFIGS",
                     ],
                     rows.iter().map(|row| {
                         [
@@ -392,8 +482,10 @@ async fn topics(
                             row.topic_id.clone(),
                             row.partition.to_string(),
                             row.leader.to_string(),
+                            row.replication_factor.to_string(),
                             csv_numbers(&row.replicas),
                             csv_numbers(&row.isr),
+                            row.configs.join(","),
                         ]
                     }),
                 )
@@ -405,20 +497,14 @@ async fn topics(
                 .as_deref()
                 .map(parse_replica_assignment)
                 .transpose()?;
-            if assignments.as_ref().is_some_and(|items| {
-                args.partitions != 1 && usize::try_from(args.partitions) != Ok(items.len())
-            }) {
-                return Err(Error::Usage(
-                    "--partitions must match the number of replica assignments".into(),
-                ));
-            }
+            validate_topic_creation_counts(args.partitions, args.replication_factor)?;
             let assignment_refs = assignments
                 .as_ref()
                 .map(|items| items.iter().map(Vec::as_slice).collect::<Vec<&[i32]>>());
             let (partition_count, replication) = assignment_refs.as_ref().map_or_else(
                 || {
                     (
-                        args.partitions,
+                        args.partitions.unwrap_or(-1),
                         TopicReplication::Fixed(args.replication_factor.unwrap_or(-1)),
                     )
                 },
@@ -451,70 +537,83 @@ async fn topics(
             }
         }
         TopicAction::Alter(args) => {
-            let metadata = if args.if_exists || args.replica_assignment.is_some() {
-                Some(base_consumer(config)?.fetch_metadata(Some(&args.topic), timeout)?)
-            } else {
-                None
+            let metadata = base_consumer(config)?.fetch_metadata(None, timeout)?;
+            let selector = TopicSelector {
+                topic: Some(args.topic.clone()),
+                topic_id: None,
+                exclude_internal: false,
+                under_replicated_partitions: false,
+                unavailable_partitions: false,
+                under_min_isr_partitions: false,
+                at_min_isr_partitions: false,
+                topics_with_overrides: false,
             };
-            if args.if_exists
-                && metadata.as_ref().is_some_and(|metadata| {
-                    metadata
-                        .topics()
-                        .first()
-                        .is_none_or(|topic| topic.error().is_some())
-                })
-            {
-                return write_mutation_rows(
-                    format,
-                    "topics.alter",
-                    &[MutationRow {
-                        resource: args.topic,
-                        status: "NOT_FOUND".into(),
-                        error: None,
-                    }],
-                );
+            let selected = select_topics(&metadata, &selector)?
+                .into_iter()
+                .map(|topic| (topic.name().to_owned(), topic.partitions().len()))
+                .collect::<Vec<_>>();
+            drop(metadata);
+            if selected.is_empty() {
+                if args.if_exists {
+                    return write_mutation_rows(
+                        format,
+                        "topics.alter",
+                        &[MutationRow {
+                            resource: args.topic,
+                            status: "NO_MATCH".into(),
+                            error: None,
+                        }],
+                    );
+                }
+                return Err(Error::Usage("no topics matched --topic".into()));
             }
             let assignments = args
                 .replica_assignment
                 .as_deref()
                 .map(parse_replica_assignment)
                 .transpose()?;
-            let new_assignment_refs = if let Some(assignments) = &assignments {
-                let existing = metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.topics().first())
-                    .filter(|topic| topic.error().is_none())
-                    .ok_or_else(|| Error::Usage(format!("topic {} not found", args.topic)))?
-                    .partitions()
-                    .len();
-                let target = usize::try_from(args.partitions)
-                    .map_err(|_| Error::Usage("--partitions must be greater than zero".into()))?;
-                if assignments.len() != target || existing >= target {
-                    return Err(Error::Usage(
-                        "--replica-assignment must cover every partition and add at least one"
-                            .into(),
-                    ));
-                }
-                Some(
-                    assignments[existing..]
-                        .iter()
-                        .map(Vec::as_slice)
-                        .collect::<Vec<&[i32]>>(),
-                )
-            } else {
-                None
-            };
-            let mut request = NewPartitions::new(
-                &args.topic,
-                usize::try_from(args.partitions)
-                    .map_err(|_| Error::Usage("--partitions must be greater than zero".into()))?,
-            );
-            if let Some(assignments) = new_assignment_refs.as_ref() {
-                request = request.assign(assignments);
+            let target = usize::try_from(args.partitions)
+                .ok()
+                .filter(|partitions| *partitions > 0)
+                .ok_or_else(|| Error::Usage("--partitions must be greater than zero".into()))?;
+            if assignments
+                .as_ref()
+                .is_some_and(|assignments| assignments.len() != target)
+            {
+                return Err(Error::Usage(
+                    "--replica-assignment must cover every target partition".into(),
+                ));
             }
+            let new_assignments = selected
+                .iter()
+                .map(|(topic, existing)| {
+                    if *existing >= target {
+                        return Err(Error::Usage(format!(
+                            "topic {topic} already has {existing} partitions; target must be larger"
+                        )));
+                    }
+                    Ok(assignments.as_ref().map(|assignments| {
+                        assignments[*existing..]
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<&[i32]>>()
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let requests = selected
+                .iter()
+                .zip(&new_assignments)
+                .map(|((topic, _), assignments)| {
+                    let request = NewPartitions::new(topic, target);
+                    match assignments {
+                        Some(assignments) => request.assign(assignments),
+                        None => request,
+                    }
+                })
+                .collect::<Vec<_>>();
             let result = admin(config)?
                 .create_partitions(
-                    &[request],
+                    &requests,
                     &AdminOptions::new().operation_timeout(Some(timeout)),
                 )
                 .await?;
@@ -524,26 +623,18 @@ async fn topics(
             } else {
                 Err(Error::Partial {
                     failed: failures,
-                    total: 1,
+                    total: selected.len(),
                 })
             }
         }
         TopicAction::Delete(args) => {
-            if args.selector.topic_id.is_some() {
-                return Err(Error::Usage(
-                    "--topic-id is only supported by topics describe".into(),
-                ));
-            }
-            let expression = args
-                .selector
-                .topic
-                .ok_or_else(|| Error::Usage("--topic is required for delete".into()))?;
+            let expression = args.topic;
             let consumer = base_consumer(config)?;
             let metadata = consumer.fetch_metadata(None, timeout)?;
             let selector = TopicSelector {
                 topic: Some(expression),
                 topic_id: None,
-                exclude_internal: args.selector.exclude_internal,
+                exclude_internal: false,
                 under_replicated_partitions: false,
                 unavailable_partitions: false,
                 under_min_isr_partitions: false,
@@ -588,7 +679,16 @@ fn select_topics<'a>(
     metadata: &'a rdkafka::metadata::Metadata,
     selector: &TopicSelector,
 ) -> Result<Vec<&'a rdkafka::metadata::MetadataTopic>> {
-    let pattern = selector.topic.as_deref().map(topic_pattern).transpose()?;
+    let expression = if selector
+        .topic_id
+        .as_deref()
+        .is_some_and(is_nonzero_topic_id)
+    {
+        None
+    } else {
+        selector.topic.as_deref()
+    };
+    let pattern = expression.map(topic_pattern).transpose()?;
     Ok(metadata
         .topics()
         .iter()
@@ -599,6 +699,28 @@ fn select_topics<'a>(
                     .is_none_or(|pattern| pattern.is_match(topic.name()))
         })
         .collect())
+}
+
+const ZERO_TOPIC_ID: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+fn is_nonzero_topic_id(topic_id: &str) -> bool {
+    topic_id != ZERO_TOPIC_ID
+}
+
+fn validate_topic_id(topic_id: Option<&str>) -> Result<()> {
+    let Some(topic_id) = topic_id else {
+        return Ok(());
+    };
+    if topic_id.len() != 22
+        || !topic_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(Error::Usage(format!(
+            "invalid topic ID '{topic_id}'; expected a 22-character Kafka UUID"
+        )));
+    }
+    Ok(())
 }
 
 fn topic_partition_matches(
@@ -617,6 +739,26 @@ fn topic_partition_matches(
 fn topic_pattern(expression: &str) -> Result<Regex> {
     Regex::new(&format!("^(?:{expression})$"))
         .map_err(|error| Error::Usage(format!("invalid topic regular expression: {error}")))
+}
+
+fn validate_topic_creation_counts(
+    partitions: Option<i32>,
+    replication_factor: Option<i32>,
+) -> Result<()> {
+    if partitions.is_some_and(|partitions| partitions < 1) {
+        return Err(Error::Usage(
+            "--partitions must be greater than zero".into(),
+        ));
+    }
+    if replication_factor
+        .is_some_and(|replication_factor| !(1..=i32::from(i16::MAX)).contains(&replication_factor))
+    {
+        return Err(Error::Usage(format!(
+            "--replication-factor must be between 1 and {}",
+            i16::MAX
+        )));
+    }
+    Ok(())
 }
 
 fn topic_results(
@@ -6252,6 +6394,35 @@ mod tests {
         let pattern = topic_pattern("events-.*").expect("valid expression");
         assert!(pattern.is_match("events-orders"));
         assert!(!pattern.is_match("archived-events-orders"));
+    }
+
+    #[test]
+    fn topic_id_should_reject_malformed_kafka_uuid() {
+        assert!(matches!(
+            validate_topic_id(Some("not-a-topic-id")),
+            Err(Error::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn zero_topic_id_should_not_override_topic_name() {
+        assert!(!is_nonzero_topic_id(ZERO_TOPIC_ID));
+    }
+
+    #[test]
+    fn topic_creation_should_reject_non_positive_partition_count() {
+        assert!(matches!(
+            validate_topic_creation_counts(Some(0), None),
+            Err(Error::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn topic_creation_should_reject_replication_factor_above_short_max() {
+        assert!(matches!(
+            validate_topic_creation_counts(None, Some(i32::from(i16::MAX) + 1)),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]

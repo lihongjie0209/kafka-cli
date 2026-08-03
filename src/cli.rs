@@ -211,11 +211,21 @@ pub struct TopicsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TopicAction {
-    List(TopicSelector),
-    Describe(TopicSelector),
+    List(ListTopicArgs),
+    Describe(DescribeTopicArgs),
     Create(CreateTopicArgs),
     Alter(AlterTopicArgs),
     Delete(DeleteTopicArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ListTopicArgs {
+    /// Topic name or regular expression. Omit to select all topics.
+    #[arg(long)]
+    pub topic: Option<String>,
+    /// Exclude Kafka internal topics.
+    #[arg(long)]
+    pub exclude_internal: bool,
 }
 
 #[derive(Debug, Args)]
@@ -223,11 +233,11 @@ pub enum TopicAction {
     clippy::struct_excessive_bools,
     reason = "Kafka exposes these mutually exclusive partition report modes as flags"
 )]
-pub struct TopicSelector {
+pub struct DescribeTopicArgs {
     /// Topic name or regular expression. Omit to select all topics.
-    #[arg(long, conflicts_with = "topic_id")]
+    #[arg(long)]
     pub topic: Option<String>,
-    /// Kafka topic UUID. Supported by the describe action.
+    /// Kafka topic UUID. A non-zero ID takes precedence over --topic.
     #[arg(long)]
     pub topic_id: Option<String>,
     /// Exclude Kafka internal topics.
@@ -248,12 +258,19 @@ pub struct TopicSelector {
     /// Only show topics with dynamic topic-level configuration overrides.
     #[arg(long, conflicts_with_all = ["under_min_isr_partitions", "at_min_isr_partitions", "under_replicated_partitions", "unavailable_partitions"])]
     pub topics_with_overrides: bool,
+    /// Succeed when no topic matches the name or ID.
+    #[arg(long)]
+    pub if_exists: bool,
+    /// Maximum partitions requested per `DescribeTopicPartitions` response.
+    #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
+    pub partition_size_limit_per_response: Option<i32>,
 }
 
 #[derive(Debug, Args)]
 pub struct DeleteTopicArgs {
-    #[command(flatten)]
-    pub selector: TopicSelector,
+    /// Topic name or regular expression.
+    #[arg(long)]
+    pub topic: String,
     /// Succeed when no topic matches the expression.
     #[arg(long)]
     pub if_exists: bool,
@@ -263,13 +280,14 @@ pub struct DeleteTopicArgs {
 pub struct CreateTopicArgs {
     #[arg(long)]
     pub topic: String,
-    #[arg(long, default_value_t = 1)]
-    pub partitions: i32,
+    /// Partition count. Omit to use the broker's default.
+    #[arg(long, conflicts_with = "replica_assignment")]
+    pub partitions: Option<i32>,
     /// Replication factor. Omit to use the broker's default.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "replica_assignment")]
     pub replication_factor: Option<i32>,
     /// Manual assignments such as 1:2,2:3 (one comma-separated entry per partition).
-    #[arg(long, conflicts_with = "replication_factor")]
+    #[arg(long, conflicts_with_all = ["partitions", "replication_factor"])]
     pub replica_assignment: Option<String>,
     /// Topic configuration in key=value form.
     #[arg(long = "config")]
@@ -1174,6 +1192,70 @@ mod tests {
             "orders",
         ]);
         assert!(conflicting_group.is_err());
+    }
+
+    #[test]
+    fn topic_create_should_use_broker_defaults_when_counts_are_omitted() {
+        let cli = Cli::try_parse_from(["kafka", "topics", "create", "--topic", "broker-defaults"])
+            .expect("topic create defaults");
+        let Command::Topics(TopicsArgs {
+            action: TopicAction::Create(create),
+        }) = cli.command
+        else {
+            panic!("expected topics create command");
+        };
+
+        assert_eq!((create.partitions, create.replication_factor), (None, None));
+    }
+
+    #[test]
+    fn topic_create_should_reject_counts_with_manual_assignment() {
+        for option in ["--partitions", "--replication-factor"] {
+            let result = Cli::try_parse_from([
+                "kafka",
+                "topics",
+                "create",
+                "--topic",
+                "manual",
+                "--replica-assignment",
+                "1",
+                option,
+                "1",
+            ]);
+
+            assert!(result.is_err(), "accepted {option} with manual assignment");
+        }
+    }
+
+    #[test]
+    fn topic_actions_should_reject_describe_only_options() {
+        for arguments in [
+            vec!["list", "--under-replicated-partitions"],
+            vec!["delete", "--topic", "events", "--exclude-internal"],
+        ] {
+            let mut command = vec!["kafka", "topics"];
+            command.extend(arguments);
+
+            assert!(Cli::try_parse_from(command).is_err());
+        }
+    }
+
+    #[test]
+    fn topic_describe_should_accept_original_selection_options() {
+        let result = Cli::try_parse_from([
+            "kafka",
+            "topics",
+            "describe",
+            "--topic",
+            "events",
+            "--topic-id",
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            "--if-exists",
+            "--partition-size-limit-per-response",
+            "500",
+        ]);
+
+        assert!(result.is_ok(), "describe options failed: {result:?}");
     }
 
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");

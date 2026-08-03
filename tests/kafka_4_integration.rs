@@ -61,6 +61,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .with_env_var("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "true")
         .with_env_var("KAFKA_SUPER_USERS", "User:ANONYMOUS")
+        .with_env_var("KAFKA_NUM_PARTITIONS", "3")
         .start()
         .expect("start Kafka 4.3.1");
     let port = broker
@@ -129,6 +130,29 @@ fn all_command_families_work_against_kafka_4_3_1() {
     ))
     .expect("topic create JSON");
     assert_eq!(topic_created["command"], "topics.create");
+    success(
+        &bootstrap,
+        &["topics", "create", "--topic", "broker-default-partitions"],
+    );
+    let broker_default: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "topics",
+            "describe",
+            "--topic",
+            "broker-default-partitions",
+        ],
+    ))
+    .expect("broker-default topic JSON");
+    assert_eq!(
+        broker_default["data"]
+            .as_array()
+            .expect("broker-default partitions")
+            .len(),
+        3
+    );
     success(
         &bootstrap,
         &[
@@ -209,6 +233,32 @@ fn all_command_families_work_against_kafka_4_3_1() {
         success(&bootstrap, &["topics", "describe", "--topic-id", topic_id])
             .contains("integration-events")
     );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "topics",
+                "describe",
+                "--topic",
+                "does-not-match",
+                "--topic-id",
+                topic_id,
+                "--partition-size-limit-per-response",
+                "1",
+            ],
+        )
+        .contains("integration-events")
+    );
+    success(
+        &bootstrap,
+        &[
+            "topics",
+            "describe",
+            "--topic",
+            "does-not-exist",
+            "--if-exists",
+        ],
+    );
     success(
         &bootstrap,
         &[
@@ -216,10 +266,18 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "create",
             "--topic",
             "under-min-isr",
+            "--partitions",
+            "1",
             "--config",
             "min.insync.replicas=2",
         ],
     );
+    let described_with_config = success(
+        &bootstrap,
+        &["topics", "describe", "--topic", "under-min-isr"],
+    );
+    assert!(described_with_config.contains("REPLICATION_FACTOR"));
+    assert!(described_with_config.contains("min.insync.replicas=2"));
     assert!(
         success(
             &bootstrap,
@@ -292,6 +350,32 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "2",
         ],
     );
+    for topic in ["regex-alter-a", "regex-alter-b"] {
+        success(
+            &bootstrap,
+            &["topics", "create", "--topic", topic, "--partitions", "1"],
+        );
+    }
+    let regex_alter = success(
+        &bootstrap,
+        &[
+            "topics",
+            "alter",
+            "--topic",
+            "regex-alter-.*",
+            "--partitions",
+            "2",
+        ],
+    );
+    assert!(regex_alter.contains("regex-alter-a"));
+    assert!(regex_alter.contains("regex-alter-b"));
+    assert!(
+        success(
+            &bootstrap,
+            &["topics", "describe", "--topic", "regex-alter-.*"],
+        )
+        .contains("regex-alter-b")
+    );
 
     // produce and consume
     Command::cargo_bin("kafka")
@@ -303,6 +387,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "create",
             "--topic",
             "integration-json",
+            "--partitions",
+            "1",
         ])
         .assert()
         .success();
