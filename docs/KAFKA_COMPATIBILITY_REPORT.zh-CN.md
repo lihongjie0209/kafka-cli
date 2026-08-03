@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `cd2405662700cc6f8818fa8abdcb9ae2b7dba8bd`。
+- 本项目审计实现基准：`master`，提交 `a6153429b115be853d3621aa25b0882bd5251d9b`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 按本报告的功能口径，13 个兼容入口中 5 个达到核心功能“已支持”，8 个为“部分支持”；另有 31 个原版入口未支持。因此不能把 29.5% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
@@ -270,8 +270,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前审计实现基准 `cd24056` 已由 GitHub Actions 运行
-[`30847531651`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30847531651) 完整验证通过：fmt/Clippy/156 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。Kafka 4.3.1 覆盖 ACL、Group、Config、offset 等既有闭环；Kafka 3.6.2 回归同时通过。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前审计实现基准 `a615342` 已由 GitHub Actions 运行
+[`30848089820`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30848089820) 完整验证通过：fmt/Clippy/156 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。Kafka 4.3.1 覆盖 ACL、Group、Config、offset 等既有闭环，并真实执行 Kafka 4 `groups list --state Assigning` 协议 fallback；Kafka 3.6.2 回归同时通过。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -393,7 +393,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | ConfigCommand 逐 entity selector | 补齐八类原版专用 entity flags 和四类 defaults flags；user/client quota 可混合默认与命名实体；兼容入口把通用 type/name/default 按原版位置配对重写 | 141 个单元测试、7 个 CLI 测试；Kafka 4.3.1 默认 user + 命名 client 设置→查询→删除闭环；CI `30845939866` 六项全绿 |
 | 2026-08-04 | ConfigCommand 分组 config 值 | 新增专用 add-config 解析器，支持逗号列表、方括号分组、空值、括号内等号和重复 key 后值覆盖；SCRAM 接受 parser 规范化后的 credential body | 146 个单元测试、7 个 CLI 测试；Kafka 4.3.1 `cleanup.policy=[compact,delete]` 闭环及 Kafka 3.6.2 SCRAM 回归；CI `30846507492` 六项全绿 |
 | 2026-08-04 | ConsumerGroup 原版 timeout | groups 命令域新增 `--timeout`，覆盖 Admin 请求与 group 稳定等待；保留原生全局 `--timeout-ms` | 147 个单元测试、7 个 CLI 测试；Kafka 4.3.1 `groups list --timeout 5000` 实际请求；CI `30846952761` 六项全绿 |
-| 2026-08-04 | ConsumerGroup Kafka 4 状态过滤 | `Assigning`/`Reconciling` 通过 ListGroups v5 + ConsumerGroupDescribe 协议 fallback 补齐；旧五状态继续走 librdkafka；确认 `NotReady` 与 Share/Streams 不属于原版 consumer-groups 合法过滤集合 | 149 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Assigning 实际请求；与 Kafka 4.4 源码差分核对 |
+| 2026-08-04 | ConsumerGroup Kafka 4 状态过滤 | `Assigning`/`Reconciling` 通过 ListGroups v5 + ConsumerGroupDescribe 协议 fallback 补齐；旧五状态继续走 librdkafka；确认 `NotReady` 与 Share/Streams 不属于原版 consumer-groups 合法过滤集合 | 149 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Assigning 实际请求；与 Kafka 4.4 源码差分核对；CI `30848089820` 六项全绿 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
