@@ -1488,6 +1488,48 @@ fn all_command_families_work_against_kafka_4_3_1() {
         &bootstrap,
         &[
             "acls",
+            "add",
+            "--group",
+            "integration-batch-group",
+            "--allow-principal",
+            "User:group-config-operator",
+            "--operation",
+            "alter-configs",
+            "--execute",
+        ],
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "acls",
+                "list",
+                "--group",
+                "integration-batch-group",
+                "--principal",
+                "User:group-config-operator",
+            ],
+        )
+        .contains("AlterConfigs")
+    );
+    success(
+        &bootstrap,
+        &[
+            "acls",
+            "remove",
+            "--group",
+            "integration-batch-group",
+            "--principal",
+            "User:group-config-operator",
+            "--operation",
+            "alter-configs",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "acls",
             "remove",
             "--topic",
             "integration-events",

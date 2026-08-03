@@ -4665,6 +4665,9 @@ fn acl_operations(values: &[String]) -> Result<Vec<AclOperation>> {
             "describe-configs" => Ok(AclOperation::DescribeConfigs),
             "alter-configs" => Ok(AclOperation::AlterConfigs),
             "idempotent-write" => Ok(AclOperation::IdempotentWrite),
+            "two-phase-commit" | "create-tokens" | "describe-tokens" => Err(Error::Unsupported(
+                format!("librdkafka 2.12 does not support ACL operation: {value}"),
+            )),
             _ => Err(Error::Usage(format!("unknown ACL operation: {value}"))),
         })
         .collect()
@@ -4729,6 +4732,7 @@ fn acl_bindings(
     }
     validate_acl_entry_values(mutation)?;
     let resources = acl_mutation_resources(mutation, operations)?;
+    validate_acl_resource_operations(&resources)?;
     let mut principals = normalized_acl_values(&mutation.allow_principal, "allow principal")?
         .into_iter()
         .map(|principal| (principal, AclPermissionType::Allow))
@@ -4815,6 +4819,9 @@ fn acl_removal_filters(
                 }),
         );
     }
+    if !entries.is_empty() {
+        validate_acl_resource_operations(&resources)?;
+    }
     let mut filters = Vec::new();
     for (resource_type, resource_name, operations) in resources {
         if entries.is_empty() {
@@ -4897,6 +4904,63 @@ fn validate_acl_entry_values(mutation: &crate::cli::AclMutationArgs) -> Result<(
     Ok(())
 }
 
+fn validate_acl_resource_operations(
+    resources: &[(AclResourceType, String, Vec<AclOperation>)],
+) -> Result<()> {
+    for (resource_type, _, operations) in resources {
+        if let Some(operation) = operations
+            .iter()
+            .find(|operation| !acl_operation_supported(*resource_type, **operation))
+        {
+            return Err(Error::Usage(format!(
+                "ACL resource type {resource_type:?} does not support operation {operation:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+const fn acl_operation_supported(resource_type: AclResourceType, operation: AclOperation) -> bool {
+    if matches!(operation, AclOperation::Any | AclOperation::All) {
+        return true;
+    }
+    match resource_type {
+        AclResourceType::Any => true,
+        AclResourceType::Topic => matches!(
+            operation,
+            AclOperation::Read
+                | AclOperation::Write
+                | AclOperation::Create
+                | AclOperation::Delete
+                | AclOperation::Alter
+                | AclOperation::Describe
+                | AclOperation::DescribeConfigs
+                | AclOperation::AlterConfigs
+        ),
+        AclResourceType::Group => matches!(
+            operation,
+            AclOperation::Read
+                | AclOperation::Delete
+                | AclOperation::Describe
+                | AclOperation::DescribeConfigs
+                | AclOperation::AlterConfigs
+        ),
+        AclResourceType::Cluster => matches!(
+            operation,
+            AclOperation::Create
+                | AclOperation::Alter
+                | AclOperation::Describe
+                | AclOperation::ClusterAction
+                | AclOperation::DescribeConfigs
+                | AclOperation::AlterConfigs
+                | AclOperation::IdempotentWrite
+        ),
+        AclResourceType::TransactionalId => {
+            matches!(operation, AclOperation::Write | AclOperation::Describe)
+        }
+    }
+}
+
 fn acl_mutation_resources(
     mutation: &crate::cli::AclMutationArgs,
     operations: &[AclOperation],
@@ -4916,6 +4980,15 @@ fn acl_mutation_resources(
     if !mutation.deny_principal.is_empty() || !mutation.deny_host.is_empty() {
         return Err(Error::Usage(
             "role ACLs only support allow principals and hosts".into(),
+        ));
+    }
+    if mutation.consumer
+        && !mutation.producer
+        && (mutation.filter.cluster || !mutation.filter.transactional_id.is_empty())
+    {
+        return Err(Error::Usage(
+            "--consumer cannot be combined with --cluster or --transactional-id unless --producer is also set"
+                .into(),
         ));
     }
     let topics = normalized_acl_values(&mutation.filter.topic, "topic")?;
@@ -7510,6 +7583,99 @@ mod tests {
             acl_resources(&filter).expect("resources"),
             [(AclResourceType::Topic, "orders".into())]
         );
+    }
+
+    #[test]
+    fn acl_bindings_should_reject_operation_unsupported_by_resource() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "add",
+            "--group",
+            "billing",
+            "--allow-principal",
+            "User:reader",
+            "--operation",
+            "write",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Add(mutation) = args.action else {
+            panic!("expected ACL add");
+        };
+        let operations = acl_operations(&mutation.operation).expect("operations");
+        let error = acl_bindings(&mutation, &operations).expect_err("unsupported operation");
+        assert!(
+            error
+                .to_string()
+                .contains("Group does not support operation Write")
+        );
+    }
+
+    #[test]
+    fn acl_bindings_should_accept_group_config_operations() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "add",
+            "--group",
+            "billing",
+            "--allow-principal",
+            "User:operator",
+            "--operation",
+            "alter-configs",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Add(mutation) = args.action else {
+            panic!("expected ACL add");
+        };
+        let operations = acl_operations(&mutation.operation).expect("operations");
+        assert!(acl_bindings(&mutation, &operations).is_ok());
+    }
+
+    #[test]
+    fn acl_consumer_role_should_reject_transactional_resource_without_producer() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "add",
+            "--consumer",
+            "--topic",
+            "orders",
+            "--group",
+            "billing",
+            "--transactional-id",
+            "billing-tx",
+            "--allow-principal",
+            "User:reader",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Add(mutation) = args.action else {
+            panic!("expected ACL add");
+        };
+        let error = acl_bindings(&mutation, &[]).expect_err("invalid role resources");
+        assert!(error.to_string().contains("unless --producer is also set"));
+    }
+
+    #[test]
+    fn acl_operations_should_report_librdkafka_new_operation_boundary() {
+        let error = acl_operations(&["two-phase-commit".into()])
+            .expect_err("unsupported librdkafka operation");
+        assert!(error.to_string().contains("librdkafka 2.12"));
     }
 
     #[test]
