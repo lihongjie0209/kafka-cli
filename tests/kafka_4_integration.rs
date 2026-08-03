@@ -621,6 +621,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
     // groups, configs, offsets
     success(&bootstrap, &["groups", "list", "--timeout", "5000"]);
     assert!(success(&bootstrap, &["groups", "list", "--state"]).contains("integration-suite"));
+    success(&bootstrap, &["groups", "list", "--state", "Assigning"]);
     assert!(
         success(&bootstrap, &["groups", "list", "--type", "classic"]).contains("integration-suite")
     );

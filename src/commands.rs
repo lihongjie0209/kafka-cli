@@ -102,6 +102,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Groups(args) => {
             groups(
                 &client_config,
+                bootstrap,
+                command_config.as_deref(),
                 args.timeout(timeout),
                 format,
                 args.action,
@@ -1685,6 +1687,8 @@ fn apply_client_properties(
 
 async fn groups(
     config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
     action: GroupAction,
@@ -1694,13 +1698,18 @@ async fn groups(
         GroupAction::ValidateRegex { .. } => Err(Error::Usage(
             "validate-regex must be handled before client configuration".into(),
         )),
-        GroupAction::List { state, group_type } => list_groups(
-            config,
-            timeout,
-            format,
-            state.as_deref(),
-            group_type.as_deref(),
-        ),
+        GroupAction::List { state, group_type } => {
+            list_groups(
+                config,
+                bootstrap,
+                command_config,
+                timeout,
+                format,
+                state.as_deref(),
+                group_type.as_deref(),
+            )
+            .await
+        }
         GroupAction::Describe {
             group,
             all_groups,
@@ -1906,8 +1915,10 @@ fn validate_group_regex(format: OutputFormat, regex: &str) -> Result<()> {
     })
 }
 
-fn list_groups(
+async fn list_groups(
     config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
     states: Option<&str>,
@@ -1921,13 +1932,21 @@ fn list_groups(
         .map(parse_group_types)
         .transpose()?
         .unwrap_or_default();
-    let client = admin(config)?;
-    let rows = ffi::list_consumer_groups(
-        client.inner().native_ptr(),
-        &states,
-        &types,
-        duration_ms(timeout)?,
-    )?;
+    let rows = if states.iter().any(|state| state.native().is_none()) {
+        list_groups_with_protocol(bootstrap, command_config, timeout, &states, &types).await?
+    } else {
+        let native_states = states
+            .iter()
+            .filter_map(|state| state.native())
+            .collect::<Vec<_>>();
+        let client = admin(config)?;
+        ffi::list_consumer_groups(
+            client.inner().native_ptr(),
+            &native_states,
+            &types,
+            duration_ms(timeout)?,
+        )?
+    };
     output::write_value(format, "groups.list", &rows, |rows| {
         output::table(
             ["GROUP", "TYPE", "STATE", "SIMPLE"],
@@ -1941,6 +1960,61 @@ fn list_groups(
             }),
         )
     })
+}
+
+async fn list_groups_with_protocol(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    states: &[ConsumerGroupStateFilter],
+    types: &[ffi::ConsumerGroupType],
+) -> Result<Vec<ffi::ConsumerGroupListing>> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let group_ids = client
+        .list_consumer_groups()
+        .await?
+        .into_iter()
+        .map(|group| group.group_id)
+        .collect::<Vec<_>>();
+    if group_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let descriptions = client.describe_consumer_groups(group_ids).await?;
+    drop(client);
+    let mut rows = descriptions
+        .into_iter()
+        .filter(|group| {
+            (states.is_empty() || states.iter().any(|state| state.matches(&group.state)))
+                && (types.is_empty()
+                    || types
+                        .iter()
+                        .any(|group_type| group_type_matches(*group_type, &group.group_type)))
+        })
+        .map(|group| ffi::ConsumerGroupListing {
+            group: group.group_id,
+            state: group.state,
+            group_type: group.group_type.to_string(),
+            is_simple: group.protocol_type.as_deref().is_none_or(str::is_empty),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.group.cmp(&right.group));
+    Ok(rows)
+}
+
+const fn group_type_matches(
+    requested: ffi::ConsumerGroupType,
+    actual: &krafka::admin::GroupType,
+) -> bool {
+    matches!(
+        (requested, actual),
+        (
+            ffi::ConsumerGroupType::Consumer,
+            krafka::admin::GroupType::Consumer
+        ) | (
+            ffi::ConsumerGroupType::Classic,
+            krafka::admin::GroupType::Classic
+        )
+    )
 }
 
 fn resolve_group_names(
@@ -1961,21 +2035,57 @@ fn resolve_group_names(
     )
 }
 
-fn parse_group_states(value: &str) -> Result<Vec<ffi::ConsumerGroupState>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumerGroupStateFilter {
+    PreparingRebalance,
+    CompletingRebalance,
+    Stable,
+    Dead,
+    Empty,
+    Assigning,
+    Reconciling,
+}
+
+impl ConsumerGroupStateFilter {
+    const fn native(self) -> Option<ffi::ConsumerGroupState> {
+        match self {
+            Self::PreparingRebalance => Some(ffi::ConsumerGroupState::PreparingRebalance),
+            Self::CompletingRebalance => Some(ffi::ConsumerGroupState::CompletingRebalance),
+            Self::Stable => Some(ffi::ConsumerGroupState::Stable),
+            Self::Dead => Some(ffi::ConsumerGroupState::Dead),
+            Self::Empty => Some(ffi::ConsumerGroupState::Empty),
+            Self::Assigning | Self::Reconciling => None,
+        }
+    }
+
+    fn matches(self, actual: &str) -> bool {
+        let expected = match self {
+            Self::PreparingRebalance => "preparingrebalance",
+            Self::CompletingRebalance => "completingrebalance",
+            Self::Stable => "stable",
+            Self::Dead => "dead",
+            Self::Empty => "empty",
+            Self::Assigning => "assigning",
+            Self::Reconciling => "reconciling",
+        };
+        normalized_group_filter(actual) == expected
+    }
+}
+
+fn parse_group_states(value: &str) -> Result<Vec<ConsumerGroupStateFilter>> {
     if value.is_empty() {
         return Ok(Vec::new());
     }
     value
         .split(',')
         .map(|state| match normalized_group_filter(state).as_str() {
-            "preparingrebalance" => Ok(ffi::ConsumerGroupState::PreparingRebalance),
-            "completingrebalance" => Ok(ffi::ConsumerGroupState::CompletingRebalance),
-            "stable" => Ok(ffi::ConsumerGroupState::Stable),
-            "dead" => Ok(ffi::ConsumerGroupState::Dead),
-            "empty" => Ok(ffi::ConsumerGroupState::Empty),
-            "assigning" | "reconciling" => Err(Error::Unsupported(format!(
-                "librdkafka 2.12 cannot filter consumer groups by the Kafka 4.4 state {state}"
-            ))),
+            "preparingrebalance" => Ok(ConsumerGroupStateFilter::PreparingRebalance),
+            "completingrebalance" => Ok(ConsumerGroupStateFilter::CompletingRebalance),
+            "stable" => Ok(ConsumerGroupStateFilter::Stable),
+            "dead" => Ok(ConsumerGroupStateFilter::Dead),
+            "empty" => Ok(ConsumerGroupStateFilter::Empty),
+            "assigning" => Ok(ConsumerGroupStateFilter::Assigning),
+            "reconciling" => Ok(ConsumerGroupStateFilter::Reconciling),
             _ => Err(Error::Usage(format!(
                 "unknown consumer-group state: {state}"
             ))),
@@ -7812,8 +7922,8 @@ mod tests {
         assert_eq!(
             parse_group_states("Stable,Preparing_Rebalance").expect("states"),
             [
-                ffi::ConsumerGroupState::Stable,
-                ffi::ConsumerGroupState::PreparingRebalance,
+                ConsumerGroupStateFilter::Stable,
+                ConsumerGroupStateFilter::PreparingRebalance,
             ]
         );
         assert_eq!(
@@ -7826,12 +7936,14 @@ mod tests {
     }
 
     #[test]
-    fn consumer_group_state_filter_should_report_librdkafka_boundary_for_assigning() {
-        assert!(matches!(
-            parse_group_states("Assigning"),
-            Err(Error::Unsupported(message))
-                if message.contains("librdkafka 2.12") && message.contains("Assigning")
-        ));
+    fn consumer_group_state_filter_should_accept_kafka_4_consumer_states() {
+        assert_eq!(
+            parse_group_states("Assigning,Reconciling").expect("Kafka 4 states"),
+            [
+                ConsumerGroupStateFilter::Assigning,
+                ConsumerGroupStateFilter::Reconciling,
+            ]
+        );
     }
 
     #[test]
