@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `1dda0cfe48e09d5623522fffe3c9f654a8b2c287`。
+- 本项目基准：`master`，提交 `1e596ab8048bd1af2ca8ade35193fbe4bdf63a18`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -256,10 +256,10 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前实现基准 `1dda0cf` 已由 GitHub Actions 运行
-[`30835653961`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30835653961) 完整验证通过：fmt/Clippy/96 个普通测试、bundled glibc、Kafka 3.6.2、包含显式默认 `--line-reader`/`--formatter` class、key/value StringDeserializer、console component properties 文件、producer 参数映射，以及 consumer 临时 group、不自动提交、命名 offset、group/partition 冲突校验和重复无 group 消费的 Kafka 4.3.1 实际闭环、x86_64 musl 和 aarch64 musl。Kafka 4 集成测试连续两次以无 group/from-beginning 消费同一消息，验证临时 group 不遗留提交状态；手工 partition 使用 `--offset earliest` 验证命名 offset。普通 CLI 测试会通过真实兼容符号链接启动二进制，并验证 configs `--alter` 会进入执行路径而非输出 PREVIEW；单元测试逐项覆盖 StringDeserializer UTF-8 行为和配置优先级、默认 console class 接受与自定义 JVM class 拒绝、consumer 配置约束、producer 配置映射、配置文件合并、废弃配置别名、groups/configs/ACL/reassignment，以及 delete-records、leader-election、cluster unregister 的 mutation rewrite。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前实现基准 `1e596ab` 已由 GitHub Actions 运行
+[`30836290536`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30836290536) 完整验证通过：fmt/Clippy/96 个普通测试、bundled glibc、Kafka 3.6.2、包含显式默认 `--line-reader`/`--formatter` class、key/value StringDeserializer、console component properties 文件、producer 参数映射，以及 consumer 临时 group、不自动提交、命名 offset、group/partition 冲突校验和重复无 group 消费的 Kafka 4.3.1 实际闭环、x86_64 musl 和 aarch64 musl。CI Actions 已迁移到 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256，替代仍依赖 Node.js 20 的 setup action。该运行的六个 job 均无 annotation。Kafka 4 集成测试连续两次以无 group/from-beginning 消费同一消息，验证临时 group 不遗留提交状态；配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
-musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
+musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
 ## 9. 建议的后续优先级
 
@@ -362,6 +362,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-04 | Console consumer 默认语义 | 无显式 group 时生成临时 group 并默认关闭自动提交；校验 group 来源一致性及 group/partition 冲突；offset 支持 earliest/latest/非负整数并要求 partition；对齐 from-beginning、auto.offset.reset 与 isolation 配置优先级 | 85 个单元测试、7 个 CLI 测试、Kafka 4.3.1 重复无 group 消费和命名 offset 闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Console component class 参数 | producer 接受原版默认 `--line-reader` 类名，consumer 接受原版默认 `--formatter` 类名；自定义 JVM class 改为可解析后明确 unsupported，不再作为未知参数失败 | 87 个单元测试、7 个 CLI 测试、Kafka 4.3.1 显式默认 class 生产消费闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | Console StringDeserializer | 新增原版 key/value deserializer 参数；默认 formatter 原生支持 Kafka StringDeserializer 及 headers property，formatter property 覆盖 CLI，UTF-8 非法字节按 Java 语义替换；其他 JVM class 明确 unsupported | 89 个单元测试、7 个 CLI 测试、Kafka 4.3.1 StringDeserializer 生产消费闭环、Kafka 3.6.2、bundled glibc 及双 musl CI 全部通过 |
+| 2026-08-04 | CI Node.js 24 与 Zig 供应链 | checkout/setup-java/upload-artifact/rust-cache 升级到 Node.js 24 版本；移除仍使用 Node.js 20 的 setup-zig，改为从官方索引解析固定 Zig 0.15.2、校验 SHA-256 后安装；quota/broker logger 配置传播断言统一使用有界重试 | actionlint 1.7.12 通过；96 个普通测试、Kafka 3.6.2/4.3.1、bundled glibc、x86_64/aarch64 musl 全绿，六个 job 零 annotation |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
