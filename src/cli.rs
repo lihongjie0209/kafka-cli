@@ -450,7 +450,10 @@ pub enum ConfigAction {
         #[arg(long, value_enum)]
         entity_type: ConfigEntityType,
         #[arg(long)]
-        entity_name: String,
+        entity_name: Option<String>,
+        /// Include inherited/static/default configurations, not only dynamic overrides.
+        #[arg(long)]
+        all: bool,
     },
     Alter {
         #[arg(long, value_enum)]
@@ -749,6 +752,14 @@ mod tests {
         "events",
         "--add-config-file",
         "topic.properties"
+    );
+    parses_command_family!(
+        configs_all_entities_parses,
+        "configs",
+        "describe",
+        "--entity-type",
+        "topics",
+        "--all"
     );
     parses_command_family!(offsets_family_parses, "offsets", "--topic", "events");
     parses_command_family!(

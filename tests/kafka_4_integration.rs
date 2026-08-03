@@ -582,6 +582,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "integration-events",
         ],
     );
+    let all_topic_configs = success(
+        &bootstrap,
+        &["configs", "describe", "--entity-type", "topics", "--all"],
+    );
+    assert!(all_topic_configs.contains("integration-events"));
+    assert!(all_topic_configs.contains("cleanup.policy"));
     success(
         &bootstrap,
         &[

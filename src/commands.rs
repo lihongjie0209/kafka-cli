@@ -1672,46 +1672,12 @@ async fn configs(
         ConfigAction::Describe {
             entity_type,
             entity_name,
+            all,
         } => {
             if matches!(entity_type, ConfigEntityType::User) {
                 return describe_user_scram(config, timeout, format, entity_name);
             }
-            let specifier = resource(entity_type, &entity_name)?;
-            let results = admin(config)?
-                .describe_configs(
-                    &[specifier],
-                    &AdminOptions::new().request_timeout(Some(timeout)),
-                )
-                .await?;
-            let rows = results
-                .into_iter()
-                .map(|item| item.map_err(|code| Error::Config(code.to_string())))
-                .collect::<Result<Vec<_>>>()?;
-            output::write_value(
-                format,
-                "configs.describe",
-                &rows
-                    .iter()
-                    .flat_map(|resource| {
-                        resource
-                            .entries
-                            .iter()
-                            .map(|entry| (&entry.name, &entry.value, entry.is_sensitive))
-                    })
-                    .collect::<Vec<_>>(),
-                |rows| {
-                    output::table(
-                        ["NAME", "VALUE", "SENSITIVE"],
-                        rows.iter().map(|(name, value, sensitive)| {
-                            [
-                                (*name).clone(),
-                                value.as_deref().unwrap_or("null").to_owned(),
-                                sensitive.to_string(),
-                            ]
-                        }),
-                    )
-                },
-            )
+            describe_resource_configs(config, timeout, format, entity_type, entity_name, all).await
         }
         ConfigAction::Alter {
             entity_type,
@@ -1797,12 +1763,13 @@ fn describe_user_scram(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
     format: OutputFormat,
-    user: String,
+    user: Option<String>,
 ) -> Result<()> {
     let client = admin(config)?;
+    let users = user.into_iter().collect::<Vec<_>>();
     let rows = ffi::describe_user_scram_credentials(
         client.inner().native_ptr(),
-        &[user],
+        &users,
         duration_ms(timeout)?,
     )?;
     output::write_value(format, "configs.describe-user", &rows, |rows| {
@@ -1817,6 +1784,144 @@ fn describe_user_scram(
             }),
         )
     })
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigDescriptionRow {
+    entity_type: String,
+    entity_name: String,
+    name: String,
+    value: Option<String>,
+    source: String,
+    sensitive: bool,
+}
+
+async fn describe_resource_configs(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    format: OutputFormat,
+    entity_type: ConfigEntityType,
+    entity_name: Option<String>,
+    all: bool,
+) -> Result<()> {
+    let names = match entity_name {
+        Some(name) => vec![name],
+        None => config_entity_names(config, timeout, entity_type)?,
+    };
+    let specifiers = names
+        .iter()
+        .map(|name| resource(entity_type, name))
+        .collect::<Result<Vec<_>>>()?;
+    let results = admin(config)?
+        .describe_configs(
+            &specifiers,
+            &AdminOptions::new().request_timeout(Some(timeout)),
+        )
+        .await?;
+    let resources = results
+        .into_iter()
+        .map(|item| item.map_err(|code| Error::Config(code.to_string())))
+        .collect::<Result<Vec<_>>>()?;
+    let kind = config_entity_type_name(entity_type);
+    let rows = resources
+        .into_iter()
+        .flat_map(|resource| {
+            let entity_name = owned_resource_name(&resource.specifier);
+            resource.entries.into_iter().filter_map(move |entry| {
+                (all || dynamic_config_source(&entry.source)).then(|| ConfigDescriptionRow {
+                    entity_type: kind.into(),
+                    entity_name: entity_name.clone(),
+                    name: entry.name,
+                    value: entry.value,
+                    source: format!("{:?}", entry.source),
+                    sensitive: entry.is_sensitive,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    output::write_value(format, "configs.describe", &rows, |rows| {
+        output::table(
+            [
+                "ENTITY_TYPE",
+                "ENTITY_NAME",
+                "NAME",
+                "VALUE",
+                "SOURCE",
+                "SENSITIVE",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.entity_type.clone(),
+                    row.entity_name.clone(),
+                    row.name.clone(),
+                    row.value.as_deref().unwrap_or("null").to_owned(),
+                    row.source.clone(),
+                    row.sensitive.to_string(),
+                ]
+            }),
+        )
+    })
+}
+
+fn config_entity_names(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    kind: ConfigEntityType,
+) -> Result<Vec<String>> {
+    let consumer = base_consumer(config)?;
+    match kind {
+        ConfigEntityType::Topic => Ok(consumer
+            .fetch_metadata(None, timeout)?
+            .topics()
+            .iter()
+            .filter(|topic| topic.error().is_none())
+            .map(|topic| topic.name().to_owned())
+            .collect()),
+        ConfigEntityType::Broker => Ok(consumer
+            .fetch_metadata(None, timeout)?
+            .brokers()
+            .iter()
+            .map(|broker| broker.id().to_string())
+            .collect()),
+        ConfigEntityType::Group => {
+            let admin = admin(config)?;
+            Ok(ffi::list_consumer_groups(
+                admin.inner().native_ptr(),
+                &[],
+                &[],
+                duration_ms(timeout)?,
+            )?
+            .into_iter()
+            .map(|group| group.group)
+            .collect())
+        }
+        ConfigEntityType::User => unreachable!("SCRAM users use their own Admin API"),
+    }
+}
+
+const fn config_entity_type_name(kind: ConfigEntityType) -> &'static str {
+    match kind {
+        ConfigEntityType::Topic => "topics",
+        ConfigEntityType::Broker => "brokers",
+        ConfigEntityType::Group => "groups",
+        ConfigEntityType::User => "users",
+    }
+}
+
+fn owned_resource_name(specifier: &OwnedResourceSpecifier) -> String {
+    match specifier {
+        OwnedResourceSpecifier::Topic(name) | OwnedResourceSpecifier::Group(name) => name.clone(),
+        OwnedResourceSpecifier::Broker(id) => id.to_string(),
+    }
+}
+
+const fn dynamic_config_source(source: &ConfigSource) -> bool {
+    matches!(
+        source,
+        ConfigSource::DynamicTopic
+            | ConfigSource::DynamicBroker
+            | ConfigSource::DynamicDefaultBroker
+    )
 }
 
 fn alter_user_scram(
