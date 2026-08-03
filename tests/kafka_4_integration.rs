@@ -78,6 +78,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
     let topic_config_file = fixture.path().join("topic.properties");
     let reader_config_file = fixture.path().join("reader.properties");
     let formatter_config_file = fixture.path().join("formatter.properties");
+    let delegation_config_file = fixture.path().join("delegation.properties");
     fs::write(
         &delete_file,
         r#"{"partitions":[{"topic":"integration-events","partition":0,"offset":1}]}"#,
@@ -98,6 +99,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
         "print.partition=true\nprint.offset=true\nprint.headers=true\nprint.key=true\nkey.separator=:\nheaders.separator=;\nnull.literal=NULL\n",
     )
     .expect("formatter properties fixture");
+    fs::write(&delegation_config_file, "").expect("delegation properties fixture");
     fs::write(
         &reassignment_file,
         r#"{"version":1,"partitions":[{"topic":"integration-events","partition":0,"replicas":[1],"log_dirs":["any"]}]}"#,
@@ -2103,6 +2105,22 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("DRY_RUN")
     );
+    let delegation_describe = kafka(
+        &bootstrap,
+        &[
+            "--command-config",
+            delegation_config_file
+                .to_str()
+                .expect("delegation config path"),
+            "delegation-tokens",
+            "describe",
+        ],
+    );
+    assert!(
+        !delegation_describe.status.success(),
+        "PLAINTEXT Kafka should reject delegation token management"
+    );
+    assert!(!delegation_describe.stderr.is_empty());
 
     success(
         &bootstrap,

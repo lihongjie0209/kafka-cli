@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use bytes::{Buf, BufMut, BytesMut};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
@@ -41,9 +44,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::{
         AclAction, Cli, ClientMetricsAction, ClusterAction, Command, ConfigAction,
-        ConfigEntityArgs, ConfigEntityType, DescribeTopicArgs, ElectionType, FeatureAction,
-        GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime, ReassignAction,
-        ResetOffsetsArgs, TopicAction, TransactionAction,
+        ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs, ElectionType,
+        FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
+        ReassignAction, ResetOffsetsArgs, TopicAction, TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -223,13 +226,23 @@ pub async fn execute(cli: Cli) -> Result<()> {
             .await
         }
         Command::MetadataQuorum(args) => {
-            metadata_quorum(
+            Box::pin(metadata_quorum(
                 bootstrap,
                 command_config.as_deref(),
                 timeout,
                 format,
                 &args.action,
-            )
+            ))
+            .await
+        }
+        Command::DelegationTokens(args) => {
+            Box::pin(delegation_tokens(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                &args.action,
+            ))
             .await
         }
         Command::Acls(args) => acls(&client_config, timeout, format, &args.action),
@@ -5186,6 +5199,381 @@ async fn metadata_quorum(
     }
 }
 
+fn parse_kafka_principals(values: &[String], option: &str) -> Result<Vec<(String, String)>> {
+    values
+        .iter()
+        .map(|value| {
+            let value = value.trim();
+            let (principal_type, principal_name) = value.split_once(':').ok_or_else(|| {
+                Error::Usage(format!(
+                    "invalid {option} '{value}'; expected principalType:name"
+                ))
+            })?;
+            if principal_type.is_empty() || principal_name.is_empty() {
+                return Err(Error::Usage(format!(
+                    "invalid {option} '{value}'; principal type and name must be non-empty"
+                )));
+            }
+            Ok((principal_type.to_owned(), principal_name.to_owned()))
+        })
+        .collect()
+}
+
+fn delegation_timestamp(timestamp: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp).map_or_else(
+        || timestamp.to_string(),
+        |timestamp| timestamp.format("%Y-%m-%dT%H:%M").to_string(),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct DelegationTokenRow {
+    token_id: String,
+    hmac: String,
+    owner: String,
+    requester: String,
+    renewers: String,
+    issue_date: String,
+    expiry_date: String,
+    max_date: String,
+}
+
+fn delegation_token_row(token: krafka::protocol::DelegationTokenInfo) -> DelegationTokenRow {
+    let owner = format!("{}:{}", token.principal_type, token.principal_name);
+    let requester = token
+        .token_requester_principal_type
+        .zip(token.token_requester_principal_name)
+        .map_or_else(
+            || owner.clone(),
+            |(principal_type, principal_name)| format!("{principal_type}:{principal_name}"),
+        );
+    DelegationTokenRow {
+        token_id: token.token_id,
+        hmac: STANDARD.encode(token.hmac),
+        owner,
+        requester,
+        renewers: token
+            .renewers
+            .iter()
+            .map(|renewer| format!("{}:{}", renewer.principal_type, renewer.principal_name))
+            .collect::<Vec<_>>()
+            .join(","),
+        issue_date: delegation_timestamp(token.issue_timestamp_ms),
+        expiry_date: delegation_timestamp(token.expiry_timestamp_ms),
+        max_date: delegation_timestamp(token.max_timestamp_ms),
+    }
+}
+
+fn write_delegation_tokens(
+    format: OutputFormat,
+    command: &str,
+    rows: &[DelegationTokenRow],
+) -> Result<()> {
+    output::write_value(format, command, &rows, |rows| {
+        output::table(
+            [
+                "TOKENID",
+                "HMAC",
+                "OWNER",
+                "REQUESTER",
+                "RENEWERS",
+                "ISSUEDATE",
+                "EXPIRYDATE",
+                "MAXDATE",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.token_id.clone(),
+                    row.hmac.clone(),
+                    row.owner.clone(),
+                    row.requester.clone(),
+                    row.renewers.clone(),
+                    row.issue_date.clone(),
+                    row.expiry_date.clone(),
+                    row.max_date.clone(),
+                ]
+            }),
+        )
+    })
+}
+
+async fn delegation_broker_connection(
+    client: &krafka::admin::AdminClient,
+) -> Result<std::sync::Arc<krafka::network::BrokerConnection>> {
+    let cluster = client.describe_cluster().await?;
+    let broker = cluster
+        .brokers
+        .first()
+        .ok_or_else(|| Error::Config("cluster returned no brokers".into()))?;
+    Ok(client
+        .pool()
+        .get_connection_by_id(
+            broker.broker_id,
+            &format!("{}:{}", broker.host, broker.port),
+        )
+        .await?)
+}
+
+#[derive(Debug, Serialize)]
+struct DelegationTokenExpiryRow {
+    action: String,
+    expiry_timestamp_ms: i64,
+    expiry_date: String,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening,
+    reason = "branches mirror Kafka DelegationTokenCommand's four actions"
+)]
+async fn delegation_tokens(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: &DelegationTokenAction,
+) -> Result<()> {
+    let command_config = command_config.ok_or_else(|| {
+        Error::Usage("--command-config is required for delegation token operations".into())
+    })?;
+    let client = config::protocol_admin(bootstrap, timeout, Some(command_config)).await?;
+    match action {
+        DelegationTokenAction::Create {
+            owner_principal,
+            renewer_principal,
+            max_life_time_period,
+        } => {
+            if *max_life_time_period < -1 {
+                return Err(Error::Usage(
+                    "--max-life-time-period must be -1 or non-negative".into(),
+                ));
+            }
+            let owners = parse_kafka_principals(owner_principal, "--owner-principal")?;
+            if owners.len() > 1 {
+                return Err(Error::Usage(
+                    "--owner-principal may be supplied at most once for create".into(),
+                ));
+            }
+            let renewers = parse_kafka_principals(renewer_principal, "--renewer-principal")?;
+            let request = krafka::protocol::CreateDelegationTokenRequest {
+                renewers: renewers
+                    .iter()
+                    .map(
+                        |(principal_type, principal_name)| krafka::protocol::CreatableRenewer {
+                            principal_type: principal_type.clone(),
+                            principal_name: principal_name.clone(),
+                        },
+                    )
+                    .collect(),
+                max_lifetime_ms: *max_life_time_period,
+                owner_principal_type: owners.first().map(|owner| owner.0.clone()),
+                owner_principal_name: owners.first().map(|owner| owner.1.clone()),
+            };
+            let connection = client.get_controller_connection().await?;
+            let version = connection
+                .negotiate_api_version(
+                    ApiKey::CreateDelegationToken,
+                    versions::CREATE_DELEGATION_TOKEN_MAX,
+                    versions::CREATE_DELEGATION_TOKEN_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    Error::Unsupported("broker does not support CreateDelegationToken".into())
+                })?;
+            if !owners.is_empty() && version < 3 {
+                return Err(Error::Unsupported(format!(
+                    "--owner-principal requires CreateDelegationToken v3; controller negotiated v{version}"
+                )));
+            }
+            let mut bytes = connection
+                .send_request(ApiKey::CreateDelegationToken, version, |buffer| {
+                    request.encode_versioned(version, buffer)
+                })
+                .await?;
+            drop(connection);
+            let response = krafka::protocol::CreateDelegationTokenResponse::decode_versioned(
+                version, &mut bytes,
+            )?;
+            if !response.error_code.is_ok() {
+                return Err(Error::Config(format!(
+                    "CreateDelegationToken failed: {:?}",
+                    response.error_code
+                )));
+            }
+            let row = delegation_token_row(krafka::protocol::DelegationTokenInfo {
+                principal_type: response.principal_type,
+                principal_name: response.principal_name,
+                token_requester_principal_type: response.token_requester_principal_type,
+                token_requester_principal_name: response.token_requester_principal_name,
+                issue_timestamp_ms: response.issue_timestamp_ms,
+                expiry_timestamp_ms: response.expiry_timestamp_ms,
+                max_timestamp_ms: response.max_timestamp_ms,
+                token_id: response.token_id,
+                hmac: response.hmac,
+                renewers: renewers
+                    .into_iter()
+                    .map(|(principal_type, principal_name)| {
+                        krafka::protocol::DelegationTokenRenewer {
+                            principal_type,
+                            principal_name,
+                        }
+                    })
+                    .collect(),
+            });
+            write_delegation_tokens(format, "delegation-tokens.create", &[row])
+        }
+        DelegationTokenAction::Describe { owner_principal } => {
+            let owners = parse_kafka_principals(owner_principal, "--owner-principal")?;
+            let request = krafka::protocol::DescribeDelegationTokenRequest {
+                owners: (!owners.is_empty()).then(|| {
+                    owners
+                        .into_iter()
+                        .map(|(principal_type, principal_name)| {
+                            krafka::protocol::DescribeDelegationTokenOwner {
+                                principal_type,
+                                principal_name,
+                            }
+                        })
+                        .collect()
+                }),
+            };
+            let connection = delegation_broker_connection(&client).await?;
+            let version = connection
+                .negotiate_api_version(
+                    ApiKey::DescribeDelegationToken,
+                    versions::DESCRIBE_DELEGATION_TOKEN_MAX,
+                    versions::DESCRIBE_DELEGATION_TOKEN_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    Error::Unsupported("broker does not support DescribeDelegationToken".into())
+                })?;
+            let mut bytes = connection
+                .send_request(ApiKey::DescribeDelegationToken, version, |buffer| {
+                    request.encode_versioned(version, buffer)
+                })
+                .await?;
+            drop(connection);
+            let response = krafka::protocol::DescribeDelegationTokenResponse::decode_versioned(
+                version, &mut bytes,
+            )?;
+            if !response.error_code.is_ok() {
+                return Err(Error::Config(format!(
+                    "DescribeDelegationToken failed: {:?}",
+                    response.error_code
+                )));
+            }
+            let rows = response
+                .tokens
+                .into_iter()
+                .map(delegation_token_row)
+                .collect::<Vec<_>>();
+            write_delegation_tokens(format, "delegation-tokens.describe", &rows)
+        }
+        DelegationTokenAction::Renew {
+            hmac,
+            renew_time_period,
+        } => {
+            if *renew_time_period < -1 {
+                return Err(Error::Usage(
+                    "--renew-time-period must be -1 or non-negative".into(),
+                ));
+            }
+            let hmac = STANDARD
+                .decode(hmac)
+                .map_err(|error| Error::Usage(format!("invalid --hmac Base64: {error}")))?;
+            let connection = delegation_broker_connection(&client).await?;
+            let request = krafka::protocol::RenewDelegationTokenRequest {
+                hmac: hmac.into(),
+                renew_period_ms: *renew_time_period,
+            };
+            let version = connection
+                .negotiate_api_version(
+                    ApiKey::RenewDelegationToken,
+                    versions::RENEW_DELEGATION_TOKEN_MAX,
+                    versions::RENEW_DELEGATION_TOKEN_MIN,
+                )
+                .await
+                .ok_or_else(|| {
+                    Error::Unsupported("broker does not support RenewDelegationToken".into())
+                })?;
+            let mut bytes = connection
+                .send_request(ApiKey::RenewDelegationToken, version, |buffer| {
+                    request.encode_versioned(version, buffer)
+                })
+                .await?;
+            drop(connection);
+            let response = krafka::protocol::RenewDelegationTokenResponse::decode_versioned(
+                version, &mut bytes,
+            )?;
+            if !response.error_code.is_ok() {
+                return Err(Error::Config(format!(
+                    "RenewDelegationToken failed: {:?}",
+                    response.error_code
+                )));
+            }
+            let row = DelegationTokenExpiryRow {
+                action: "renew".into(),
+                expiry_timestamp_ms: response.expiry_timestamp_ms,
+                expiry_date: delegation_timestamp(response.expiry_timestamp_ms),
+            };
+            output::write_value(format, "delegation-tokens.renew", &row, |row| {
+                output::table(
+                    ["ACTION", "EXPIRY_TIMESTAMP_MS", "EXPIRY_DATE"],
+                    [[
+                        row.action.clone(),
+                        row.expiry_timestamp_ms.to_string(),
+                        row.expiry_date.clone(),
+                    ]],
+                )
+            })
+        }
+        DelegationTokenAction::Expire {
+            hmac,
+            expiry_time_period,
+        } => {
+            if *expiry_time_period < -1 {
+                return Err(Error::Usage(
+                    "--expiry-time-period must be -1 or non-negative".into(),
+                ));
+            }
+            let hmac = STANDARD
+                .decode(hmac)
+                .map_err(|error| Error::Usage(format!("invalid --hmac Base64: {error}")))?;
+            let result = client
+                .expire_delegation_token(
+                    &hmac,
+                    (*expiry_time_period >= 0).then(|| {
+                        Duration::from_millis(
+                            u64::try_from(*expiry_time_period).unwrap_or(u64::MAX),
+                        )
+                    }),
+                )
+                .await?;
+            if let Some(error) = result.error {
+                return Err(Error::Config(format!(
+                    "ExpireDelegationToken failed: {error}"
+                )));
+            }
+            let row = DelegationTokenExpiryRow {
+                action: "expire".into(),
+                expiry_timestamp_ms: result.expiry_timestamp_ms,
+                expiry_date: delegation_timestamp(result.expiry_timestamp_ms),
+            };
+            output::write_value(format, "delegation-tokens.expire", &row, |row| {
+                output::table(
+                    ["ACTION", "EXPIRY_TIMESTAMP_MS", "EXPIRY_DATE"],
+                    [[
+                        row.action.clone(),
+                        row.expiry_timestamp_ms.to_string(),
+                        row.expiry_date.clone(),
+                    ]],
+                )
+            })
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ClientMetricsResourceRow {
     name: String,
@@ -9638,6 +10026,41 @@ mod tests {
             relative_timestamp(None, false, 1_000).expect("missing timestamp"),
             "-1"
         );
+    }
+
+    #[test]
+    fn delegation_principals_should_trim_and_validate_type_and_name() {
+        assert_eq!(
+            parse_kafka_principals(&[" User:alice ".into()], "--owner-principal")
+                .expect("principal"),
+            [("User".into(), "alice".into())]
+        );
+        assert!(parse_kafka_principals(&["alice".into()], "--owner-principal").is_err());
+        assert!(parse_kafka_principals(&["User:".into()], "--owner-principal").is_err());
+    }
+
+    #[test]
+    fn delegation_token_row_should_preserve_requester_renewers_and_standard_hmac() {
+        let row = delegation_token_row(krafka::protocol::DelegationTokenInfo {
+            principal_type: "User".into(),
+            principal_name: "owner".into(),
+            token_requester_principal_type: Some("User".into()),
+            token_requester_principal_name: Some("requester".into()),
+            issue_timestamp_ms: 0,
+            expiry_timestamp_ms: 60_000,
+            max_timestamp_ms: 120_000,
+            token_id: "token-1".into(),
+            hmac: bytes::Bytes::from_static(&[0xfb, 0xff]),
+            renewers: vec![krafka::protocol::DelegationTokenRenewer {
+                principal_type: "User".into(),
+                principal_name: "renewer".into(),
+            }],
+        });
+
+        assert_eq!(row.owner, "User:owner");
+        assert_eq!(row.requester, "User:requester");
+        assert_eq!(row.renewers, "User:renewer");
+        assert_eq!(row.hmac, "+/8=");
     }
 
     #[test]

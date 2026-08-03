@@ -89,6 +89,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-features" => Some("features"),
         "kafka-transactions" => Some("transactions"),
         "kafka-metadata-quorum" => Some("metadata-quorum"),
+        "kafka-delegation-tokens" => Some("delegation-tokens"),
         _ => None,
     }
 }
@@ -156,6 +157,12 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             ("--delete", "delete", true),
             ("--describe", "describe", false),
             ("--list", "list", false),
+        ],
+        "delegation-tokens" => &[
+            ("--create", "create", false),
+            ("--renew", "renew", false),
+            ("--expire", "expire", false),
+            ("--describe", "describe", false),
         ],
         _ => &[],
     };
@@ -299,6 +306,46 @@ pub enum Command {
     Transactions(TransactionsArgs),
     /// Inspect and modify the `KRaft` metadata quorum.
     MetadataQuorum(MetadataQuorumArgs),
+    /// Create, inspect, renew, and expire delegation tokens.
+    DelegationTokens(DelegationTokensArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DelegationTokensArgs {
+    #[command(subcommand)]
+    pub action: DelegationTokenAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DelegationTokenAction {
+    /// Create a delegation token.
+    Create {
+        #[arg(long = "owner-principal")]
+        owner_principal: Vec<String>,
+        #[arg(long = "renewer-principal")]
+        renewer_principal: Vec<String>,
+        #[arg(long = "max-life-time-period", allow_hyphen_values = true)]
+        max_life_time_period: i64,
+    },
+    /// Renew a delegation token.
+    Renew {
+        #[arg(long)]
+        hmac: String,
+        #[arg(long = "renew-time-period", allow_hyphen_values = true)]
+        renew_time_period: i64,
+    },
+    /// Expire a delegation token.
+    Expire {
+        #[arg(long)]
+        hmac: String,
+        #[arg(long = "expiry-time-period", allow_hyphen_values = true)]
+        expiry_time_period: i64,
+    },
+    /// Describe visible delegation tokens.
+    Describe {
+        #[arg(long = "owner-principal")]
+        owner_principal: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1814,6 +1861,40 @@ mod tests {
     parses_command_family!(client_metrics_family_parses, "client-metrics", "list");
     parses_command_family!(features_family_parses, "features", "describe");
     parses_command_family!(transactions_list_family_parses, "transactions", "list");
+    parses_command_family!(
+        delegation_tokens_create_family_parses,
+        "delegation-tokens",
+        "create",
+        "--max-life-time-period",
+        "-1",
+        "--renewer-principal",
+        "User:alice"
+    );
+    parses_command_family!(
+        delegation_tokens_renew_family_parses,
+        "delegation-tokens",
+        "renew",
+        "--hmac",
+        "AA==",
+        "--renew-time-period",
+        "-1"
+    );
+    parses_command_family!(
+        delegation_tokens_expire_family_parses,
+        "delegation-tokens",
+        "expire",
+        "--hmac",
+        "AA==",
+        "--expiry-time-period",
+        "-1"
+    );
+    parses_command_family!(
+        delegation_tokens_describe_family_parses,
+        "delegation-tokens",
+        "describe",
+        "--owner-principal",
+        "User:alice"
+    );
     parses_command_family!(
         metadata_quorum_status_family_parses,
         "metadata-quorum",
