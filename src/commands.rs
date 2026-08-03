@@ -817,10 +817,11 @@ async fn consume(
         let pattern = format!("^({include})$");
         consumer.subscribe(&[&pattern])?;
     } else {
-        consumer.subscribe(&[args
+        let topic = args
             .topic
             .as_deref()
-            .expect("clap requires topic or include")])?;
+            .ok_or_else(|| Error::Usage("consume requires --topic or --include".into()))?;
+        consumer.subscribe(&[topic])?;
     }
 
     let mut stream = consumer.stream();
@@ -918,7 +919,9 @@ async fn groups(
     verbose: bool,
 ) -> Result<()> {
     match action {
-        GroupAction::ValidateRegex { .. } => unreachable!("handled before client configuration"),
+        GroupAction::ValidateRegex { .. } => Err(Error::Usage(
+            "validate-regex must be handled before client configuration".into(),
+        )),
         GroupAction::List { state, group_type } => list_groups(
             config,
             timeout,
@@ -1526,6 +1529,7 @@ fn reset_offsets(
     format: OutputFormat,
     args: &ResetOffsetsArgs,
 ) -> Result<()> {
+    validate_reset_target(args)?;
     let groups = resolve_group_names(config, timeout, &args.group, args.all_groups)?;
     if groups.is_empty() {
         return Err(Error::Usage("no consumer groups matched".into()));
@@ -1672,6 +1676,22 @@ fn reset_offsets(
         args.group.len() == 1,
         &group_errors,
     )
+}
+
+fn validate_reset_target(args: &ResetOffsetsArgs) -> Result<()> {
+    if args.to_earliest
+        || args.to_latest
+        || args.to_offset.is_some()
+        || args.shift_by.is_some()
+        || args.to_current
+        || args.to_datetime.is_some()
+        || args.by_duration.is_some()
+        || args.from_file.is_some()
+    {
+        Ok(())
+    } else {
+        Err(Error::Usage("choose one reset target".into()))
+    }
 }
 
 fn resettable_groups(
@@ -2256,7 +2276,9 @@ fn config_entity_names(
             .map(|group| group.group)
             .collect())
         }
-        ConfigEntityType::User => unreachable!("SCRAM users use their own Admin API"),
+        ConfigEntityType::User => Err(Error::Usage(
+            "SCRAM users must use the credential Admin API".into(),
+        )),
     }
 }
 
@@ -4615,6 +4637,30 @@ mod tests {
             93_784_000
         );
         assert!(parse_iso8601_duration_millis("1 hour").is_err());
+    }
+
+    #[test]
+    fn reset_offsets_should_reject_missing_target_before_broker_work() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "groups",
+            "reset-offsets",
+            "--group",
+            "test-group",
+            "--topic",
+            "events",
+        ])
+        .expect("reset command parses");
+        let Command::Groups(groups) = cli.command else {
+            panic!("expected groups command");
+        };
+        let GroupAction::ResetOffsets(args) = groups.action else {
+            panic!("expected reset-offsets action");
+        };
+
+        assert!(matches!(validate_reset_target(&args), Err(Error::Usage(_))));
     }
 
     #[test]

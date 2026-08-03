@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 13 个入口中原版主要动作均有对应路径，但不代表动作内选项完整；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 66 个通过 | 63 个 library unit tests + 3 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 67 个通过 | 64 个 library unit tests + 3 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -228,7 +228,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：66 个通过。
+- Rust 单元测试与普通 CLI 测试：67 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -338,6 +338,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Consumer Group 二次语义审计 | reset-offsets 仅处理 Empty/Dead/不存在的 group，活动组写入结构化 errors；无 committed topic 的 group 不再中断批次；重复 topic selector 合并；group delete 统一 table/JSON 结果 | Clippy、66 个普通测试、Kafka 4.3.1 active-group/重复 selector/delete JSON 集成测试通过 |
 | 2026-08-03 | 管理结果结构化输出 | Topics create/alter/delete、SCRAM alter、ACL add/remove、delete-records 统一接入 `comfy-table`/JSON envelope；ACL FFI 不再直接写 stderr，逐请求错误进入 envelope | Clippy、66 个普通测试、Kafka 4.3.1 Topics/SCRAM/ACL/delete-records JSON 集成测试通过 |
 | 2026-08-03 | 非流式输出闭环 | Reassignment execute/cancel、cluster unregister 及 Topics no-op 结果接入统一 mutation table/JSON；生产/消费流和 CSV 保持专用流格式 | Clippy、66 个普通测试、Kafka 4.3.1 reassignment/unregister JSON 集成测试通过 |
+| 2026-08-03 | 参数与 panic 路径复审 | reset-offsets 在任何 broker 请求前校验 reset scenario；移除 consume、group dispatch、user config 枚举路径的生产代码 `expect!/unreachable!` | all-features Clippy、67 个普通测试通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
