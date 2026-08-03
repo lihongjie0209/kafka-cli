@@ -87,6 +87,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-cluster" => Some("cluster"),
         "kafka-client-metrics" => Some("client-metrics"),
         "kafka-features" => Some("features"),
+        "kafka-transactions" => Some("transactions"),
         _ => None,
     }
 }
@@ -293,6 +294,71 @@ pub enum Command {
     ClientMetrics(ClientMetricsArgs),
     /// Inspect and manage Kafka feature levels.
     Features(FeaturesArgs),
+    /// Analyze and recover transactional producer state.
+    Transactions(TransactionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TransactionsArgs {
+    #[command(subcommand)]
+    pub action: TransactionAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TransactionAction {
+    /// List transactions known to every broker coordinator.
+    List {
+        #[arg(long)]
+        duration_filter: Option<i64>,
+        #[arg(long)]
+        transactional_id_pattern: Option<String>,
+    },
+    /// Describe one transactional ID.
+    Describe {
+        #[arg(long)]
+        transactional_id: String,
+    },
+    /// Describe active producers for one topic-partition.
+    DescribeProducers {
+        #[arg(long)]
+        broker_id: Option<i32>,
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        partition: i32,
+    },
+    /// Abort an open transaction on one topic-partition.
+    Abort {
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        partition: i32,
+        #[arg(long, conflicts_with_all = ["producer_id", "producer_epoch", "coordinator_epoch"])]
+        start_offset: Option<i64>,
+        #[arg(long, requires_all = ["producer_epoch", "coordinator_epoch"])]
+        producer_id: Option<i64>,
+        #[arg(long, requires_all = ["producer_id", "coordinator_epoch"])]
+        producer_epoch: Option<i16>,
+        #[arg(long, requires_all = ["producer_id", "producer_epoch"])]
+        coordinator_epoch: Option<i32>,
+    },
+    /// Locate open transactions no longer owned by a coordinator.
+    FindHanging {
+        #[arg(long)]
+        broker_id: Option<i32>,
+        #[arg(long, default_value_t = 15)]
+        max_transaction_timeout: i32,
+        #[arg(long)]
+        topic: Option<String>,
+        #[arg(long, requires = "topic")]
+        partition: Option<i32>,
+    },
+    /// Fence the producer and force termination of its current transaction.
+    #[command(name = "forceTerminateTransaction")]
+    ForceTerminateTransaction {
+        #[arg(long = "transactionalId")]
+        transactional_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1704,6 +1770,50 @@ mod tests {
     parses_command_family!(cluster_family_parses, "cluster", "cluster-id");
     parses_command_family!(client_metrics_family_parses, "client-metrics", "list");
     parses_command_family!(features_family_parses, "features", "describe");
+    parses_command_family!(transactions_list_family_parses, "transactions", "list");
+    parses_command_family!(
+        transactions_describe_family_parses,
+        "transactions",
+        "describe",
+        "--transactional-id",
+        "orders"
+    );
+    parses_command_family!(
+        transactions_describe_producers_family_parses,
+        "transactions",
+        "describe-producers",
+        "--broker-id",
+        "1",
+        "--topic",
+        "orders",
+        "--partition",
+        "0"
+    );
+    parses_command_family!(
+        transactions_abort_family_parses,
+        "transactions",
+        "abort",
+        "--topic",
+        "orders",
+        "--partition",
+        "0",
+        "--start-offset",
+        "1"
+    );
+    parses_command_family!(
+        transactions_find_hanging_family_parses,
+        "transactions",
+        "find-hanging",
+        "--broker-id",
+        "1"
+    );
+    parses_command_family!(
+        transactions_force_terminate_family_parses,
+        "transactions",
+        "forceTerminateTransaction",
+        "--transactionalId",
+        "orders"
+    );
     parses_command_family!(
         features_upgrade_family_parses,
         "features",

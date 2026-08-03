@@ -156,3 +156,19 @@ fn kafka_features_alias_should_accept_original_subcommands() {
         .stdout(predicate::str::contains("metadata.version"))
         .stdout(predicate::str::contains("30"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_transactions_alias_should_accept_original_subcommands() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-transactions.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-transactions alias");
+
+    Command::new(alias)
+        .args(["list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--duration-filter"));
+}

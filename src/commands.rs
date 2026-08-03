@@ -31,7 +31,7 @@ use rdkafka::{
     consumer::{BaseConsumer, Consumer, StreamConsumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::{BorrowedHeaders, Header, Headers, OwnedHeaders, ToBytes},
-    producer::{DeliveryFuture, FutureProducer, FutureRecord},
+    producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer},
     topic_partition_list::TopicPartitionList,
 };
 use regex::Regex;
@@ -42,6 +42,7 @@ use crate::{
         AclAction, Cli, ClientMetricsAction, ClusterAction, Command, ConfigAction,
         ConfigEntityArgs, ConfigEntityType, DescribeTopicArgs, ElectionType, FeatureAction,
         GroupAction, ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs, TopicAction,
+        TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -193,6 +194,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
         }
         Command::Features(args) => {
             features(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                &args.action,
+            )
+            .await
+        }
+        Command::Transactions(args) => {
+            transactions(
+                &client_config,
                 bootstrap,
                 command_config.as_deref(),
                 timeout,
@@ -3854,6 +3866,579 @@ fn feature_updates(
         })
         .collect();
     Ok((operation, updates, dry_run))
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionListRow {
+    transactional_id: String,
+    coordinator: i32,
+    producer_id: i64,
+    transaction_state: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProducerStateRow {
+    producer_id: i64,
+    producer_epoch: i32,
+    latest_coordinator_epoch: i32,
+    last_sequence: i32,
+    last_timestamp: i64,
+    current_transaction_start_offset: Option<i64>,
+}
+
+async fn transaction_list(
+    client: &krafka::admin::AdminClient,
+    duration_filter: Option<i64>,
+    pattern: Option<&str>,
+) -> Result<Vec<TransactionListRow>> {
+    let cluster = client.describe_cluster().await?;
+    let request = krafka::protocol::ListTransactionsRequest {
+        state_filters: Vec::new(),
+        producer_id_filters: Vec::new(),
+        duration_filter: duration_filter.unwrap_or(-1),
+        transactional_id_pattern: pattern.map(str::to_owned),
+    };
+    let mut rows = Vec::new();
+    for broker in cluster.brokers {
+        let address = format!("{}:{}", broker.host, broker.port);
+        let connection = client
+            .pool()
+            .get_connection_by_id(broker.broker_id, &address)
+            .await?;
+        let version = connection
+            .negotiate_api_version(
+                ApiKey::ListTransactions,
+                versions::LIST_TRANSACTIONS_MAX,
+                versions::LIST_TRANSACTIONS_MIN,
+            )
+            .await
+            .ok_or_else(|| Error::Unsupported("broker does not support ListTransactions".into()))?;
+        if pattern.is_some() && version < 2 {
+            return Err(Error::Unsupported(format!(
+                "transactional-id-pattern requires ListTransactions v2; broker {} negotiated v{version}",
+                broker.broker_id
+            )));
+        }
+        let bytes = connection
+            .send_request(ApiKey::ListTransactions, version, |buffer| {
+                request.encode_versioned(version, buffer)
+            })
+            .await?;
+        drop(connection);
+        let response = krafka::protocol::ListTransactionsResponse::decode_versioned(
+            version,
+            &mut bytes.clone(),
+        )?;
+        if !response.error_code.is_ok() {
+            return Err(Error::Config(format!(
+                "ListTransactions failed on broker {}: {:?}",
+                broker.broker_id, response.error_code
+            )));
+        }
+        rows.extend(
+            response
+                .transaction_states
+                .into_iter()
+                .map(|entry| TransactionListRow {
+                    transactional_id: entry.transactional_id,
+                    coordinator: broker.broker_id,
+                    producer_id: entry.producer_id,
+                    transaction_state: entry.transaction_state,
+                }),
+        );
+    }
+    rows.sort_by(|left, right| left.transactional_id.cmp(&right.transactional_id));
+    Ok(rows)
+}
+
+async fn transaction_coordinator(
+    client: &krafka::admin::AdminClient,
+    transactional_id: &str,
+) -> Result<i32> {
+    let cluster = client.describe_cluster().await?;
+    let broker = cluster
+        .brokers
+        .first()
+        .ok_or_else(|| Error::Config("cluster returned no brokers".into()))?;
+    let address = format!("{}:{}", broker.host, broker.port);
+    let connection = client
+        .pool()
+        .get_connection_by_id(broker.broker_id, &address)
+        .await?;
+    let version = connection
+        .negotiate_api_version(ApiKey::FindCoordinator, 6, 1)
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support FindCoordinator".into()))?;
+    let request = krafka::protocol::FindCoordinatorRequest::for_transaction(transactional_id);
+    let mut bytes = connection
+        .send_request(ApiKey::FindCoordinator, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(connection);
+    let response =
+        krafka::protocol::FindCoordinatorResponse::decode_versioned(version, &mut bytes)?;
+    if !response.error_code.is_ok() {
+        return Err(Error::Config(format!(
+            "FindCoordinator failed for {transactional_id}: {:?}",
+            response.error_code
+        )));
+    }
+    Ok(response.node_id)
+}
+
+async fn transaction_producer_states(
+    client: &krafka::admin::AdminClient,
+    broker_id: Option<i32>,
+    topic: &str,
+    partition: i32,
+) -> Result<Vec<ProducerStateRow>> {
+    if partition < 0 {
+        return Err(Error::Usage("partition must be non-negative".into()));
+    }
+    let result = if let Some(broker_id) = broker_id {
+        let cluster = client.describe_cluster().await?;
+        let broker = cluster
+            .brokers
+            .iter()
+            .find(|broker| broker.broker_id == broker_id)
+            .ok_or_else(|| Error::Usage(format!("broker {broker_id} was not described")))?;
+        let address = format!("{}:{}", broker.host, broker.port);
+        let connection = client
+            .pool()
+            .get_connection_by_id(broker_id, &address)
+            .await?;
+        let request = krafka::protocol::DescribeProducersRequest {
+            topics: vec![krafka::protocol::DescribeProducersTopicRequest {
+                name: topic.into(),
+                partition_indexes: vec![partition],
+            }],
+        };
+        let version = connection
+            .negotiate_api_version(ApiKey::DescribeProducers, 0, 0)
+            .await
+            .ok_or_else(|| {
+                Error::Unsupported("broker does not support DescribeProducers".into())
+            })?;
+        let mut bytes = connection
+            .send_request(ApiKey::DescribeProducers, version, |buffer| {
+                request.encode_versioned(version, buffer)
+            })
+            .await?;
+        drop(connection);
+        krafka::protocol::DescribeProducersResponse::decode_versioned(version, &mut bytes)?.topics
+    } else {
+        client
+            .describe_producers(&[(topic, &[partition])])
+            .await?
+            .into_iter()
+            .map(|topic| krafka::protocol::DescribeProducersTopicResponse {
+                name: topic.name,
+                partitions: topic
+                    .partitions
+                    .into_iter()
+                    .map(
+                        |partition| krafka::protocol::DescribeProducersPartitionResponse {
+                            partition_index: partition.partition_index,
+                            error_code: krafka::error::ErrorCode::None,
+                            error_message: partition.error,
+                            active_producers: partition
+                                .active_producers
+                                .into_iter()
+                                .map(|producer| krafka::protocol::ProducerState {
+                                    producer_id: producer.producer_id,
+                                    producer_epoch: producer.producer_epoch,
+                                    last_sequence: producer.last_sequence,
+                                    last_timestamp: producer.last_timestamp,
+                                    coordinator_epoch: producer.coordinator_epoch,
+                                    current_txn_start_offset: producer.current_txn_start_offset,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .collect(),
+            })
+            .collect()
+    };
+    let partition = result
+        .into_iter()
+        .flat_map(|topic| topic.partitions)
+        .find(|candidate| candidate.partition_index == partition)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "no producer state returned for {topic}-{partition}"
+            ))
+        })?;
+    if let Some(error) = partition.error_message {
+        return Err(Error::Config(error));
+    }
+    Ok(partition
+        .active_producers
+        .into_iter()
+        .map(|producer| ProducerStateRow {
+            producer_id: producer.producer_id,
+            producer_epoch: producer.producer_epoch,
+            latest_coordinator_epoch: producer.coordinator_epoch,
+            last_sequence: producer.last_sequence,
+            last_timestamp: producer.last_timestamp,
+            current_transaction_start_offset: (producer.current_txn_start_offset >= 0)
+                .then_some(producer.current_txn_start_offset),
+        })
+        .collect())
+}
+
+#[derive(Debug, Serialize)]
+struct TransactionDescriptionRow {
+    coordinator_id: i32,
+    transactional_id: String,
+    producer_id: i64,
+    producer_epoch: i16,
+    transaction_state: String,
+    transaction_timeout_ms: i32,
+    current_transaction_start_time_ms: Option<i64>,
+    transaction_duration_ms: Option<i64>,
+    topic_partitions: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HangingTransactionRow {
+    topic: String,
+    partition: i32,
+    producer_id: i64,
+    producer_epoch: i32,
+    coordinator_epoch: i32,
+    start_offset: i64,
+    last_timestamp: i64,
+    duration_minutes: i64,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening,
+    reason = "branches mirror Kafka TransactionsCommand actions and share one protocol client"
+)]
+async fn transactions(
+    client_config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: &TransactionAction,
+) -> Result<()> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    match action {
+        TransactionAction::List {
+            duration_filter,
+            transactional_id_pattern,
+        } => {
+            let rows = transaction_list(
+                &client,
+                *duration_filter,
+                transactional_id_pattern.as_deref(),
+            )
+            .await?;
+            output::write_value(format, "transactions.list", &rows, |rows| {
+                output::table(
+                    [
+                        "TransactionalId",
+                        "Coordinator",
+                        "ProducerId",
+                        "TransactionState",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.transactional_id.clone(),
+                            row.coordinator.to_string(),
+                            row.producer_id.to_string(),
+                            row.transaction_state.clone(),
+                        ]
+                    }),
+                )
+            })
+        }
+        TransactionAction::Describe { transactional_id } => {
+            let coordinator_id = transaction_coordinator(&client, transactional_id).await?;
+            let description = client
+                .describe_transactions(&[transactional_id.as_str()])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::Config(format!("no description returned for {transactional_id}"))
+                })?;
+            if let Some(error) = description.error {
+                return Err(Error::Config(error));
+            }
+            let now = Utc::now().timestamp_millis();
+            let start = (description.start_time_ms >= 0).then_some(description.start_time_ms);
+            let row = TransactionDescriptionRow {
+                coordinator_id,
+                transactional_id: description.transactional_id,
+                producer_id: description.producer_id,
+                producer_epoch: description.producer_epoch,
+                transaction_state: description.state,
+                transaction_timeout_ms: description.timeout_ms,
+                current_transaction_start_time_ms: start,
+                transaction_duration_ms: start.map(|start| now - start),
+                topic_partitions: description
+                    .topics
+                    .iter()
+                    .flat_map(|topic| {
+                        topic
+                            .partitions
+                            .iter()
+                            .map(|partition| format!("{}-{partition}", topic.topic))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            };
+            output::write_value(format, "transactions.describe", &row, |row| {
+                output::table(
+                    [
+                        "CoordinatorId",
+                        "TransactionalId",
+                        "ProducerId",
+                        "ProducerEpoch",
+                        "TransactionState",
+                        "TransactionTimeoutMs",
+                        "CurrentTransactionStartTimeMs",
+                        "TransactionDurationMs",
+                        "TopicPartitions",
+                    ],
+                    [[
+                        row.coordinator_id.to_string(),
+                        row.transactional_id.clone(),
+                        row.producer_id.to_string(),
+                        row.producer_epoch.to_string(),
+                        row.transaction_state.clone(),
+                        row.transaction_timeout_ms.to_string(),
+                        row.current_transaction_start_time_ms
+                            .map_or_else(|| "None".into(), |value| value.to_string()),
+                        row.transaction_duration_ms
+                            .map_or_else(|| "None".into(), |value| value.to_string()),
+                        row.topic_partitions.clone(),
+                    ]],
+                )
+            })
+        }
+        TransactionAction::DescribeProducers {
+            broker_id,
+            topic,
+            partition,
+        } => {
+            let rows = transaction_producer_states(&client, *broker_id, topic, *partition).await?;
+            output::write_value(format, "transactions.describe-producers", &rows, |rows| {
+                output::table(
+                    [
+                        "ProducerId",
+                        "ProducerEpoch",
+                        "LatestCoordinatorEpoch",
+                        "LastSequence",
+                        "LastTimestamp",
+                        "CurrentTransactionStartOffset",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.producer_id.to_string(),
+                            row.producer_epoch.to_string(),
+                            row.latest_coordinator_epoch.to_string(),
+                            row.last_sequence.to_string(),
+                            row.last_timestamp.to_string(),
+                            row.current_transaction_start_offset
+                                .map_or_else(|| "None".into(), |value| value.to_string()),
+                        ]
+                    }),
+                )
+            })
+        }
+        TransactionAction::Abort {
+            topic,
+            partition,
+            start_offset,
+            producer_id,
+            producer_epoch,
+            coordinator_epoch,
+        } => {
+            let (producer_id, producer_epoch, coordinator_epoch) = if let Some(start_offset) =
+                start_offset
+            {
+                let state = transaction_producer_states(&client, None, topic, *partition)
+                    .await?
+                    .into_iter()
+                    .find(|state| state.current_transaction_start_offset == Some(*start_offset))
+                    .ok_or_else(|| Error::Usage(format!("could not find any open transactions starting at offset {start_offset} on partition {topic}-{partition}")))?;
+                (
+                    state.producer_id,
+                    i16::try_from(state.producer_epoch)
+                        .map_err(|_| Error::Config("producer epoch exceeds i16".into()))?,
+                    state.latest_coordinator_epoch.max(0),
+                )
+            } else if let (Some(producer_id), Some(producer_epoch), Some(coordinator_epoch)) =
+                (producer_id, producer_epoch, coordinator_epoch)
+            {
+                (*producer_id, *producer_epoch, (*coordinator_epoch).max(0))
+            } else {
+                return Err(Error::Usage("the transaction must be identified with --start-offset or --producer-id, --producer-epoch, and --coordinator-epoch".into()));
+            };
+            let results = client
+                .write_txn_markers(&[krafka::protocol::WritableTxnMarker {
+                    producer_id,
+                    producer_epoch,
+                    transaction_result: false,
+                    topics: vec![krafka::protocol::WritableTxnMarkerTopic {
+                        name: topic.clone(),
+                        partition_indexes: vec![*partition],
+                    }],
+                    coordinator_epoch,
+                    transaction_version:
+                        krafka::protocol::WritableTxnMarker::legacy_transaction_version(),
+                }])
+                .await?;
+            let errors = results
+                .iter()
+                .flat_map(|result| &result.topics)
+                .flat_map(|topic| &topic.partitions)
+                .filter_map(|partition| partition.error.clone())
+                .collect::<Vec<_>>();
+            if !errors.is_empty() {
+                return Err(Error::Partial {
+                    failed: errors.len(),
+                    total: 1,
+                });
+            }
+            Ok(())
+        }
+        TransactionAction::ForceTerminateTransaction { transactional_id } => {
+            let mut config = client_config.clone();
+            config.set("transactional.id", transactional_id);
+            let producer: FutureProducer = config.create()?;
+            producer.init_transactions(timeout)?;
+            Ok(())
+        }
+        TransactionAction::FindHanging {
+            broker_id,
+            max_transaction_timeout,
+            topic,
+            partition,
+        } => {
+            if topic.is_none() && broker_id.is_none() {
+                return Err(Error::Usage(
+                    "find-hanging requires either --topic or --broker-id".into(),
+                ));
+            }
+            if *max_transaction_timeout < 0 {
+                return Err(Error::Usage(
+                    "max transaction timeout must be non-negative".into(),
+                ));
+            }
+            let metadata_client: BaseConsumer = client_config.create()?;
+            let metadata = metadata_client.fetch_metadata(topic.as_deref(), timeout)?;
+            let mut targets = Vec::new();
+            for metadata_topic in metadata.topics() {
+                if topic
+                    .as_ref()
+                    .is_some_and(|name| name != metadata_topic.name())
+                {
+                    continue;
+                }
+                for metadata_partition in metadata_topic.partitions() {
+                    if partition.is_some_and(|wanted| wanted != metadata_partition.id()) {
+                        continue;
+                    }
+                    if broker_id
+                        .is_some_and(|broker| !metadata_partition.replicas().contains(&broker))
+                    {
+                        continue;
+                    }
+                    targets.push((metadata_topic.name().to_owned(), metadata_partition.id()));
+                }
+            }
+            let now = Utc::now().timestamp_millis();
+            let threshold = i64::from(*max_transaction_timeout) * 60_000;
+            let mut candidates = Vec::new();
+            for (topic, partition) in targets {
+                for state in
+                    transaction_producer_states(&client, *broker_id, &topic, partition).await?
+                {
+                    if state.current_transaction_start_offset.is_some()
+                        && now - state.last_timestamp > threshold
+                    {
+                        candidates.push((topic.clone(), partition, state));
+                    }
+                }
+            }
+            let producer_ids = candidates
+                .iter()
+                .map(|(_, _, state)| state.producer_id)
+                .collect::<Vec<_>>();
+            let listings = client
+                .list_transactions(&[], &producer_ids, -1, None)
+                .await?;
+            let transaction_ids = listings
+                .transactions
+                .iter()
+                .map(|entry| entry.transactional_id.as_str())
+                .collect::<Vec<_>>();
+            let descriptions = client.describe_transactions(&transaction_ids).await?;
+            let mut rows = Vec::new();
+            for (topic, partition, state) in candidates {
+                let transactional_id = listings
+                    .transactions
+                    .iter()
+                    .find(|entry| entry.producer_id == state.producer_id)
+                    .map(|entry| entry.transactional_id.as_str());
+                let still_owned = transactional_id
+                    .and_then(|id| {
+                        descriptions
+                            .iter()
+                            .find(|description| description.transactional_id == id)
+                    })
+                    .is_some_and(|description| {
+                        description.topics.iter().any(|candidate| {
+                            candidate.topic == topic && candidate.partitions.contains(&partition)
+                        })
+                    });
+                if !still_owned {
+                    rows.push(HangingTransactionRow {
+                        topic,
+                        partition,
+                        producer_id: state.producer_id,
+                        producer_epoch: state.producer_epoch,
+                        coordinator_epoch: state.latest_coordinator_epoch,
+                        start_offset: state.current_transaction_start_offset.unwrap_or(-1),
+                        last_timestamp: state.last_timestamp,
+                        duration_minutes: (now - state.last_timestamp) / 60_000,
+                    });
+                }
+            }
+            output::write_value(format, "transactions.find-hanging", &rows, |rows| {
+                output::table(
+                    [
+                        "Topic",
+                        "Partition",
+                        "ProducerId",
+                        "ProducerEpoch",
+                        "CoordinatorEpoch",
+                        "StartOffset",
+                        "LastTimestamp",
+                        "Duration(min)",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.topic.clone(),
+                            row.partition.to_string(),
+                            row.producer_id.to_string(),
+                            row.producer_epoch.to_string(),
+                            row.coordinator_epoch.to_string(),
+                            row.start_offset.to_string(),
+                            row.last_timestamp.to_string(),
+                            row.duration_minutes.to_string(),
+                        ]
+                    }),
+                )
+            })
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

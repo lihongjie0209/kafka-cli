@@ -2039,6 +2039,46 @@ fn all_command_families_work_against_kafka_4_3_1() {
     .expect("unregister preview JSON");
     assert_eq!(unregister_preview["command"], "cluster.unregister");
 
+    // transactions (empty transaction sets and producer state are valid responses)
+    let transactions: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &["--output", "json", "transactions", "list"],
+    ))
+    .expect("transactions list JSON");
+    assert_eq!(transactions["command"], "transactions.list");
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "transactions",
+                "describe-producers",
+                "--broker-id",
+                "1",
+                "--topic",
+                "integration-events",
+                "--partition",
+                "0",
+            ],
+        )
+        .contains("ProducerId")
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "transactions",
+                "find-hanging",
+                "--topic",
+                "integration-events",
+                "--partition",
+                "0",
+                "--max-transaction-timeout",
+                "0",
+            ],
+        )
+        .contains("Duration(min)")
+    );
+
     success(
         &bootstrap,
         &[
