@@ -32,3 +32,32 @@ fn group_regex_validation_should_not_require_a_broker() {
         .stdout(predicate::str::contains("orders-.*"))
         .stdout(predicate::str::contains("true"));
 }
+
+#[test]
+fn reassignment_preview_should_accept_safety_flags_without_connecting() {
+    let file = tempfile::NamedTempFile::new().expect("temporary reassignment file");
+    std::fs::write(
+        file.path(),
+        r#"{"version":1,"partitions":[{"topic":"events","partition":0,"replicas":[1]}]}"#,
+    )
+    .expect("write reassignment fixture");
+    let mut command = Command::cargo_bin("kafka").expect("kafka binary");
+    command
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "reassign",
+            "execute",
+            "--reassignment-json-file",
+            file.path().to_str().expect("fixture path"),
+            "--additional",
+            "--disallow-replication-factor-change",
+            "--throttle",
+            "1048576",
+            "--replica-alter-log-dirs-throttle",
+            "524288",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PREVIEW EXECUTE"));
+}

@@ -1096,9 +1096,39 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "execute",
             "--reassignment-json-file",
             reassignment_file.to_str().expect("fixture path"),
+            "--disallow-replication-factor-change",
+            "--throttle",
+            "1048576",
+            "--replica-alter-log-dirs-throttle",
+            "524288",
             "--execute",
         ],
     );
+    let topic_throttles = success(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            "integration-events",
+        ],
+    );
+    assert!(topic_throttles.contains("leader.replication.throttled.replicas"));
+    let broker_throttles = success(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "brokers",
+            "--entity-name",
+            "1",
+        ],
+    );
+    assert!(broker_throttles.contains("leader.replication.throttled.rate"));
+    assert!(broker_throttles.contains("replica.alter.log.dirs.io.max.bytes.per.second"));
     fs::write(
         &invalid_reassignment_file,
         r#"{"version":1,"partitions":[{"topic":"missing-reassignment-topic","partition":0,"replicas":[1]}]}"#,

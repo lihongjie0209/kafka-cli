@@ -3712,6 +3712,10 @@ async fn reassign(
         }
         ReassignAction::Execute {
             reassignment_json_file,
+            additional,
+            disallow_replication_factor_change,
+            throttle,
+            replica_alter_log_dirs_throttle,
             execute,
         } => {
             let plan = read_reassignment(reassignment_json_file)?;
@@ -3724,6 +3728,24 @@ async fn reassign(
                 );
             }
             let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+            let active = client.list_partition_reassignments(None, timeout).await?;
+            if !additional && reassignment_count(&active) != 0 {
+                return Err(Error::Usage(
+                    "cannot execute while a partition reassignment is active; use --additional to add to the existing reassignment"
+                        .into(),
+                ));
+            }
+            if *disallow_replication_factor_change {
+                reject_replication_factor_changes(config, timeout, &plan)?;
+            }
+            apply_reassignment_throttles(
+                config,
+                timeout,
+                &plan,
+                &active,
+                *throttle,
+                *replica_alter_log_dirs_throttle,
+            )?;
             let result = client
                 .alter_partition_reassignments(reassignment_topics(&plan, false), timeout)
                 .await?;
@@ -3824,6 +3846,215 @@ async fn reassign(
             })
         }
     }
+}
+
+fn reassignment_count(running: &[krafka::admin::PartitionReassignmentInfo]) -> usize {
+    running.iter().map(|topic| topic.partitions.len()).sum()
+}
+
+fn reject_replication_factor_changes(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    plan: &ReassignmentFile,
+) -> Result<()> {
+    let current = current_replicas(config, timeout, plan)?;
+    validate_replication_factors(plan, &current)
+}
+
+fn validate_replication_factors(
+    plan: &ReassignmentFile,
+    current: &BTreeMap<(String, i32), Vec<i32>>,
+) -> Result<()> {
+    let changes = plan
+        .partitions
+        .iter()
+        .filter_map(|target| {
+            let key = (target.topic.clone(), target.partition);
+            current.get(&key).map_or_else(
+                || {
+                    Some(format!(
+                        "{}:{} does not exist in cluster metadata",
+                        target.topic, target.partition
+                    ))
+                },
+                |replicas| {
+                    (replicas.len() != target.replicas.len()).then(|| {
+                        format!(
+                            "{}:{} would change replication factor from {} to {}",
+                            target.topic,
+                            target.partition,
+                            replicas.len(),
+                            target.replicas.len()
+                        )
+                    })
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Usage(format!(
+            "--disallow-replication-factor-change rejected the plan: {}",
+            changes.join("; ")
+        )))
+    }
+}
+
+#[derive(Debug, Default)]
+struct PartitionMove {
+    sources: BTreeSet<i32>,
+    destinations: BTreeSet<i32>,
+}
+
+type ReassignmentMoveMap = BTreeMap<(String, i32), PartitionMove>;
+
+fn reassignment_move_map(
+    plan: &ReassignmentFile,
+    running: &[krafka::admin::PartitionReassignmentInfo],
+    current: &BTreeMap<(String, i32), Vec<i32>>,
+) -> Result<ReassignmentMoveMap> {
+    let mut moves = ReassignmentMoveMap::new();
+    for topic in running {
+        for partition in &topic.partitions {
+            let adding = partition
+                .adding_replicas
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            moves.insert(
+                (topic.name.clone(), partition.partition_index),
+                PartitionMove {
+                    sources: partition
+                        .replicas
+                        .iter()
+                        .copied()
+                        .filter(|broker| !adding.contains(broker))
+                        .collect(),
+                    destinations: adding,
+                },
+            );
+        }
+    }
+    for target in &plan.partitions {
+        let key = (target.topic.clone(), target.partition);
+        let sources = moves.get(&key).map_or_else(
+            || {
+                current
+                    .get(&key)
+                    .map(|replicas| replicas.iter().copied().collect())
+            },
+            |movement| Some(movement.sources.clone()),
+        );
+        let sources = sources.ok_or_else(|| {
+            Error::Usage(format!(
+                "{}:{} does not exist in cluster metadata",
+                target.topic, target.partition
+            ))
+        })?;
+        let destinations = target
+            .replicas
+            .iter()
+            .copied()
+            .filter(|broker| !sources.contains(broker))
+            .collect();
+        moves.insert(
+            key,
+            PartitionMove {
+                sources,
+                destinations,
+            },
+        );
+    }
+    Ok(moves)
+}
+
+fn checked_throttle(value: u64, option: &str) -> Result<String> {
+    i64::try_from(value)
+        .map(|value| value.to_string())
+        .map_err(|_| Error::Usage(format!("{option} must not exceed {}", i64::MAX)))
+}
+
+fn apply_reassignment_throttles(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    plan: &ReassignmentFile,
+    running: &[krafka::admin::PartitionReassignmentInfo],
+    inter_broker: Option<u64>,
+    log_dirs: Option<u64>,
+) -> Result<()> {
+    if inter_broker.is_none() && log_dirs.is_none() {
+        return Ok(());
+    }
+    let current = current_replicas(config, timeout, plan)?;
+    let moves = reassignment_move_map(plan, running, &current)?;
+    let admin = admin(config)?;
+    let timeout_ms = duration_ms(timeout)?;
+    if let Some(rate) = inter_broker {
+        let rate = checked_throttle(rate, "--throttle")?;
+        let mut topic_values = BTreeMap::<String, (BTreeSet<String>, BTreeSet<String>)>::new();
+        let mut brokers = BTreeSet::new();
+        for ((topic, partition), movement) in &moves {
+            let values = topic_values.entry(topic.clone()).or_default();
+            for broker in &movement.sources {
+                values.0.insert(format!("{partition}:{broker}"));
+                brokers.insert(*broker);
+            }
+            for broker in &movement.destinations {
+                values.1.insert(format!("{partition}:{broker}"));
+                brokers.insert(*broker);
+            }
+        }
+        for (topic, (leaders, followers)) in topic_values {
+            ffi::incremental_alter_config(
+                admin.inner().native_ptr(),
+                rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TOPIC,
+                &topic,
+                &[
+                    (
+                        "leader.replication.throttled.replicas".into(),
+                        leaders.into_iter().collect::<Vec<_>>().join(","),
+                    ),
+                    (
+                        "follower.replication.throttled.replicas".into(),
+                        followers.into_iter().collect::<Vec<_>>().join(","),
+                    ),
+                ],
+                &[],
+                timeout_ms,
+            )?;
+        }
+        for broker in brokers {
+            ffi::incremental_alter_config(
+                admin.inner().native_ptr(),
+                rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
+                &broker.to_string(),
+                &[
+                    ("leader.replication.throttled.rate".into(), rate.clone()),
+                    ("follower.replication.throttled.rate".into(), rate.clone()),
+                ],
+                &[],
+                timeout_ms,
+            )?;
+        }
+    }
+    if let Some(rate) = log_dirs {
+        let rate = checked_throttle(rate, "--replica-alter-log-dirs-throttle")?;
+        for broker in broker_log_dir_plan(plan).keys() {
+            ffi::incremental_alter_config(
+                admin.inner().native_ptr(),
+                rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
+                &broker.to_string(),
+                &[(
+                    "replica.alter.log.dirs.io.max.bytes.per.second".into(),
+                    rate.clone(),
+                )],
+                &[],
+                timeout_ms,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn write_reassignment_mutation_rows(
@@ -5284,6 +5515,60 @@ mod tests {
         assert_eq!(moves[&1]["/data/a"]["events"], [0]);
         assert_eq!(moves[&3]["/data/c"]["events"], [0]);
         assert!(!moves.contains_key(&2));
+    }
+
+    #[test]
+    fn replication_factor_guard_should_reject_changed_factor() {
+        let plan = ReassignmentFile {
+            version: 1,
+            partitions: vec![ReassignmentPartition {
+                topic: "events".into(),
+                partition: 0,
+                replicas: vec![1, 2, 3],
+                log_dirs: Vec::new(),
+            }],
+        };
+        let current = BTreeMap::from([(("events".into(), 0), vec![1, 2])]);
+
+        assert!(matches!(
+            validate_replication_factors(&plan, &current),
+            Err(Error::Usage(message)) if message.contains("from 2 to 3")
+        ));
+    }
+
+    #[test]
+    fn replication_factor_guard_should_accept_replica_movement() {
+        let plan = ReassignmentFile {
+            version: 1,
+            partitions: vec![ReassignmentPartition {
+                topic: "events".into(),
+                partition: 0,
+                replicas: vec![2, 3],
+                log_dirs: Vec::new(),
+            }],
+        };
+        let current = BTreeMap::from([(("events".into(), 0), vec![1, 2])]);
+
+        assert!(validate_replication_factors(&plan, &current).is_ok());
+    }
+
+    #[test]
+    fn reassignment_throttle_map_should_include_source_and_new_destination() {
+        let plan = ReassignmentFile {
+            version: 1,
+            partitions: vec![ReassignmentPartition {
+                topic: "events".into(),
+                partition: 0,
+                replicas: vec![2, 3],
+                log_dirs: Vec::new(),
+            }],
+        };
+        let current = BTreeMap::from([(("events".into(), 0), vec![1, 2])]);
+
+        let moves = reassignment_move_map(&plan, &[], &current).expect("valid move map");
+        let movement = &moves[&("events".into(), 0)];
+        assert_eq!(movement.sources, BTreeSet::from([1, 2]));
+        assert_eq!(movement.destinations, BTreeSet::from([3]));
     }
 
     #[test]

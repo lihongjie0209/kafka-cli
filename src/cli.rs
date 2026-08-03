@@ -604,6 +604,18 @@ pub enum ReassignAction {
     Execute {
         #[arg(long)]
         reassignment_json_file: PathBuf,
+        /// Allow starting this plan while another reassignment is active.
+        #[arg(long)]
+        additional: bool,
+        /// Reject any partition whose target replication factor differs from its current value.
+        #[arg(long)]
+        disallow_replication_factor_change: bool,
+        /// Inter-broker replication throttle in bytes per second.
+        #[arg(long)]
+        throttle: Option<u64>,
+        /// Replica log-directory movement throttle in bytes per second.
+        #[arg(long)]
+        replica_alter_log_dirs_throttle: Option<u64>,
         #[arg(long)]
         execute: bool,
     },
