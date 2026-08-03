@@ -1571,21 +1571,28 @@ async fn consume_share_records(
     acknowledgement: ShareAcknowledgeType,
 ) -> Result<i64> {
     let mut received = 0_i64;
+    let mut idle_since = Instant::now();
     while should_consume_more(args.max_messages, received) {
-        let poll_timeout = args
+        let finite_idle_timeout = args
             .timeout_ms
             .filter(|timeout| *timeout != u64::MAX)
-            .map_or(Duration::from_secs(1), Duration::from_millis);
+            .map(Duration::from_millis);
+        let poll_timeout = finite_idle_timeout.map_or(Duration::from_secs(1), |timeout| {
+            timeout
+                .saturating_sub(idle_since.elapsed())
+                .min(Duration::from_secs(1))
+        });
         let records = tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             result = consumer.poll(poll_timeout) => result?,
         };
         if records.is_empty() {
-            if args.timeout_ms.is_some_and(|timeout| timeout != u64::MAX) {
+            if finite_idle_timeout.is_some_and(|timeout| idle_since.elapsed() >= timeout) {
                 break;
             }
             continue;
         }
+        idle_since = Instant::now();
         for record in records {
             if !should_consume_more(args.max_messages, received) {
                 break;

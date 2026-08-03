@@ -36,6 +36,32 @@ fn kafka_script(home: &Path, name: &str) -> PathBuf {
     home.join("bin").join(name)
 }
 
+fn eventually_success_contains(bootstrap: &str, args: &[&str], expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        let output = Command::cargo_bin("kafka")
+            .expect("kafka binary")
+            .arg("--bootstrap-server")
+            .arg(bootstrap)
+            .args(args)
+            .output()
+            .expect("run kafka command");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.status.success() && stdout.contains(expected) {
+            return stdout;
+        }
+        last_error = format!(
+            "status={} stdout={} stderr={}",
+            output.status,
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    panic!("kafka {args:?} did not contain {expected:?}: {last_error}");
+}
+
 fn start_kafka_3_6(home: &Path, fixture: &TempDir) -> (Broker, String) {
     let broker_port = free_port();
     let controller_port = free_port();
@@ -274,21 +300,18 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         ])
         .assert()
         .success();
-    Command::cargo_bin("kafka")
-        .expect("kafka binary")
-        .args([
-            "--bootstrap-server",
-            &bootstrap,
+    eventually_success_contains(
+        &bootstrap,
+        &[
             "configs",
             "describe",
             "--entity-type",
             "users",
             "--entity-name",
             "kafka-36-user",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("SCRAM-SHA-512"));
+        ],
+        "SCRAM-SHA-512",
+    );
     Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([
