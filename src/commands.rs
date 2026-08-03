@@ -714,7 +714,7 @@ fn validate_topic_id(topic_id: Option<&str>) -> Result<()> {
     if topic_id.len() != 22
         || !topic_id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_'))
     {
         return Err(Error::Usage(format!(
             "invalid topic ID '{topic_id}'; expected a 22-character Kafka UUID"
@@ -6402,6 +6402,11 @@ mod tests {
             validate_topic_id(Some("not-a-topic-id")),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn topic_id_should_accept_librdkafka_standard_base64_uuid() {
+        assert!(validate_topic_id(Some("YcqKQkG1QC+w8OkFq/qppA")).is_ok());
     }
 
     #[test]
