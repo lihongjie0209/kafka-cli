@@ -474,7 +474,6 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "integration-events",
             "--partition",
             "0",
-            "--from-beginning",
             "--max-messages",
             "1",
             "--offset",
