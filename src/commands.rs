@@ -10,7 +10,6 @@ use std::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
 use krafka::protocol::{
-    AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType, AclResourceType,
     ApiKey, Decode, DescribableLogDirTopic, KafkaString, ListPartitionReassignmentsTopic,
     ReassignablePartition, ReassignableTopic, TaggedFields, TryEncode,
 };
@@ -36,6 +35,10 @@ use crate::{
     },
     config,
     error::{Error, Result},
+    ffi::{
+        self, AclBinding, AclBindingFilter, AclOperation, AclPatternType, AclPermissionType,
+        AclResourceType,
+    },
     output::{self, OutputFormat},
 };
 
@@ -89,16 +92,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Command::Acls(args) => {
-            acls(
-                bootstrap,
-                command_config.as_deref(),
-                timeout,
-                format,
-                &args.action,
-            )
-            .await
-        }
+        Command::Acls(args) => acls(&client_config, timeout, format, &args.action),
         Command::Reassign(args) => {
             Box::pin(reassign(
                 &client_config,
@@ -1682,18 +1676,24 @@ async fn unregister_broker(client: &krafka::admin::AdminClient, broker_id: i32) 
     }
 }
 
-async fn acls(
-    bootstrap: &str,
-    command_config: Option<&Path>,
+fn acls(
+    config: &rdkafka::ClientConfig,
     timeout: Duration,
     format: OutputFormat,
     action: &AclAction,
 ) -> Result<()> {
-    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let client = admin(config)?;
+    let timeout_ms = duration_ms(timeout)?;
     match action {
         AclAction::List(filter) => {
-            let rows = native_describe_acls(&client, acl_filter(filter, None)?).await?;
-            drop(client);
+            let rows = ffi::describe_acls(
+                client.inner().native_ptr(),
+                &acl_filter(filter, None)?,
+                timeout_ms,
+            )?
+            .into_iter()
+            .map(acl_row)
+            .collect::<Vec<_>>();
             output::write_value(format, "acls.list", &rows, |rows| acl_table(rows))
         }
         AclAction::Add(mutation) => {
@@ -1708,13 +1708,12 @@ async fn acls(
                 println!("Would create {} ACL binding(s)", bindings.len());
                 return Ok(());
             }
-            let failures = native_create_acls(&client, &bindings).await?;
-            drop(client);
-            if failures == 0 {
+            let result = ffi::create_acls(client.inner().native_ptr(), &bindings, timeout_ms)?;
+            if result.failures == 0 {
                 Ok(())
             } else {
                 Err(Error::Partial {
-                    failed: failures,
+                    failed: result.failures,
                     total: bindings.len(),
                 })
             }
@@ -1725,22 +1724,24 @@ async fn acls(
             if !mutation.execute {
                 let mut rows = Vec::new();
                 for filter in filters {
-                    rows.extend(native_describe_acls(&client, filter).await?);
+                    rows.extend(
+                        ffi::describe_acls(client.inner().native_ptr(), &filter, timeout_ms)?
+                            .into_iter()
+                            .map(acl_row),
+                    );
                 }
-                drop(client);
                 return output::write_value(format, "acls.remove.preview", &rows, |rows| {
                     acl_table(rows)
                 });
             }
             let total = filters.len();
-            let (deleted, failures) = native_delete_acls(&client, &filters).await?;
-            drop(client);
-            if failures == 0 {
-                println!("Deleted {deleted} ACL binding(s).");
+            let result = ffi::delete_acls(client.inner().native_ptr(), &filters, timeout_ms)?;
+            if result.failures == 0 {
+                println!("Deleted {} ACL binding(s).", result.matched);
                 Ok(())
             } else {
                 Err(Error::Partial {
-                    failed: failures,
+                    failed: result.failures,
                     total,
                 })
             }
@@ -1798,8 +1799,10 @@ fn acl_resource(filter: &crate::cli::AclFilterArgs) -> Result<(AclResourceType, 
     if let Some(transactional_id) = &filter.transactional_id {
         resources.push((AclResourceType::TransactionalId, transactional_id.clone()));
     }
-    if let Some(token) = &filter.delegation_token {
-        resources.push((AclResourceType::DelegationToken, token.clone()));
+    if filter.delegation_token.is_some() {
+        return Err(Error::Unsupported(
+            "librdkafka does not support delegation-token ACL resources".into(),
+        ));
     }
     match resources.len() {
         0 => Ok((AclResourceType::Any, None)),
@@ -1862,17 +1865,15 @@ fn acl_bindings(
             };
             for host in hosts {
                 for operation in &operations {
-                    bindings.push(
-                        AclBinding::new(
-                            resource_type,
-                            &resource_name,
-                            *principal,
-                            host,
-                            *operation,
-                            *permission,
-                        )
-                        .with_pattern_type(acl_wire_pattern(mutation.filter.resource_pattern_type)),
-                    );
+                    bindings.push(AclBinding {
+                        resource_type,
+                        resource_name: resource_name.clone(),
+                        pattern_type: acl_wire_pattern(mutation.filter.resource_pattern_type),
+                        principal: (*principal).to_owned(),
+                        host: host.to_owned(),
+                        operation: *operation,
+                        permission_type: *permission,
+                    });
                 }
             }
         }
@@ -2000,237 +2001,27 @@ fn acl_mutation_resources(
     Ok(resources)
 }
 
-async fn native_create_acls(
-    client: &krafka::admin::AdminClient,
-    bindings: &[AclBinding],
-) -> Result<usize> {
-    let count =
-        i32::try_from(bindings.len()).map_err(|_| Error::Usage("too many ACL bindings".into()))?;
-    let connection = client.get_controller_connection().await?;
-    let mut response = connection
-        .send_request(ApiKey::CreateAcls, 1, |buffer| {
-            count.try_encode(buffer)?;
-            for binding in bindings {
-                acl_resource_code(binding.resource_type).try_encode(buffer)?;
-                KafkaString(Some(binding.resource_name.clone())).try_encode(buffer)?;
-                acl_pattern_code(binding.pattern_type).try_encode(buffer)?;
-                KafkaString(Some(binding.principal.clone())).try_encode(buffer)?;
-                KafkaString(Some(binding.host.clone())).try_encode(buffer)?;
-                binding.operation.to_i8().try_encode(buffer)?;
-                binding.permission_type.to_i8().try_encode(buffer)?;
-            }
-            Ok(())
-        })
-        .await?;
-    drop(connection);
-    let _throttle_time_ms = i32::decode(&mut response)?;
-    let result_count = decode_acl_count(&mut response)?;
-    let mut failures = 0;
-    for _ in 0..result_count {
-        let error_code = i16::decode(&mut response)?;
-        let error_message = KafkaString::decode(&mut response)?.0;
-        if error_code != 0 {
-            failures += 1;
-            eprintln!(
-                "ACL creation failed with code {error_code}: {}",
-                error_message.unwrap_or_else(|| "unknown Kafka error".into())
-            );
-        }
+fn acl_row(binding: AclBinding) -> AclRow {
+    AclRow {
+        resource_type: format!("{:?}", binding.resource_type),
+        resource_name: binding.resource_name,
+        pattern_type: format!("{:?}", binding.pattern_type),
+        principal: binding.principal,
+        host: binding.host,
+        operation: format!("{:?}", binding.operation),
+        permission: format!("{:?}", binding.permission_type),
     }
-    Ok(failures)
-}
-
-async fn native_describe_acls(
-    client: &krafka::admin::AdminClient,
-    filter: AclBindingFilter,
-) -> Result<Vec<AclRow>> {
-    let connection = client.get_controller_connection().await?;
-    let mut response = connection
-        .send_request(ApiKey::DescribeAcls, 1, |buffer| {
-            encode_acl_filter(&filter, buffer)
-        })
-        .await?;
-    drop(connection);
-    let _throttle_time_ms = i32::decode(&mut response)?;
-    let error_code = i16::decode(&mut response)?;
-    let error_message = KafkaString::decode(&mut response)?.0;
-    if error_code != 0 {
-        return Err(Error::Config(error_message.unwrap_or_else(|| {
-            format!("DescribeAcls failed with Kafka error code {error_code}")
-        })));
-    }
-    let resource_count = decode_acl_count(&mut response)?;
-    let mut rows = Vec::new();
-    for _ in 0..resource_count {
-        let resource_type = i8::decode(&mut response)?;
-        let resource_name = decode_required_acl_string(&mut response, "ACL resource name")?;
-        let pattern_type = i8::decode(&mut response)?;
-        let acl_count = decode_acl_count(&mut response)?;
-        for _ in 0..acl_count {
-            rows.push(decode_acl_row(
-                &mut response,
-                resource_type,
-                &resource_name,
-                pattern_type,
-            )?);
-        }
-    }
-    Ok(rows)
-}
-
-async fn native_delete_acls(
-    client: &krafka::admin::AdminClient,
-    filters: &[AclBindingFilter],
-) -> Result<(usize, usize)> {
-    let count =
-        i32::try_from(filters.len()).map_err(|_| Error::Usage("too many ACL filters".into()))?;
-    let connection = client.get_controller_connection().await?;
-    let mut response = connection
-        .send_request(ApiKey::DeleteAcls, 1, |buffer| {
-            count.try_encode(buffer)?;
-            for filter in filters {
-                encode_acl_filter(filter, buffer)?;
-            }
-            Ok(())
-        })
-        .await?;
-    drop(connection);
-    let _throttle_time_ms = i32::decode(&mut response)?;
-    let result_count = decode_acl_count(&mut response)?;
-    let mut deleted = 0;
-    let mut failures = 0;
-    for _ in 0..result_count {
-        let error_code = i16::decode(&mut response)?;
-        let error_message = KafkaString::decode(&mut response)?.0;
-        if error_code != 0 {
-            failures += 1;
-            eprintln!(
-                "ACL deletion failed with code {error_code}: {}",
-                error_message.unwrap_or_else(|| "unknown Kafka error".into())
-            );
-        }
-        let matching_count = decode_acl_count(&mut response)?;
-        deleted += matching_count;
-        for _ in 0..matching_count {
-            let matching_error_code = i16::decode(&mut response)?;
-            let matching_error_message = KafkaString::decode(&mut response)?.0;
-            if matching_error_code != 0 {
-                failures += 1;
-                eprintln!(
-                    "ACL binding deletion failed with code {matching_error_code}: {}",
-                    matching_error_message.unwrap_or_else(|| "unknown Kafka error".into())
-                );
-            }
-            let resource_type = i8::decode(&mut response)?;
-            let resource_name = decode_required_acl_string(&mut response, "ACL resource name")?;
-            let pattern_type = i8::decode(&mut response)?;
-            let _ = decode_acl_row(&mut response, resource_type, &resource_name, pattern_type)?;
-        }
-    }
-    Ok((deleted, failures))
-}
-
-fn encode_acl_filter(
-    filter: &AclBindingFilter,
-    buffer: &mut bytes::BytesMut,
-) -> krafka::Result<()> {
-    acl_resource_code(filter.resource_type).try_encode(buffer)?;
-    KafkaString(filter.resource_name.clone()).try_encode(buffer)?;
-    acl_pattern_code(filter.pattern_type).try_encode(buffer)?;
-    KafkaString(filter.principal.clone()).try_encode(buffer)?;
-    KafkaString(filter.host.clone()).try_encode(buffer)?;
-    filter.operation.to_i8().try_encode(buffer)?;
-    filter.permission_type.to_i8().try_encode(buffer)
 }
 
 fn decode_acl_count(buffer: &mut bytes::Bytes) -> Result<usize> {
     let count = i32::decode(buffer)?;
-    usize::try_from(count).map_err(|_| Error::Config("negative ACL array length".into()))
+    usize::try_from(count).map_err(|_| Error::Config("negative Kafka array length".into()))
 }
 
 fn decode_required_acl_string(buffer: &mut bytes::Bytes, field: &str) -> Result<String> {
     KafkaString::decode(buffer)?
         .0
         .ok_or_else(|| Error::Config(format!("broker returned null {field}")))
-}
-
-fn decode_acl_row(
-    buffer: &mut bytes::Bytes,
-    resource_type: i8,
-    resource_name: &str,
-    pattern_type: i8,
-) -> Result<AclRow> {
-    Ok(AclRow {
-        resource_type: acl_resource_name(resource_type).into(),
-        resource_name: resource_name.into(),
-        pattern_type: acl_pattern_name(pattern_type).into(),
-        principal: decode_required_acl_string(buffer, "ACL principal")?,
-        host: decode_required_acl_string(buffer, "ACL host")?,
-        operation: acl_operation_name(i8::decode(buffer)?).into(),
-        permission: acl_permission_name(i8::decode(buffer)?).into(),
-    })
-}
-
-fn acl_resource_code(resource: AclResourceType) -> i8 {
-    resource.to_i8()
-}
-
-const fn acl_pattern_code(pattern: AclPatternType) -> i8 {
-    match pattern {
-        AclPatternType::Any => 1,
-        AclPatternType::Literal => 3,
-        AclPatternType::Prefixed => 4,
-        _ => 0,
-    }
-}
-
-const fn acl_resource_name(value: i8) -> &'static str {
-    match value {
-        1 => "Any",
-        2 => "Topic",
-        3 => "Group",
-        4 => "Cluster",
-        5 => "TransactionalId",
-        6 => "DelegationToken",
-        _ => "Unknown",
-    }
-}
-
-const fn acl_pattern_name(value: i8) -> &'static str {
-    match value {
-        1 => "Any",
-        2 => "Match",
-        3 => "Literal",
-        4 => "Prefixed",
-        _ => "Unknown",
-    }
-}
-
-const fn acl_operation_name(value: i8) -> &'static str {
-    match value {
-        1 => "Any",
-        2 => "All",
-        3 => "Read",
-        4 => "Write",
-        5 => "Create",
-        6 => "Delete",
-        7 => "Alter",
-        8 => "Describe",
-        9 => "ClusterAction",
-        10 => "DescribeConfigs",
-        11 => "AlterConfigs",
-        12 => "IdempotentWrite",
-        _ => "Unknown",
-    }
-}
-
-const fn acl_permission_name(value: i8) -> &'static str {
-    match value {
-        1 => "Any",
-        2 => "Deny",
-        3 => "Allow",
-        _ => "Unknown",
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3405,15 +3196,6 @@ mod tests {
                 && binding.host == "*"
                 && binding.permission_type == AclPermissionType::Deny
         }));
-    }
-
-    #[test]
-    fn acl_pattern_codec_should_match_kafka_wire_discriminants() {
-        assert_eq!(acl_pattern_code(AclPatternType::Any), 1);
-        assert_eq!(acl_pattern_code(AclPatternType::Literal), 3);
-        assert_eq!(acl_pattern_code(AclPatternType::Prefixed), 4);
-        assert_eq!(acl_pattern_name(2), "Match");
-        assert_eq!(acl_pattern_name(4), "Prefixed");
     }
 
     #[test]

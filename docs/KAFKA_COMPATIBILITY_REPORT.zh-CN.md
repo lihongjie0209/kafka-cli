@@ -12,7 +12,7 @@
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
 - Connect、Share Group、Streams Group、事务、delegation token、metadata quorum、storage、性能测试、验证工具等原版工具尚未实现。
-- 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API；少数管理路径仍使用 `krafka`，尚未完全统一到 librdkafka。
+- 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API。ACL create/describe/delete 已迁移到 librdkafka；少数其他管理路径仍使用 `krafka`，尚未完全统一。
 
 ## 2. 状态定义
 
@@ -35,7 +35,7 @@
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、describe、delete、delete-offsets、reset-offsets；缺少批量与导入导出模式 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group；缺少其他 entity type |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | topic 正则、partition 模式、earliest/latest/timestamp、排除内部主题 |
-| `kafka-acls.sh` | `kafka acls` | 部分支持 | list/add/remove、常见资源和 producer/consumer 快捷角色 |
+| `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；缺少 throttle 高级参数 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件、预览、执行 |
 | `kafka-leader-election.sh` | `kafka leader-election` | 部分支持 | preferred/unclean、单分区或全部；缺少 JSON 文件批量选择 |
@@ -125,15 +125,16 @@
 
 ### 4.7 ACLs
 
-已支持：list/add/remove；Topic、Group、Cluster、Transactional ID、Delegation Token；Literal/Prefixed/Any；allow/deny principal 与 host；常见 operations；producer、consumer、idempotent 快捷角色；预览与 `--execute`。
+已支持：list/add/remove；Topic、Group、Cluster、Transactional ID；Literal/Prefixed/Any；allow/deny principal 与 host；常见 operations；producer、consumer、idempotent 快捷角色；预览与 `--execute`。Create、Describe 和 Delete 均通过 librdkafka Admin API 执行。
 
 缺少或有差异：
 
 - 未支持 Kafka 4.4 的 `--user-principal` 资源语义。
+- librdkafka 2.12 的 ACL ResourceType 不包含 Delegation Token；使用 `--delegation-token` 时会明确返回不支持，而不会切换到另一套协议实现。
 - 未支持 bootstrap-controller。
 - 原版 remove 会交互确认或使用 `--force`；本项目采用更安全的显式 `--execute`，没有交互确认。
 - 快捷角色当前只允许 allow principal/host，不允许 deny 组合。
-- ACL 网络操作目前仍有手写协议/`krafka` 路径，尚未全部迁移到 librdkafka Admin FFI。
+- ACL FFI 使用窄范围 RAII 封装管理 Admin queue、options、event 和 native binding 生命周期。
 
 ### 4.8 Partition Reassignment
 
@@ -186,7 +187,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。表格输出
 
 1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现。
 2. `rdkafka-sys`：只包装 `rdkafka` 尚未暴露的 librdkafka Admin API，例如 leader election、部分 group offset/config API。
-3. `krafka`：当前仍用于 API versions、unregister、部分 ACL/reassignment/log-dir 协议路径。为确保认证、重试、协议协商和错误行为一致，应逐步迁移到 librdkafka/`rdkafka-sys`，最后评估删除该依赖。
+3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移到 librdkafka/`rdkafka-sys`，最后评估删除该依赖。
 
 不建议全量直接使用 `rdkafka-sys`：它与 `rdkafka` 使用同一个 librdkafka，但会把 C 指针、回调、队列和资源生命周期全部暴露为 `unsafe`，不会获得额外协议权威性。
 
@@ -226,7 +227,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 
 ### P0：统一客户端与保证现有功能可靠
 
-1. 将 ACL、API versions、unregister、reassignment/log-dir 等剩余 `krafka` 路径迁移至 `rdkafka` 或窄范围 `rdkafka-sys` RAII 封装。
+1. 将 API versions、unregister、reassignment/log-dir 等剩余 `krafka` 路径迁移至 `rdkafka` 或窄范围 `rdkafka-sys` RAII 封装。
 2. 增加 TLS/SASL 集成测试。
 3. 增加多 broker Kafka 4 集成环境，验证 reassignment、leader election、ISR 和 rack-aware 分配。
 4. 在 CI 对两个 musl artifact 执行 `--help`/`--version` smoke test；ARM64 使用 QEMU 或原生 ARM runner。
@@ -249,3 +250,9 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
 
 在对外发布时，建议使用“兼容 13 个常用 Kafka CLI 入口的 Rust 工具”表述，不应使用“100% 兼容 Apache Kafka CLI”。完成 P0 和 P1 后，才适合将已覆盖的 13 个脚本声明为主要功能兼容。
+
+## 11. librdkafka 对齐变更记录
+
+| 日期 | 功能 | 结果 | 验证 |
+|---|---|---|---|
+| 2026-08-03 | ACL Create/Describe/Delete | 从手写 Kafka 协议迁移到 librdkafka Admin FFI；不支持的 Delegation Token 资源改为明确报错 | Clippy、48 个普通测试、Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |

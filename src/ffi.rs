@@ -79,6 +79,88 @@ impl Drop for ListGroupOffsets {
     }
 }
 
+struct NativeAcl(*mut sys::rd_kafka_AclBinding_t);
+impl Drop for NativeAcl {
+    fn drop(&mut self) {
+        unsafe { sys::rd_kafka_AclBinding_destroy(self.0) };
+    }
+}
+
+/// ACL resource types supported by librdkafka.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclResourceType {
+    Any,
+    Topic,
+    Group,
+    Cluster,
+    TransactionalId,
+}
+
+/// ACL resource pattern types supported by librdkafka.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclPatternType {
+    Any,
+    Match,
+    Literal,
+    Prefixed,
+}
+
+/// Kafka ACL operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclOperation {
+    Any,
+    All,
+    Read,
+    Write,
+    Create,
+    Delete,
+    Alter,
+    Describe,
+    ClusterAction,
+    DescribeConfigs,
+    AlterConfigs,
+    IdempotentWrite,
+}
+
+/// Kafka ACL permission types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclPermissionType {
+    Any,
+    Deny,
+    Allow,
+}
+
+/// One concrete ACL binding.
+#[derive(Debug, Clone)]
+pub struct AclBinding {
+    pub resource_type: AclResourceType,
+    pub resource_name: String,
+    pub pattern_type: AclPatternType,
+    pub principal: String,
+    pub host: String,
+    pub operation: AclOperation,
+    pub permission_type: AclPermissionType,
+}
+
+/// Filter accepted by librdkafka's `DescribeAcls` and `DeleteAcls` APIs.
+#[derive(Debug, Clone)]
+pub struct AclBindingFilter {
+    pub resource_type: AclResourceType,
+    pub resource_name: Option<String>,
+    pub pattern_type: AclPatternType,
+    pub principal: Option<String>,
+    pub host: Option<String>,
+    pub operation: AclOperation,
+    pub permission_type: AclPermissionType,
+}
+
+/// Outcome of a bulk ACL mutation.
+#[derive(Debug, Clone, Copy)]
+pub struct AclMutationResult {
+    pub matched: usize,
+    pub failures: usize,
+}
+
 /// A committed consumer-group offset returned by librdkafka.
 #[derive(Debug)]
 pub struct GroupOffsetEntry {
@@ -138,6 +220,455 @@ fn poll(queue: &Queue, timeout_ms: i32) -> Result<Event> {
         return Err(Error::Config(message));
     }
     Ok(event)
+}
+
+/// Creates ACL bindings through librdkafka's Admin API.
+pub fn create_acls(
+    client: *mut sys::rd_kafka_t,
+    bindings: &[AclBinding],
+    timeout_ms: i32,
+) -> Result<AclMutationResult> {
+    let native = bindings
+        .iter()
+        .map(native_acl_binding)
+        .collect::<Result<Vec<_>>>()?;
+    let mut pointers = native.iter().map(|binding| binding.0).collect::<Vec<_>>();
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_CREATEACLS,
+        timeout_ms,
+    )?;
+    unsafe {
+        sys::rd_kafka_CreateAcls(
+            client,
+            pointers.as_mut_ptr(),
+            pointers.len(),
+            options.0,
+            queue.0,
+        );
+    }
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_CreateAcls_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid CreateAcls response".into(),
+        ));
+    }
+    let mut count = 0;
+    let results = unsafe { sys::rd_kafka_CreateAcls_result_acls(result, &raw mut count) };
+    let failures = acl_result_failures(results, count, "ACL creation")?;
+    Ok(AclMutationResult {
+        matched: count,
+        failures,
+    })
+}
+
+/// Describes ACL bindings through librdkafka's Admin API.
+pub fn describe_acls(
+    client: *mut sys::rd_kafka_t,
+    filter: &AclBindingFilter,
+    timeout_ms: i32,
+) -> Result<Vec<AclBinding>> {
+    let filter = native_acl_filter(filter)?;
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_DESCRIBEACLS,
+        timeout_ms,
+    )?;
+    unsafe { sys::rd_kafka_DescribeAcls(client, filter.0, options.0, queue.0) };
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_DescribeAcls_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid DescribeAcls response".into(),
+        ));
+    }
+    let mut count = 0;
+    let bindings = unsafe { sys::rd_kafka_DescribeAcls_result_acls(result, &raw mut count) };
+    if count > 0 && bindings.is_null() {
+        return Err(Error::Config(
+            "broker returned a null DescribeAcls binding array".into(),
+        ));
+    }
+    (0..count)
+        .map(|index| unsafe { acl_binding_from_native(*bindings.add(index)) })
+        .collect()
+}
+
+/// Deletes ACL bindings through librdkafka's Admin API.
+pub fn delete_acls(
+    client: *mut sys::rd_kafka_t,
+    filters: &[AclBindingFilter],
+    timeout_ms: i32,
+) -> Result<AclMutationResult> {
+    let native = filters
+        .iter()
+        .map(native_acl_filter)
+        .collect::<Result<Vec<_>>>()?;
+    let mut pointers = native.iter().map(|filter| filter.0).collect::<Vec<_>>();
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_DELETEACLS,
+        timeout_ms,
+    )?;
+    unsafe {
+        sys::rd_kafka_DeleteAcls(
+            client,
+            pointers.as_mut_ptr(),
+            pointers.len(),
+            options.0,
+            queue.0,
+        );
+    }
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_DeleteAcls_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid DeleteAcls response".into(),
+        ));
+    }
+    let mut response_count = 0;
+    let responses =
+        unsafe { sys::rd_kafka_DeleteAcls_result_responses(result, &raw mut response_count) };
+    if response_count > 0 && responses.is_null() {
+        return Err(Error::Config(
+            "broker returned a null DeleteAcls response array".into(),
+        ));
+    }
+    let mut matched = 0;
+    let mut failures = 0;
+    for index in 0..response_count {
+        let response = unsafe { *responses.add(index) };
+        if response.is_null() {
+            return Err(Error::Config("broker returned a null ACL result".into()));
+        }
+        let error = unsafe { sys::rd_kafka_DeleteAcls_result_response_error(response) };
+        if !error.is_null() {
+            failures += 1;
+            eprintln!("ACL deletion failed: {}", unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            });
+        }
+        let mut matching_count = 0;
+        let matching = unsafe {
+            sys::rd_kafka_DeleteAcls_result_response_matching_acls(
+                response,
+                &raw mut matching_count,
+            )
+        };
+        matched += matching_count;
+        if matching_count > 0 && matching.is_null() {
+            return Err(Error::Config(
+                "broker returned a null deleted ACL array".into(),
+            ));
+        }
+        for matching_index in 0..matching_count {
+            let binding = unsafe { *matching.add(matching_index) };
+            if binding.is_null() {
+                return Err(Error::Config("broker returned a null ACL binding".into()));
+            }
+            let error = unsafe { sys::rd_kafka_AclBinding_error(binding) };
+            if !error.is_null() {
+                failures += 1;
+                eprintln!("ACL binding deletion failed: {}", unsafe {
+                    c_string(sys::rd_kafka_error_string(error))
+                });
+            }
+        }
+    }
+    Ok(AclMutationResult { matched, failures })
+}
+
+fn native_acl_binding(binding: &AclBinding) -> Result<NativeAcl> {
+    native_acl(
+        binding.resource_type,
+        Some(binding.resource_name.as_str()),
+        binding.pattern_type,
+        Some(binding.principal.as_str()),
+        Some(binding.host.as_str()),
+        binding.operation,
+        binding.permission_type,
+        false,
+    )
+}
+
+fn native_acl_filter(filter: &AclBindingFilter) -> Result<NativeAcl> {
+    native_acl(
+        filter.resource_type,
+        filter.resource_name.as_deref(),
+        filter.pattern_type,
+        filter.principal.as_deref(),
+        filter.host.as_deref(),
+        filter.operation,
+        filter.permission_type,
+        true,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors librdkafka's ACL constructor"
+)]
+fn native_acl(
+    resource_type: AclResourceType,
+    resource_name: Option<&str>,
+    pattern_type: AclPatternType,
+    principal: Option<&str>,
+    host: Option<&str>,
+    operation: AclOperation,
+    permission_type: AclPermissionType,
+    filter: bool,
+) -> Result<NativeAcl> {
+    let resource_name = optional_c_string(resource_name, "ACL resource name")?;
+    let principal = optional_c_string(principal, "ACL principal")?;
+    let host = optional_c_string(host, "ACL host")?;
+    let mut error = [0 as c_char; 512];
+    let constructor = if filter {
+        sys::rd_kafka_AclBindingFilter_new
+    } else {
+        sys::rd_kafka_AclBinding_new
+    };
+    let binding = unsafe {
+        constructor(
+            native_acl_resource(resource_type),
+            resource_name
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr()),
+            native_acl_pattern(pattern_type),
+            principal
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr()),
+            host.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+            native_acl_operation(operation),
+            native_acl_permission(permission_type),
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if binding.is_null() {
+        Err(Error::Config(c_buffer(&error)))
+    } else {
+        Ok(NativeAcl(binding))
+    }
+}
+
+fn optional_c_string(value: Option<&str>, field: &str) -> Result<Option<CString>> {
+    value
+        .map(|value| {
+            CString::new(value).map_err(|_| Error::Usage(format!("{field} contains a NUL byte")))
+        })
+        .transpose()
+}
+
+fn acl_result_failures(
+    results: *mut *const sys::rd_kafka_acl_result_t,
+    count: usize,
+    operation: &str,
+) -> Result<usize> {
+    if count > 0 && results.is_null() {
+        return Err(Error::Config(format!(
+            "broker returned a null {operation} result array"
+        )));
+    }
+    let mut failures = 0;
+    for index in 0..count {
+        let result = unsafe { *results.add(index) };
+        if result.is_null() {
+            return Err(Error::Config(format!(
+                "broker returned a null {operation} result"
+            )));
+        }
+        let error = unsafe { sys::rd_kafka_acl_result_error(result) };
+        if !error.is_null() {
+            failures += 1;
+            eprintln!("{operation} failed: {}", unsafe {
+                c_string(sys::rd_kafka_error_string(error))
+            });
+        }
+    }
+    Ok(failures)
+}
+
+unsafe fn acl_binding_from_native(
+    binding: *const sys::rd_kafka_AclBinding_t,
+) -> Result<AclBinding> {
+    if binding.is_null() {
+        return Err(Error::Config("broker returned a null ACL binding".into()));
+    }
+    let error = unsafe { sys::rd_kafka_AclBinding_error(binding) };
+    if !error.is_null() {
+        return Err(Error::Config(unsafe {
+            c_string(sys::rd_kafka_error_string(error))
+        }));
+    }
+    Ok(AclBinding {
+        resource_type: unsafe {
+            acl_resource_from_native(sys::rd_kafka_AclBinding_restype(binding))
+        }?,
+        resource_name: unsafe { c_string(sys::rd_kafka_AclBinding_name(binding)) },
+        pattern_type: unsafe {
+            acl_pattern_from_native(sys::rd_kafka_AclBinding_resource_pattern_type(binding))
+        }?,
+        principal: unsafe { c_string(sys::rd_kafka_AclBinding_principal(binding)) },
+        host: unsafe { c_string(sys::rd_kafka_AclBinding_host(binding)) },
+        operation: unsafe {
+            acl_operation_from_native(sys::rd_kafka_AclBinding_operation(binding))
+        }?,
+        permission_type: unsafe {
+            acl_permission_from_native(sys::rd_kafka_AclBinding_permission_type(binding))
+        }?,
+    })
+}
+
+const fn native_acl_resource(value: AclResourceType) -> sys::rd_kafka_ResourceType_t {
+    match value {
+        AclResourceType::Any => sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_ANY,
+        AclResourceType::Topic => sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TOPIC,
+        AclResourceType::Group => sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_GROUP,
+        AclResourceType::Cluster => sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
+        AclResourceType::TransactionalId => {
+            sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TRANSACTIONAL_ID
+        }
+    }
+}
+
+const fn native_acl_pattern(value: AclPatternType) -> sys::rd_kafka_ResourcePatternType_t {
+    match value {
+        AclPatternType::Any => sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_ANY,
+        AclPatternType::Match => {
+            sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_MATCH
+        }
+        AclPatternType::Literal => {
+            sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_LITERAL
+        }
+        AclPatternType::Prefixed => {
+            sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_PREFIXED
+        }
+    }
+}
+
+const fn native_acl_operation(value: AclOperation) -> sys::rd_kafka_AclOperation_t {
+    match value {
+        AclOperation::Any => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ANY,
+        AclOperation::All => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ALL,
+        AclOperation::Read => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_READ,
+        AclOperation::Write => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_WRITE,
+        AclOperation::Create => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_CREATE,
+        AclOperation::Delete => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_DELETE,
+        AclOperation::Alter => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ALTER,
+        AclOperation::Describe => sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_DESCRIBE,
+        AclOperation::ClusterAction => {
+            sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_CLUSTER_ACTION
+        }
+        AclOperation::DescribeConfigs => {
+            sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_DESCRIBE_CONFIGS
+        }
+        AclOperation::AlterConfigs => {
+            sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ALTER_CONFIGS
+        }
+        AclOperation::IdempotentWrite => {
+            sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_IDEMPOTENT_WRITE
+        }
+    }
+}
+
+const fn native_acl_permission(value: AclPermissionType) -> sys::rd_kafka_AclPermissionType_t {
+    match value {
+        AclPermissionType::Any => {
+            sys::rd_kafka_AclPermissionType_t::RD_KAFKA_ACL_PERMISSION_TYPE_ANY
+        }
+        AclPermissionType::Deny => {
+            sys::rd_kafka_AclPermissionType_t::RD_KAFKA_ACL_PERMISSION_TYPE_DENY
+        }
+        AclPermissionType::Allow => {
+            sys::rd_kafka_AclPermissionType_t::RD_KAFKA_ACL_PERMISSION_TYPE_ALLOW
+        }
+    }
+}
+
+fn acl_resource_from_native(value: sys::rd_kafka_ResourceType_t) -> Result<AclResourceType> {
+    match value {
+        sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_ANY => Ok(AclResourceType::Any),
+        sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TOPIC => Ok(AclResourceType::Topic),
+        sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_GROUP => Ok(AclResourceType::Group),
+        sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER => Ok(AclResourceType::Cluster),
+        sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TRANSACTIONAL_ID => {
+            Ok(AclResourceType::TransactionalId)
+        }
+        _ => Err(Error::Unsupported(
+            "librdkafka returned an unknown ACL resource type".into(),
+        )),
+    }
+}
+
+fn acl_pattern_from_native(value: sys::rd_kafka_ResourcePatternType_t) -> Result<AclPatternType> {
+    match value {
+        sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_ANY => {
+            Ok(AclPatternType::Any)
+        }
+        sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_MATCH => {
+            Ok(AclPatternType::Match)
+        }
+        sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_LITERAL => {
+            Ok(AclPatternType::Literal)
+        }
+        sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_PREFIXED => {
+            Ok(AclPatternType::Prefixed)
+        }
+        _ => Err(Error::Unsupported(
+            "librdkafka returned an unknown ACL pattern type".into(),
+        )),
+    }
+}
+
+fn acl_operation_from_native(value: sys::rd_kafka_AclOperation_t) -> Result<AclOperation> {
+    match value {
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ANY => Ok(AclOperation::Any),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ALL => Ok(AclOperation::All),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_READ => Ok(AclOperation::Read),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_WRITE => Ok(AclOperation::Write),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_CREATE => Ok(AclOperation::Create),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_DELETE => Ok(AclOperation::Delete),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ALTER => Ok(AclOperation::Alter),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_DESCRIBE => Ok(AclOperation::Describe),
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_CLUSTER_ACTION => {
+            Ok(AclOperation::ClusterAction)
+        }
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_DESCRIBE_CONFIGS => {
+            Ok(AclOperation::DescribeConfigs)
+        }
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_ALTER_CONFIGS => {
+            Ok(AclOperation::AlterConfigs)
+        }
+        sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_IDEMPOTENT_WRITE => {
+            Ok(AclOperation::IdempotentWrite)
+        }
+        _ => Err(Error::Unsupported(
+            "librdkafka returned an unknown ACL operation".into(),
+        )),
+    }
+}
+
+fn acl_permission_from_native(
+    value: sys::rd_kafka_AclPermissionType_t,
+) -> Result<AclPermissionType> {
+    match value {
+        sys::rd_kafka_AclPermissionType_t::RD_KAFKA_ACL_PERMISSION_TYPE_ANY => {
+            Ok(AclPermissionType::Any)
+        }
+        sys::rd_kafka_AclPermissionType_t::RD_KAFKA_ACL_PERMISSION_TYPE_DENY => {
+            Ok(AclPermissionType::Deny)
+        }
+        sys::rd_kafka_AclPermissionType_t::RD_KAFKA_ACL_PERMISSION_TYPE_ALLOW => {
+            Ok(AclPermissionType::Allow)
+        }
+        _ => Err(Error::Unsupported(
+            "librdkafka returned an unknown ACL permission type".into(),
+        )),
+    }
 }
 
 /// Lists every committed offset for one consumer group.
@@ -492,5 +1023,28 @@ mod tests {
         assert!(!is_election_noop(
             sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_CLUSTER_AUTHORIZATION_FAILED
         ));
+    }
+
+    #[test]
+    fn acl_types_should_match_librdkafka_discriminants() {
+        assert_eq!(
+            native_acl_resource(AclResourceType::Cluster),
+            sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER
+        );
+        assert_eq!(
+            native_acl_pattern(AclPatternType::Literal),
+            sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_LITERAL
+        );
+        assert_eq!(
+            native_acl_operation(AclOperation::IdempotentWrite),
+            sys::rd_kafka_AclOperation_t::RD_KAFKA_ACL_OPERATION_IDEMPOTENT_WRITE
+        );
+        assert_eq!(
+            acl_pattern_from_native(
+                sys::rd_kafka_ResourcePatternType_t::RD_KAFKA_RESOURCE_PATTERN_MATCH
+            )
+            .expect("match pattern"),
+            AclPatternType::Match
+        );
     }
 }
