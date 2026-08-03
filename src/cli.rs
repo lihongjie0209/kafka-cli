@@ -456,6 +456,10 @@ pub enum ConfigEntityType {
     Client,
     #[value(name = "ips", alias = "ip")]
     Ip,
+    #[value(name = "broker-loggers", alias = "broker-logger")]
+    BrokerLogger,
+    #[value(name = "client-metrics", alias = "client-metric")]
+    ClientMetrics,
 }
 
 #[derive(Debug, Subcommand)]

@@ -898,6 +898,55 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("connection_creation_rate")
     );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "broker-loggers",
+            "--entity-name",
+            "1",
+            "--add-config",
+            "kafka.server.KafkaApis=INFO",
+            "--execute",
+        ],
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "configs",
+                "describe",
+                "--entity-type",
+                "broker-loggers",
+                "--entity-name",
+                "1",
+            ],
+        )
+        .contains("kafka.server.KafkaApis")
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "client-metrics",
+            "--entity-name",
+            "integration-metrics",
+            "--add-config",
+            "metrics=org.apache",
+            "--execute",
+        ],
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &["configs", "describe", "--entity-type", "client-metrics"],
+        )
+        .contains("integration-metrics")
+    );
     let scram_alter: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
@@ -941,6 +990,34 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "integration-user",
             "--delete-config",
             "SCRAM-SHA-256",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "broker-loggers",
+            "--entity-name",
+            "1",
+            "--delete-config",
+            "kafka.server.KafkaApis",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "client-metrics",
+            "--entity-name",
+            "integration-metrics",
+            "--delete-config",
+            "metrics",
             "--execute",
         ],
     );

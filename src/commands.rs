@@ -10,8 +10,11 @@ use std::{
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
 use krafka::protocol::{
-    ApiKey, Decode, DescribableLogDirTopic, KafkaString, ListPartitionReassignmentsTopic,
-    ReassignablePartition, ReassignableTopic, TaggedFields, TryEncode,
+    AlterConfigOp, AlterableConfig, ApiKey, ConfigResourceType as ProtocolConfigResourceType,
+    Decode, DescribableLogDirTopic, DescribeConfigsRequest, DescribeConfigsResource,
+    IncrementalAlterConfigsRequest, IncrementalAlterConfigsResource, KafkaString,
+    ListPartitionReassignmentsTopic, ReassignablePartition, ReassignableTopic, TaggedFields,
+    TryEncode, VersionedDecode, VersionedEncode, versions,
 };
 use rdkafka::{
     Message, Offset,
@@ -2362,6 +2365,10 @@ fn shifted_offset(
         })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "branches mirror Kafka's resource, quota, and SCRAM config backends"
+)]
 async fn configs(
     config: &rdkafka::ClientConfig,
     bootstrap: &str,
@@ -2392,6 +2399,18 @@ async fn configs(
             }
             let (entity_type, entity_name) =
                 single_resource_entity(&entity_type, &entity_name, entity_default, false)?;
+            if protocol_config_resource_type(entity_type).is_some() {
+                return describe_protocol_configs(
+                    bootstrap,
+                    command_config,
+                    timeout,
+                    format,
+                    entity_type,
+                    entity_name,
+                    all,
+                )
+                .await;
+            }
             describe_resource_configs(config, timeout, format, entity_type, entity_name, all).await
         }
         ConfigAction::Alter {
@@ -2450,6 +2469,21 @@ async fn configs(
             }
             if !execute {
                 return config_change_preview(format, &pairs, &delete);
+            }
+            if protocol_config_resource_type(entity_type).is_some() {
+                return alter_protocol_config(
+                    bootstrap,
+                    command_config,
+                    timeout,
+                    format,
+                    entity_type,
+                    entity_name.as_deref().ok_or_else(|| {
+                        Error::Usage("resource alteration requires --entity-name".into())
+                    })?,
+                    &pairs,
+                    &delete,
+                )
+                .await;
             }
             let admin = admin(config)?;
             crate::ffi::incremental_alter_config(
@@ -2821,6 +2855,229 @@ async fn alter_quota_configs(
     }
 }
 
+const fn protocol_config_resource_type(
+    kind: ConfigEntityType,
+) -> Option<ProtocolConfigResourceType> {
+    match kind {
+        ConfigEntityType::BrokerLogger => Some(ProtocolConfigResourceType::BrokerLogger),
+        ConfigEntityType::ClientMetrics => Some(ProtocolConfigResourceType::ClientMetrics),
+        _ => None,
+    }
+}
+
+async fn protocol_config_broker(
+    client: &krafka::admin::AdminClient,
+    kind: ConfigEntityType,
+    name: &str,
+) -> Result<(i32, String)> {
+    let cluster = client.describe_cluster().await?;
+    let broker_id = if matches!(kind, ConfigEntityType::BrokerLogger) {
+        name.parse::<i32>()
+            .map_err(|_| Error::Usage("broker-logger entity name must be a broker ID".into()))?
+    } else {
+        cluster.controller_id
+    };
+    let broker = cluster
+        .brokers
+        .iter()
+        .find(|broker| broker.broker_id == broker_id)
+        .ok_or_else(|| Error::Usage(format!("broker {broker_id} was not described")))?;
+    Ok((broker_id, format!("{}:{}", broker.host, broker.port)))
+}
+
+async fn describe_protocol_configs(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    kind: ConfigEntityType,
+    name: Option<String>,
+    all: bool,
+) -> Result<()> {
+    let resource_type = protocol_config_resource_type(kind)
+        .ok_or_else(|| Error::Usage("invalid protocol config resource".into()))?;
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let names = if let Some(name) = name {
+        vec![name]
+    } else if matches!(kind, ConfigEntityType::ClientMetrics) {
+        client.list_client_metrics_resources().await?
+    } else {
+        return Err(Error::Usage(
+            "broker-logger describe requires --entity-name".into(),
+        ));
+    };
+    let routing_name = names.first().map_or("", String::as_str);
+    let (broker_id, address) = protocol_config_broker(&client, kind, routing_name).await?;
+    let connection = client
+        .pool()
+        .get_connection_by_id(broker_id, &address)
+        .await?;
+    let request = DescribeConfigsRequest {
+        resources: names
+            .iter()
+            .map(|name| DescribeConfigsResource {
+                resource_type,
+                resource_name: name.clone(),
+                config_names: None,
+            })
+            .collect(),
+        include_synonyms: all,
+        include_documentation: false,
+    };
+    let version = connection
+        .negotiate_api_version(
+            ApiKey::DescribeConfigs,
+            versions::DESCRIBE_CONFIGS_MAX,
+            versions::DESCRIBE_CONFIGS_MIN,
+        )
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support DescribeConfigs".into()))?;
+    let mut response = connection
+        .send_request(ApiKey::DescribeConfigs, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(connection);
+    drop(client);
+    let response =
+        krafka::protocol::DescribeConfigsResponse::decode_versioned(version, &mut response)?;
+    let mut rows = Vec::new();
+    for resource in response.results {
+        if !resource.error_code.is_ok() {
+            return Err(Error::Config(
+                resource
+                    .error_message
+                    .unwrap_or_else(|| format!("{:?}", resource.error_code)),
+            ));
+        }
+        rows.extend(resource.configs.into_iter().filter_map(|entry| {
+            (all || matches!(entry.config_source, 6 | 7)).then(|| ConfigDescriptionRow {
+                entity_type: config_entity_type_name(kind).into(),
+                entity_name: resource.resource_name.clone(),
+                name: entry.name,
+                value: entry.value,
+                source: entry.config_source.to_string(),
+                sensitive: entry.is_sensitive,
+            })
+        }));
+    }
+    output::write_value(format, "configs.describe", &rows, |rows| {
+        output::table(
+            [
+                "ENTITY_TYPE",
+                "ENTITY_NAME",
+                "NAME",
+                "VALUE",
+                "SOURCE",
+                "SENSITIVE",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.entity_type.clone(),
+                    row.entity_name.clone(),
+                    row.name.clone(),
+                    row.value.as_deref().unwrap_or("null").to_owned(),
+                    row.source.clone(),
+                    row.sensitive.to_string(),
+                ]
+            }),
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "arguments mirror a Kafka IncrementalAlterConfigs resource and command context"
+)]
+async fn alter_protocol_config(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    kind: ConfigEntityType,
+    name: &str,
+    add: &[(String, String)],
+    delete: &[String],
+) -> Result<()> {
+    let resource_type = protocol_config_resource_type(kind)
+        .ok_or_else(|| Error::Usage("invalid protocol config resource".into()))?;
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let (broker_id, address) = protocol_config_broker(&client, kind, name).await?;
+    let connection = client
+        .pool()
+        .get_connection_by_id(broker_id, &address)
+        .await?;
+    let request = IncrementalAlterConfigsRequest {
+        resources: vec![IncrementalAlterConfigsResource {
+            resource_type,
+            resource_name: name.into(),
+            configs: add
+                .iter()
+                .map(|(key, value)| AlterableConfig {
+                    name: key.clone(),
+                    config_operation: AlterConfigOp::Set,
+                    value: Some(value.clone()),
+                })
+                .chain(delete.iter().map(|key| AlterableConfig {
+                    name: key.clone(),
+                    config_operation: AlterConfigOp::Delete,
+                    value: None,
+                }))
+                .collect(),
+        }],
+        validate_only: false,
+    };
+    let version = connection
+        .negotiate_api_version(
+            ApiKey::IncrementalAlterConfigs,
+            versions::INCREMENTAL_ALTER_CONFIGS_MAX,
+            versions::INCREMENTAL_ALTER_CONFIGS_MIN,
+        )
+        .await
+        .ok_or_else(|| {
+            Error::Unsupported("broker does not support IncrementalAlterConfigs".into())
+        })?;
+    let mut response = connection
+        .send_request(ApiKey::IncrementalAlterConfigs, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(connection);
+    drop(client);
+    let response = krafka::protocol::IncrementalAlterConfigsResponse::decode_versioned(
+        version,
+        &mut response,
+    )?;
+    let rows = response
+        .results
+        .into_iter()
+        .map(|result| MutationRow {
+            resource: format!("{}:{}", config_entity_type_name(kind), result.resource_name),
+            status: if result.error_code.is_ok() {
+                "ALTERED"
+            } else {
+                "FAILED"
+            }
+            .into(),
+            error: (!result.error_code.is_ok()).then(|| {
+                result
+                    .error_message
+                    .unwrap_or_else(|| format!("{:?}", result.error_code))
+            }),
+        })
+        .collect::<Vec<_>>();
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_mutation_rows(format, "configs.alter", &rows)?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: failures,
+            total: rows.len(),
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ConfigChangeRow<'a> {
     operation: &'static str,
@@ -2975,6 +3232,9 @@ fn config_entity_names(
         ConfigEntityType::Client | ConfigEntityType::Ip => Err(Error::Usage(
             "client and IP entities must use the quota Admin API".into(),
         )),
+        ConfigEntityType::BrokerLogger | ConfigEntityType::ClientMetrics => Err(Error::Usage(
+            "this resource type must use the protocol config API".into(),
+        )),
     }
 }
 
@@ -2986,6 +3246,8 @@ const fn config_entity_type_name(kind: ConfigEntityType) -> &'static str {
         ConfigEntityType::User => "users",
         ConfigEntityType::Client => "clients",
         ConfigEntityType::Ip => "ips",
+        ConfigEntityType::BrokerLogger => "broker-loggers",
+        ConfigEntityType::ClientMetrics => "client-metrics",
     }
 }
 
@@ -3060,7 +3322,10 @@ const fn native_resource_type(kind: ConfigEntityType) -> rdkafka_sys::rd_kafka_R
         ConfigEntityType::Broker => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
         ConfigEntityType::Group => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_GROUP,
         ConfigEntityType::User => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_UNKNOWN,
-        ConfigEntityType::Client | ConfigEntityType::Ip => {
+        ConfigEntityType::Client
+        | ConfigEntityType::Ip
+        | ConfigEntityType::BrokerLogger
+        | ConfigEntityType::ClientMetrics => {
             rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_UNKNOWN
         }
     }
@@ -3082,6 +3347,11 @@ fn resource(kind: ConfigEntityType, name: &str) -> Result<ResourceSpecifier<'_>>
         ConfigEntityType::Client | ConfigEntityType::Ip => {
             return Err(Error::Config(
                 "client and IP configuration must use the quota Admin API".into(),
+            ));
+        }
+        ConfigEntityType::BrokerLogger | ConfigEntityType::ClientMetrics => {
+            return Err(Error::Config(
+                "this resource type must use the protocol config API".into(),
             ));
         }
     })
