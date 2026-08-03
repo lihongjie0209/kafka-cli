@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 123 个通过 | 116 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 128 个通过 | 121 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -150,9 +150,10 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 - broker-logger 与 client-metrics 的 describe/alter/delete；broker logger 请求路由到指定 broker，client metrics 支持省略名称枚举全部 subscription，并把写请求路由到 controller。
 - SCRAM 预览只显示 mechanism 和 iterations，不回显 password。
 - alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON，而非手工文本。
+- `--delete-config` 按原版支持单次逗号分隔多个 key 并逐项 trim；重复实体类型、非整数 broker/broker-logger ID 以及 add-config 非法 key 字符会在任何 broker 请求前拒绝。
 - 原生子命令支持预览与 `--execute`；兼容脚本的原版 `--alter` 动作立即执行。
 
-缺少：bootstrap-controller。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity 还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
+缺少：bootstrap-controller。该模式不是把 controller 地址写进 `bootstrap.servers`：Java Admin 使用独立 controller bootstrap 模式；librdkafka 2.12 没有 `bootstrap.controllers`，而当前 krafka 初始化强制执行 broker Metadata 请求，因此两者都不能真实连接 controller listener，本项目不会提供无执行效果的占位参数。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
 
 ### 4.6 Get Offsets
 
@@ -236,7 +237,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：123 个通过（116 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：128 个通过（121 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -373,6 +374,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | GetOffsetShell 二次语义审计 | 对齐固定 client ID、Java 末尾空 token、逐 partition 错误和未知 offset；补齐 `-4/-5/-6` 解析，并对 librdkafka 2.12 的执行限制返回明确错误 | 115 个单元测试、7 个 CLI 测试、Kafka 3.6.2/4.3.1、bundled glibc 及双 musl CI 全部通过 |
 | 2026-08-04 | musl artifact 运行验证 | x86_64 musl 在 CI runner 原生执行 `--version`/`--help`；aarch64 musl 通过 QEMU user-mode emulator 执行相同 smoke test，不再只依赖 ELF 文件类型 | CI `30840437738` 六个 job 全绿，两种 musl artifact 均成功实际启动 |
 | 2026-08-04 | Consumer include 正则后端边界 | 移除 Rust regex 对 `--include` 的异方言预校验，订阅表达式由实际执行查询的 librdkafka POSIX ERE 引擎编译；保留整串锚定 | 116 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Rust regex 拒绝但 librdkafka 接受的量词集成用例 |
+| 2026-08-04 | ConfigCommand 参数语义复审 | `delete-config` 支持逗号分隔并逐项 trim；新增重复 entity type、broker ID 和 add-config key 字符预校验；确认现有客户端无法真实支持 controller bootstrap | 121 个单元测试、7 个 CLI 测试；Kafka 4.3.1 使用单个逗号列表删除两个 topic config |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

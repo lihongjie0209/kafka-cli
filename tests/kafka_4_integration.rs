@@ -1011,9 +1011,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--entity-name",
             "integration-events",
             "--delete-config",
-            "retention.ms",
-            "--delete-config",
-            "segment.bytes",
+            "retention.ms,segment.bytes",
             "--execute",
         ],
     );

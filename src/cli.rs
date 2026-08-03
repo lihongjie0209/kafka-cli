@@ -653,7 +653,7 @@ pub enum ConfigAction {
         add: Vec<String>,
         #[arg(long = "add-config-file", conflicts_with = "add")]
         add_file: Option<PathBuf>,
-        #[arg(long = "delete-config")]
+        #[arg(long = "delete-config", value_delimiter = ',')]
         delete: Vec<String>,
         #[arg(long)]
         execute: bool,
@@ -1323,6 +1323,29 @@ mod tests {
         "--all"
     );
     parses_command_family!(offsets_family_parses, "offsets", "--topic", "events");
+    #[test]
+    fn configs_delete_should_split_kafka_comma_separated_keys() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "configs",
+            "alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            "events",
+            "--delete-config",
+            "retention.ms,cleanup.policy",
+        ])
+        .expect("comma-separated delete configs");
+        let Command::Configs(ConfigsArgs {
+            action: ConfigAction::Alter { delete, .. },
+        }) = cli.command
+        else {
+            panic!("expected configs alter command");
+        };
+
+        assert_eq!(delete, ["retention.ms", "cleanup.policy"]);
+    }
     #[test]
     fn offsets_should_parse_kafka_tiered_time_aliases() {
         for value in [

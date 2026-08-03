@@ -2814,6 +2814,8 @@ async fn configs(
             entity_default,
             all,
         } => {
+            validate_config_entity_types(&entity_type)?;
+            validate_config_entity_names(&entity_type, &entity_name)?;
             if quota_entity_types(&entity_type) {
                 return describe_quota_configs(
                     config,
@@ -2855,6 +2857,7 @@ async fn configs(
             delete,
             execute,
         } => {
+            let delete = normalize_config_deletions(delete);
             let pairs = if let Some(path) = add_file.as_deref() {
                 let mut pairs = config::load_properties(path)?
                     .into_iter()
@@ -2869,6 +2872,9 @@ async fn configs(
                     "provide --add-config, --add-config-file, or --delete-config".into(),
                 ));
             }
+            validate_config_entity_types(&entity_type)?;
+            validate_config_entity_names(&entity_type, &entity_name)?;
+            validate_config_keys(&pairs)?;
             validate_quota_change_names(&entity_type, &pairs, &delete)?;
             if quota_entity_types(&entity_type) && !only_scram_changes(&pairs, &delete) {
                 return alter_quota_configs(
@@ -2934,6 +2940,61 @@ async fn configs(
             )
         }
     }
+}
+
+fn normalize_config_deletions(delete: Vec<String>) -> Vec<String> {
+    delete
+        .into_iter()
+        .map(|key| key.trim().to_owned())
+        .collect()
+}
+
+fn validate_config_entity_types(types: &[ConfigEntityType]) -> Result<()> {
+    let distinct = types.iter().copied().collect::<BTreeSet<_>>();
+    if distinct.len() != types.len() {
+        return Err(Error::Usage("duplicate --entity-type values".into()));
+    }
+    if types.len() > 1
+        && distinct != BTreeSet::from([ConfigEntityType::User, ConfigEntityType::Client])
+    {
+        return Err(Error::Usage(
+            "only users and clients may be specified together".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_config_entity_names(types: &[ConfigEntityType], names: &[String]) -> Result<()> {
+    if types.len() == 1
+        && matches!(
+            types[0],
+            ConfigEntityType::Broker | ConfigEntityType::BrokerLogger
+        )
+    {
+        for name in names {
+            name.parse::<i32>().map_err(|_| {
+                Error::Usage(format!(
+                    "the entity name for {} must be a valid integer broker ID: {name}",
+                    config_entity_type_name(types[0])
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_config_keys(add: &[(String, String)]) -> Result<()> {
+    for (key, _) in add {
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'$' | b'.' | b'_' | b'-'))
+        {
+            return Err(Error::Usage(format!(
+                "invalid character found in config key: {key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn quota_entity_types(types: &[ConfigEntityType]) -> bool {
@@ -6360,6 +6421,41 @@ mod tests {
             quota_entities(&[ConfigEntityType::Ip], &[], true, true)
                 .expect("valid default IP quota"),
             [("ip", None)]
+        );
+    }
+
+    #[test]
+    fn config_entity_types_should_reject_duplicates() {
+        assert!(matches!(
+            validate_config_entity_types(&[ConfigEntityType::Topic, ConfigEntityType::Topic]),
+            Err(Error::Usage(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn config_broker_entity_name_should_require_an_integer() {
+        assert!(matches!(
+            validate_config_entity_names(
+                &[ConfigEntityType::BrokerLogger],
+                &["not-a-broker".into()]
+            ),
+            Err(Error::Usage(message)) if message.contains("integer broker ID")
+        ));
+    }
+
+    #[test]
+    fn config_keys_should_reject_characters_disallowed_by_kafka() {
+        assert!(matches!(
+            validate_config_keys(&[("retention ms".into(), "1000".into())]),
+            Err(Error::Usage(message)) if message.contains("invalid character")
+        ));
+    }
+
+    #[test]
+    fn config_deletions_should_trim_each_comma_separated_key() {
+        assert_eq!(
+            normalize_config_deletions(vec![" retention.ms".into(), "segment.bytes ".into()]),
+            ["retention.ms", "segment.bytes"]
         );
     }
 
