@@ -42,7 +42,7 @@
 | 入口功能评级 | 5 已支持 / 8 部分支持 / 31 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 158 个通过 | 151 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 160 个通过 | 153 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -131,7 +131,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 - describe 默认 offsets 视图以及 `--state`、`--members`、`--offsets`；支持重复 `--group` 和 `--all-groups`，state/members 使用 librdkafka `DescribeConsumerGroups` Admin API。
 - committed offset、log end offset、lag 和错误列。
 - members 输出已解码的当前和 target topic-partition assignment；state 输出 group type、assignor、member count 与 coordinator。
-- describe 支持原版 `--verbose`：offset 视图增加 librdkafka 返回的 committed leader epoch；members 视图增加 current/target epoch 与 assignment；state 视图增加 group epoch 与 target assignment epoch；非 verbose members 只显示 partition 数量。描述主体继续来自 librdkafka，Kafka 4 consumer protocol epoch 由 ConsumerGroupDescribe 协议结果按 group/member ID 合并；classic group 保持缺失值。
+- describe 支持原版 `--verbose`：offset 视图增加 librdkafka 返回的 committed leader epoch；members 视图增加 current/target epoch 与 assignment，并在同组同时存在 classic/consumer protocol 成员时按原版增加 `UPGRADED`；state 视图增加 group epoch 与 target assignment epoch；非 verbose members 只显示 partition 数量。描述主体继续来自 librdkafka，Kafka 4 consumer protocol epoch/member type 由 ConsumerGroupDescribe 协议结果按 group/member ID 合并；unknown 不会误报为未升级。
 - delete group 支持重复 `--group` 和 `--all-groups`；delete-offsets 支持重复裸 topic 与 `topic:partition,partition`，单个 librdkafka 请求可携带跨 topic partition list；原生子命令默认预览并通过 `--execute` 执行，兼容脚本的原版 `--delete`/`--delete-offsets` 动作立即执行。
 - reset offsets：支持重复 `--group`/`--topic`、`--all-groups`、`--all-topics`、原版 `topic:partition,partition` selector、`--dry-run`/`--execute`，以及 earliest、latest、absolute offset、shift-by、current、datetime、ISO-8601 duration；支持原版 `--export` 与 `--from-file` 无表头 CSV（单 group 三列、多 group 四列），导入校验选择范围、重复目标并按 log start/end 边界调整 offset；执行阶段使用 librdkafka `AlterConsumerGroupOffsets` Admin API。
 - `validate-regex` 可在不提供 bootstrap-server 时独立校验正则；兼容脚本入口的原版 `--validate-regex` 会自动改写到该子命令，结果使用表格/JSON 输出。语法由 Rust regex/librdkafka 可用集合约束，不宣称覆盖所有 Java Pattern 扩展。
@@ -246,7 +246,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：158 个通过（151 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：160 个通过（153 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -395,6 +395,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | ConsumerGroup 原版 timeout | groups 命令域新增 `--timeout`，覆盖 Admin 请求与 group 稳定等待；保留原生全局 `--timeout-ms` | 147 个单元测试、7 个 CLI 测试；Kafka 4.3.1 `groups list --timeout 5000` 实际请求；CI `30846952761` 六项全绿 |
 | 2026-08-04 | ConsumerGroup Kafka 4 状态过滤 | `Assigning`/`Reconciling` 通过 ListGroups v5 + ConsumerGroupDescribe 协议 fallback 补齐；旧五状态继续走 librdkafka；确认 `NotReady` 与 Share/Streams 不属于原版 consumer-groups 合法过滤集合 | 149 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Assigning 实际请求；与 Kafka 4.4 源码差分核对；CI `30848089820` 六项全绿 |
 | 2026-08-04 | ConsumerGroup verbose epoch | state verbose 合并 group/target assignment epoch，members verbose 合并 member/target epoch；librdkafka 继续提供 coordinator、assignment 与成员主体，协议结果只补缺失字段 | 151 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 state/members verbose 列断言；CI `30848663059` 六项全绿 |
+| 2026-08-04 | ConsumerGroup migration member | ConsumerGroupDescribe member type 映射为三态 upgraded；仅当同一 group 同时存在 classic 与 consumer protocol 成员时，verbose members 按原版增加 `UPGRADED` 列 | 153 个单元测试、7 个 CLI 测试；迁移组动态列与 unknown 边界由单元测试覆盖 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

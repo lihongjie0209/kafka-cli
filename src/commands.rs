@@ -2147,6 +2147,7 @@ struct GroupMemberRow {
     assignment: String,
     target_epoch: Option<i32>,
     target_assignment: String,
+    upgraded: Option<bool>,
 }
 
 #[derive(Default)]
@@ -2154,6 +2155,7 @@ struct ProtocolGroupEpochs {
     group_epoch: Option<i32>,
     target_assignment_epoch: Option<i32>,
     member_epochs: BTreeMap<String, Option<i32>>,
+    member_upgraded: BTreeMap<String, Option<bool>>,
 }
 
 async fn protocol_group_epochs(
@@ -2173,8 +2175,20 @@ async fn protocol_group_epochs(
                 target_assignment_epoch: description.assignment_epoch,
                 member_epochs: description
                     .members
+                    .iter()
+                    .map(|member| (member.member_id.clone(), member.member_epoch))
+                    .collect(),
+                member_upgraded: description
+                    .members
                     .into_iter()
-                    .map(|member| (member.member_id, member.member_epoch))
+                    .map(|member| {
+                        let upgraded = match member.member_type {
+                            Some(0) => Some(false),
+                            Some(1) => Some(true),
+                            _ => None,
+                        };
+                        (member.member_id, upgraded)
+                    })
                     .collect(),
             };
             (description.group_id, epochs)
@@ -2382,6 +2396,9 @@ async fn describe_group_members(
                     assignment: group_partitions(&member.assignment),
                     target_epoch: group_epochs.and_then(|group| group.target_assignment_epoch),
                     target_assignment: group_partitions(&member.target_assignment),
+                    upgraded: group_epochs
+                        .and_then(|group| group.member_upgraded.get(&member.member_id).copied())
+                        .flatten(),
                 })
         })
         .collect::<Vec<_>>();
@@ -2391,7 +2408,41 @@ async fn describe_group_members(
 }
 
 fn group_members_table(rows: &[GroupMemberRow], verbose: bool) -> String {
-    if verbose {
+    if verbose && has_migration_members(rows) {
+        output::table(
+            [
+                "GROUP",
+                "MEMBER_ID",
+                "INSTANCE_ID",
+                "CLIENT_ID",
+                "HOST",
+                "PARTITIONS",
+                "CURRENT_EPOCH",
+                "ASSIGNMENT",
+                "TARGET_EPOCH",
+                "TARGET_ASSIGNMENT",
+                "UPGRADED",
+            ],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.member_id.clone(),
+                    row.instance_id.as_deref().unwrap_or("-").to_owned(),
+                    row.client_id.clone(),
+                    row.host.clone(),
+                    row.partitions.to_string(),
+                    row.current_epoch
+                        .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
+                    row.assignment.clone(),
+                    row.target_epoch
+                        .map_or_else(|| "-".into(), |epoch| epoch.to_string()),
+                    row.target_assignment.clone(),
+                    row.upgraded
+                        .map_or_else(|| "-".into(), |upgraded| upgraded.to_string()),
+                ]
+            }),
+        )
+    } else if verbose {
         output::table(
             [
                 "GROUP",
@@ -2444,6 +2495,21 @@ fn group_members_table(rows: &[GroupMemberRow], verbose: bool) -> String {
             }),
         )
     }
+}
+
+fn has_migration_members(rows: &[GroupMemberRow]) -> bool {
+    let mut protocols = BTreeMap::<&str, (bool, bool)>::new();
+    for row in rows {
+        let entry = protocols.entry(&row.group).or_default();
+        match row.upgraded {
+            Some(false) => entry.0 = true,
+            Some(true) => entry.1 = true,
+            None => {}
+        }
+    }
+    protocols
+        .values()
+        .any(|(has_classic, has_consumer)| *has_classic && *has_consumer)
 }
 
 fn group_partitions(partitions: &[ffi::ConsumerGroupPartition]) -> String {
@@ -8154,11 +8220,54 @@ mod tests {
                 assignment: "orders:0".into(),
                 target_epoch: Some(8),
                 target_assignment: "orders:0".into(),
+                upgraded: None,
             }],
             true,
         );
 
         assert!(table.contains("CURRENT_EPOCH") && table.contains('9'));
+    }
+
+    #[test]
+    fn group_member_verbose_table_should_show_upgraded_for_migration_group() {
+        let row = |member_id: &str, upgraded| GroupMemberRow {
+            group: "orders".into(),
+            member_id: member_id.into(),
+            instance_id: None,
+            client_id: member_id.into(),
+            host: "/127.0.0.1".into(),
+            partitions: 0,
+            current_epoch: None,
+            assignment: String::new(),
+            target_epoch: None,
+            target_assignment: String::new(),
+            upgraded: Some(upgraded),
+        };
+        let table = group_members_table(&[row("classic", false), row("consumer", true)], true);
+
+        assert!(table.contains("UPGRADED"));
+    }
+
+    #[test]
+    fn group_member_verbose_table_should_omit_upgraded_for_unknown_type() {
+        let table = group_members_table(
+            &[GroupMemberRow {
+                group: "orders".into(),
+                member_id: "member-1".into(),
+                instance_id: None,
+                client_id: "client-1".into(),
+                host: "/127.0.0.1".into(),
+                partitions: 0,
+                current_epoch: None,
+                assignment: String::new(),
+                target_epoch: None,
+                target_assignment: String::new(),
+                upgraded: None,
+            }],
+            true,
+        );
+
+        assert!(!table.contains("UPGRADED"));
     }
 
     #[test]
