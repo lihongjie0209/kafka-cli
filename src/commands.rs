@@ -2238,6 +2238,10 @@ async fn describe_share_group_offsets(
             })?;
         let mut response = connection
             .send_request(api_key, version, |buffer| {
+                // krafka preserves unknown API keys, but conservatively emits a
+                // non-flexible header for them. APIs 90-92 are flexible from v0,
+                // so this byte completes the request header's tagged fields.
+                buffer.put_u8(0);
                 encode_unsigned_varint(2, buffer);
                 encode_compact_string(group_id, buffer);
                 buffer.put_u8(0); // nullable compact topics: null means all partitions
@@ -2247,6 +2251,10 @@ async fn describe_share_group_offsets(
             })
             .await?;
         drop(connection);
+        // The corresponding flexible response-header tagged fields are left in
+        // the payload because krafka treats this forward-compatible key as
+        // unknown.
+        skip_tagged_fields(&mut response)?;
         let _throttle_time_ms = i32::decode(&mut response)?;
         let group_count = decode_compact_len(&mut response)?;
         for _ in 0..group_count {
@@ -2513,6 +2521,7 @@ async fn delete_share_group_offsets(
         })?;
     let mut response = connection
         .send_request(api_key, version, |buffer| {
+            buffer.put_u8(0); // flexible request-header tagged fields
             encode_compact_string(group_id, buffer);
             encode_unsigned_varint(topics.len() + 1, buffer);
             for topic in &topics {
@@ -2524,6 +2533,7 @@ async fn delete_share_group_offsets(
         })
         .await?;
     drop(connection);
+    skip_tagged_fields(&mut response)?; // flexible response-header tagged fields
     let _throttle_time_ms = i32::decode(&mut response)?;
     let top_error = i16::decode(&mut response)?;
     let top_message = decode_nullable_compact_string(&mut response)?;
@@ -2620,6 +2630,7 @@ async fn alter_share_group_offsets(
         })?;
     let mut response = connection
         .send_request(api_key, version, |buffer| {
+            buffer.put_u8(0); // flexible request-header tagged fields
             encode_compact_string(group_id, buffer);
             encode_unsigned_varint(topics.len() + 1, buffer);
             for (topic, partitions) in &topics {
@@ -2637,6 +2648,7 @@ async fn alter_share_group_offsets(
         })
         .await?;
     drop(connection);
+    skip_tagged_fields(&mut response)?; // flexible response-header tagged fields
     let _throttle_time_ms = i32::decode(&mut response)?;
     let top_error = i16::decode(&mut response)?;
     let top_message = decode_nullable_compact_string(&mut response)?;
