@@ -1896,14 +1896,23 @@ async fn broker_api_versions(
 struct BrokerRow {
     id: i32,
     host: String,
-    port: i32,
+    port: u16,
+    rack: Option<String>,
+    controller: bool,
 }
 
 fn broker_table(rows: &[BrokerRow]) -> String {
     output::table(
-        ["ID", "HOST", "PORT"],
-        rows.iter()
-            .map(|row| [row.id.to_string(), row.host.clone(), row.port.to_string()]),
+        ["ID", "HOST", "PORT", "RACK", "CONTROLLER"],
+        rows.iter().map(|row| {
+            [
+                row.id.to_string(),
+                row.host.clone(),
+                row.port.to_string(),
+                row.rack.as_deref().unwrap_or("-").to_owned(),
+                row.controller.to_string(),
+            ]
+        }),
     )
 }
 
@@ -1917,24 +1926,26 @@ async fn cluster(
 ) -> Result<()> {
     match action {
         ClusterAction::Id => {
-            let id = admin(config)?
-                .inner()
-                .fetch_cluster_id(timeout)
-                .ok_or_else(|| Error::Unsupported("broker did not return a cluster ID".into()))?;
+            let client = admin(config)?;
+            let id = ffi::describe_cluster(client.inner().native_ptr(), duration_ms(timeout)?)?
+                .cluster_id;
             output::write_value(format, "cluster.id", &id, |id| {
                 output::table(["CLUSTER_ID"], [[id.clone()]])
             })
         }
         ClusterAction::ListEndpoints => {
-            let client = base_consumer(config)?;
-            let metadata = client.fetch_metadata(None, timeout)?;
-            let rows = metadata
-                .brokers()
-                .iter()
+            let client = admin(config)?;
+            let cluster =
+                ffi::describe_cluster(client.inner().native_ptr(), duration_ms(timeout)?)?;
+            let rows = cluster
+                .nodes
+                .into_iter()
                 .map(|broker| BrokerRow {
-                    id: broker.id(),
-                    host: broker.host().to_owned(),
-                    port: broker.port(),
+                    id: broker.id,
+                    host: broker.host,
+                    port: broker.port,
+                    rack: broker.rack,
+                    controller: broker.is_controller,
                 })
                 .collect::<Vec<_>>();
             output::write_value(format, "cluster.list-endpoints", &rows, |rows| {

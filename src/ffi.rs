@@ -293,6 +293,24 @@ pub struct ConsumerGroupDescription {
     pub members: Vec<ConsumerGroupMember>,
 }
 
+/// Broker node returned by librdkafka's `DescribeCluster` API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClusterNode {
+    pub id: i32,
+    pub host: String,
+    pub port: u16,
+    pub rack: Option<String>,
+    pub is_controller: bool,
+}
+
+/// Cluster identity and nodes returned by librdkafka.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClusterDescription {
+    pub cluster_id: String,
+    pub controller_id: i32,
+    pub nodes: Vec<ClusterNode>,
+}
+
 /// A committed consumer-group offset returned by librdkafka.
 #[derive(Debug)]
 pub struct GroupOffsetEntry {
@@ -352,6 +370,58 @@ fn poll(queue: &Queue, timeout_ms: i32) -> Result<Event> {
         return Err(Error::Config(message));
     }
     Ok(event)
+}
+
+/// Describes the cluster through librdkafka's Admin API.
+pub fn describe_cluster(
+    client: *mut sys::rd_kafka_t,
+    timeout_ms: i32,
+) -> Result<ClusterDescription> {
+    let queue = queue(client)?;
+    let options = options(
+        client,
+        sys::rd_kafka_admin_op_t::RD_KAFKA_ADMIN_OP_DESCRIBECLUSTER,
+        timeout_ms,
+    )?;
+    unsafe { sys::rd_kafka_DescribeCluster(client, options.0, queue.0) };
+    let event = poll(&queue, timeout_ms)?;
+    let result = unsafe { sys::rd_kafka_event_DescribeCluster_result(event.0) };
+    if result.is_null() {
+        return Err(Error::Config(
+            "broker returned an invalid DescribeCluster response".into(),
+        ));
+    }
+    let controller = unsafe { sys::rd_kafka_DescribeCluster_result_controller(result) };
+    let controller_id = if controller.is_null() {
+        -1
+    } else {
+        unsafe { sys::rd_kafka_Node_id(controller) }
+    };
+    let mut count = 0;
+    let nodes = unsafe { sys::rd_kafka_DescribeCluster_result_nodes(result, &raw mut count) };
+    if count > 0 && nodes.is_null() {
+        return Err(Error::Config("broker returned a null node array".into()));
+    }
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let node = unsafe { *nodes.add(index) };
+        if node.is_null() {
+            return Err(Error::Config("broker returned a null cluster node".into()));
+        }
+        let id = unsafe { sys::rd_kafka_Node_id(node) };
+        rows.push(ClusterNode {
+            id,
+            host: unsafe { c_string(sys::rd_kafka_Node_host(node)) },
+            port: unsafe { sys::rd_kafka_Node_port(node) },
+            rack: unsafe { optional_c_string_from_ptr(sys::rd_kafka_Node_rack(node)) },
+            is_controller: id == controller_id,
+        });
+    }
+    Ok(ClusterDescription {
+        cluster_id: unsafe { c_string(sys::rd_kafka_DescribeCluster_result_cluster_id(result)) },
+        controller_id,
+        nodes: rows,
+    })
 }
 
 /// Lists consumer groups with broker-side state and type filters.

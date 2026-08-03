@@ -168,7 +168,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 
 ### 4.13 Cluster
 
-已支持 cluster ID、broker endpoints、API versions、unregister broker。Cluster ID 和 broker endpoints 均通过 rdkafka/librdkafka metadata API 获取。
+已支持 cluster ID、broker endpoints、API versions、unregister broker。Cluster ID 和 broker endpoints 均通过 librdkafka `DescribeCluster` Admin API 获取；endpoint 输出包含 rack 与 controller 标记。
 
 缺少或有差异：bootstrap-controller、list-endpoints 的 `--include-fenced-brokers`、原版短参数和废弃 config 别名。unregister 要求 `--execute`，避免误操作。
 
@@ -269,3 +269,4 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Consumer Group list | 从旧同步 group-list API 迁移到 librdkafka `ListConsumerGroups` Admin API，新增 Kafka 原版 `--state` 与 `--type` 可选过滤 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 集成测试通过 |
 | 2026-08-03 | Consumer Group describe | state/members 从旧 group-list API 迁移到 librdkafka `DescribeConsumerGroups`；解码 current/target member assignment，并输出 type、assignor、coordinator | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 state/members 集成测试通过 |
 | 2026-08-03 | Consumer Group reset write | reset-offsets 从 consumer synchronous commit 迁移到 librdkafka `AlterConsumerGroupOffsets` Admin API，保留安全预览和所有 reset target 算法 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 reset/describe 闭环集成测试通过 |
+| 2026-08-03 | Describe Cluster | cluster ID 与 endpoint 查询统一迁移到 librdkafka `DescribeCluster` Admin API，新增 rack 与 controller 输出 | Clippy、53 个普通测试、bundled Kafka 3.6.2 与 Kafka 4.3.1 cluster 集成测试通过 |
