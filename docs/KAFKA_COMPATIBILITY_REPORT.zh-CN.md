@@ -102,7 +102,7 @@
 缺少或有差异：
 
 - librdkafka 2.12 C Admin API 未暴露 `partition-size-limit-per-response` 请求旋钮，因此该兼容参数不会强制指定单次响应的 partition 上限；结果集合不受影响。
-- 原版废弃的 `--delete-config` 未提供。
+- Kafka 4.4 原版 `--delete-config` 只打印“自 4.0 起不再支持”的弃用警告，不再执行配置删除；本项目不提供这个无效果占位参数，topic 配置删除由 `configs alter --delete-config` 实际执行。
 - 表格列名和排版不是原版逐字符复制。
 
 ### 4.2 Console Producer
