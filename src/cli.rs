@@ -77,6 +77,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-console-consumer" => Some("consume"),
         "kafka-consumer-groups" => Some("groups"),
         "kafka-groups" => Some("all-groups"),
+        "kafka-share-groups" => Some("share-groups"),
         "kafka-configs" => Some("configs"),
         "kafka-get-offsets" => Some("offsets"),
         "kafka-acls" => Some("acls"),
@@ -95,6 +96,10 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Kafka script action aliases are centralized to keep rewrite precedence explicit"
+)]
 fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
     let deprecated_configs: &[&str] = match command {
         "produce" => &["--producer.config"],
@@ -138,6 +143,13 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             ("--list", "list", false),
         ],
         "all-groups" => &[("--list", "list", false)],
+        "share-groups" => &[
+            ("--delete-offsets", "delete-offsets", true),
+            ("--reset-offsets", "reset-offsets", false),
+            ("--describe", "describe", false),
+            ("--delete", "delete", true),
+            ("--list", "list", false),
+        ],
         "configs" => &[
             ("--describe", "describe", false),
             ("--alter", "alter", true),
@@ -284,6 +296,8 @@ pub enum Command {
     Groups(GroupsArgs),
     /// List groups of every Kafka group type.
     AllGroups(AllGroupsArgs),
+    /// Inspect and manage Share groups.
+    ShareGroups(ShareGroupsArgs),
     /// Inspect and alter dynamic configuration.
     Configs(ConfigsArgs),
     /// Query partition offsets.
@@ -891,6 +905,98 @@ pub enum AllGroupType {
     Streams,
 }
 
+#[derive(Debug, Args)]
+pub struct ShareGroupsArgs {
+    /// `ShareGroupCommand` request/stabilization timeout in milliseconds.
+    #[arg(long = "timeout", global = true, default_value_t = 30_000)]
+    pub timeout_ms: u64,
+    #[command(subcommand)]
+    pub action: ShareGroupAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShareGroupAction {
+    /// List all Share groups.
+    List {
+        /// Include state and optionally filter by comma-separated states.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        state: Option<String>,
+    },
+    /// Describe Share group offsets, members, or state.
+    Describe {
+        #[arg(
+            long,
+            required_unless_present = "all_groups",
+            conflicts_with = "all_groups"
+        )]
+        group: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
+        #[arg(long, conflicts_with_all = ["state", "offsets"])]
+        members: bool,
+        #[arg(long, conflicts_with_all = ["members", "offsets"])]
+        state: bool,
+        #[arg(long, conflicts_with_all = ["members", "state"])]
+        offsets: bool,
+    },
+    /// Delete inactive Share groups.
+    Delete {
+        #[arg(
+            long,
+            required_unless_present = "all_groups",
+            conflicts_with = "all_groups"
+        )]
+        group: Vec<String>,
+        #[arg(long)]
+        all_groups: bool,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Reset offsets for one inactive Share group.
+    ResetOffsets(ShareGroupResetOffsetsArgs),
+    /// Delete offsets for topics in one inactive Share group.
+    DeleteOffsets {
+        #[arg(long)]
+        group: String,
+        #[arg(long, required = true)]
+        topic: Vec<String>,
+        #[arg(long)]
+        execute: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka-compatible reset target flags are intentionally mutually exclusive"
+)]
+pub struct ShareGroupResetOffsetsArgs {
+    #[arg(long)]
+    pub group: String,
+    #[arg(long, required_unless_present_any = ["all_topics", "from_file"], conflicts_with_all = ["all_topics", "from_file"])]
+    pub topic: Vec<String>,
+    #[arg(long, conflicts_with_all = ["topic", "from_file"])]
+    pub all_topics: bool,
+    #[arg(long, conflicts_with_all = ["to_latest", "to_offset", "to_current", "to_datetime", "from_file"])]
+    pub to_earliest: bool,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_offset", "to_current", "to_datetime", "from_file"])]
+    pub to_latest: bool,
+    #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["to_earliest", "to_latest", "to_current", "to_datetime", "from_file"])]
+    pub to_offset: Option<i64>,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_datetime", "from_file"])]
+    pub to_current: bool,
+    #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_current", "from_file"])]
+    pub to_datetime: Option<String>,
+    #[arg(long, conflicts_with_all = ["topic", "all_topics", "to_earliest", "to_latest", "to_offset", "to_current", "to_datetime"])]
+    pub from_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "execute", required_unless_present = "execute")]
+    pub dry_run: bool,
+    #[arg(long, conflicts_with = "dry_run", required_unless_present = "dry_run")]
+    pub execute: bool,
+    #[arg(long)]
+    pub export: bool,
+}
+
 impl GroupsArgs {
     pub(crate) fn timeout(&self, default: Duration) -> Duration {
         self.timeout_ms.map_or(default, Duration::from_millis)
@@ -1360,6 +1466,10 @@ mod tests {
         assert_eq!(compatibility_command("kafka-topics.sh"), Some("topics"));
         assert_eq!(compatibility_command("kafka-groups.sh"), Some("all-groups"));
         assert_eq!(
+            compatibility_command("kafka-share-groups.sh"),
+            Some("share-groups")
+        );
+        assert_eq!(
             compatibility_command("kafka-client-metrics.sh"),
             Some("client-metrics")
         );
@@ -1748,6 +1858,34 @@ mod tests {
         "--skip-message-on-error"
     );
     parses_command_family!(groups_family_parses, "groups", "list");
+    parses_command_family!(
+        share_groups_describe_parses,
+        "share-groups",
+        "describe",
+        "--group",
+        "workers",
+        "--members",
+        "--verbose"
+    );
+    parses_command_family!(
+        share_groups_list_state_parses,
+        "share-groups",
+        "list",
+        "--state",
+        "Stable,Empty"
+    );
+    parses_command_family!(
+        share_groups_reset_parses,
+        "share-groups",
+        "reset-offsets",
+        "--group",
+        "workers",
+        "--topic",
+        "events:0,1",
+        "--to-earliest",
+        "--dry-run",
+        "--export"
+    );
     parses_command_family!(
         all_groups_family_parses,
         "all-groups",

@@ -228,3 +228,20 @@ fn kafka_groups_alias_should_accept_original_list_filters() {
         .stdout(predicate::str::contains("--consumer"))
         .stdout(predicate::str::contains("--streams"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_share_groups_alias_should_accept_original_actions() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-share-groups.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-share-groups alias");
+
+    Command::new(alias)
+        .args(["--describe", "--group", "workers", "--members", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--all-groups"))
+        .stdout(predicate::str::contains("--offsets"));
+}

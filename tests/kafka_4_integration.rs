@@ -3,6 +3,7 @@
 use std::{fs, process::Output, thread, time::Duration};
 
 use assert_cmd::Command;
+use krafka::share_consumer::ShareConsumer;
 use predicates::prelude::*;
 use tempfile::TempDir;
 use testcontainers::{core::ImageExt, runners::SyncRunner};
@@ -62,6 +63,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .with_env_var("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "true")
         .with_env_var("KAFKA_SUPER_USERS", "User:ANONYMOUS")
         .with_env_var("KAFKA_NUM_PARTITIONS", "3")
+        .with_env_var(
+            "KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR",
+            "1",
+        )
+        .with_env_var("KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR", "1")
         .start()
         .expect("start Kafka 4.3.1");
     let port = broker
@@ -625,6 +631,119 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .stdout(predicate::str::contains("trace"));
 
     // groups, configs, offsets
+    let runtime = tokio::runtime::Runtime::new().expect("Share consumer runtime");
+    let share_consumer = runtime
+        .block_on(async {
+            let consumer = ShareConsumer::builder()
+                .bootstrap_servers(&bootstrap)
+                .group_id("integration-share")
+                .build()
+                .await?;
+            consumer.subscribe(&["integration-events"]).await?;
+            Ok::<_, krafka::error::KrafkaError>(consumer)
+        })
+        .expect("start Share consumer");
+    assert!(
+        eventually_contains(&bootstrap, &["share-groups", "list"], "integration-share")
+            .contains("integration-share")
+    );
+    assert!(
+        eventually_contains(
+            &bootstrap,
+            &[
+                "share-groups",
+                "describe",
+                "--group",
+                "integration-share",
+                "--state"
+            ],
+            "integration-share",
+        )
+        .contains("Stable")
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "share-groups",
+                "describe",
+                "--group",
+                "integration-share",
+                "--members",
+                "--verbose",
+            ],
+        )
+        .contains("MEMBER-EPOCH")
+    );
+    runtime
+        .block_on(share_consumer.close())
+        .expect("close Share consumer");
+    drop(share_consumer);
+    drop(runtime);
+    eventually_contains(
+        &bootstrap,
+        &["share-groups", "list", "--state", "Empty"],
+        "integration-share",
+    );
+    success(
+        &bootstrap,
+        &[
+            "share-groups",
+            "describe",
+            "--group",
+            "integration-share",
+            "--offsets",
+            "--verbose",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "share-groups",
+            "reset-offsets",
+            "--group",
+            "integration-share",
+            "--topic",
+            "integration-events:0",
+            "--to-earliest",
+            "--dry-run",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "share-groups",
+            "reset-offsets",
+            "--group",
+            "integration-share",
+            "--topic",
+            "integration-events:0",
+            "--to-earliest",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "share-groups",
+            "delete-offsets",
+            "--group",
+            "integration-share",
+            "--topic",
+            "integration-events",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "share-groups",
+            "delete",
+            "--group",
+            "integration-share",
+            "--execute",
+        ],
+    );
     let all_groups = success(&bootstrap, &["all-groups", "list"]);
     assert!(all_groups.contains("integration-suite"));
     assert!(all_groups.contains("Classic"));

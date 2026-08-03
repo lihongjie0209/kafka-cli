@@ -46,7 +46,8 @@ use crate::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
         ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
         ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
-        ReassignAction, ResetOffsetsArgs, TopicAction, TransactionAction,
+        ReassignAction, ResetOffsetsArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
+        TopicAction, TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -130,7 +131,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Produce(args) => produce(client_config, args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::Groups(args) => {
-            groups(
+            Box::pin(groups(
                 &client_config,
                 bootstrap,
                 command_config.as_deref(),
@@ -138,7 +139,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 format,
                 args.action,
                 verbose,
-            )
+            ))
             .await
         }
         Command::AllGroups(args) => {
@@ -149,6 +150,18 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 format,
                 args.action,
             )
+            .await
+        }
+        Command::ShareGroups(args) => {
+            Box::pin(share_groups(
+                &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                Duration::from_millis(args.timeout_ms),
+                format,
+                args.action,
+                verbose,
+            ))
             .await
         }
         Command::Configs(args) => {
@@ -1999,6 +2012,1009 @@ fn group_type_label(group_type: &str) -> String {
         "share" => "Share".into(),
         "streams" => "Streams".into(),
         _ => group_type.to_owned(),
+    }
+}
+
+#[derive(Debug)]
+struct ShareGroupDescriptionWithCoordinator {
+    coordinator_id: i32,
+    coordinator: String,
+    description: krafka::protocol::ShareGroupDescription,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareGroupListRow {
+    group: String,
+    state: Option<String>,
+}
+
+async fn share_group_ids(client: &krafka::admin::AdminClient) -> Result<Vec<String>> {
+    let mut groups = client
+        .list_consumer_groups()
+        .await?
+        .into_iter()
+        .filter(|group| {
+            group
+                .group_type
+                .as_ref()
+                .is_some_and(|kind| kind.to_string().eq_ignore_ascii_case("share"))
+        })
+        .map(|group| group.group_id)
+        .collect::<Vec<_>>();
+    groups.sort();
+    Ok(groups)
+}
+
+async fn group_coordinator_connection(
+    client: &krafka::admin::AdminClient,
+    group_id: &str,
+) -> Result<(
+    i32,
+    String,
+    std::sync::Arc<krafka::network::BrokerConnection>,
+)> {
+    let bootstrap_connection = delegation_broker_connection(client).await?;
+    let version = bootstrap_connection
+        .negotiate_api_version(ApiKey::FindCoordinator, 6, 1)
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support FindCoordinator".into()))?;
+    let request = krafka::protocol::FindCoordinatorRequest::for_group(group_id);
+    let mut bytes = bootstrap_connection
+        .send_request(ApiKey::FindCoordinator, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(bootstrap_connection);
+    let response =
+        krafka::protocol::FindCoordinatorResponse::decode_versioned(version, &mut bytes)?;
+    if !response.error_code.is_ok() {
+        return Err(Error::Config(format!(
+            "FindCoordinator failed for {group_id}: {:?}: {}",
+            response.error_code,
+            response.error_message.as_deref().unwrap_or("-")
+        )));
+    }
+    let address = format!("{}:{}", response.host, response.port);
+    let connection = client
+        .pool()
+        .get_connection_by_id(response.node_id, &address)
+        .await?;
+    Ok((response.node_id, address, connection))
+}
+
+async fn describe_share_groups(
+    client: &krafka::admin::AdminClient,
+    group_ids: &[String],
+) -> Result<Vec<ShareGroupDescriptionWithCoordinator>> {
+    let mut descriptions = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        let (coordinator_id, coordinator, connection) =
+            group_coordinator_connection(client, group_id).await?;
+        let version = connection
+            .negotiate_api_version(ApiKey::ShareGroupDescribe, 1, 1)
+            .await
+            .ok_or_else(|| {
+                Error::Unsupported("broker does not support ShareGroupDescribe v1".into())
+            })?;
+        let request = krafka::protocol::ShareGroupDescribeRequest {
+            group_ids: vec![group_id.clone()],
+            include_authorized_operations: false,
+        };
+        let mut bytes = connection
+            .send_request(ApiKey::ShareGroupDescribe, version, |buffer| {
+                request.encode_versioned(version, buffer)
+            })
+            .await?;
+        drop(connection);
+        let response =
+            krafka::protocol::ShareGroupDescribeResponse::decode_versioned(version, &mut bytes)?;
+        let description = response
+            .groups
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Config(format!("broker omitted Share group {group_id}")))?;
+        if !description.error_code.is_ok() {
+            return Err(Error::Config(format!(
+                "ShareGroupDescribe failed for {group_id}: {:?}: {}",
+                description.error_code,
+                description.error_message.as_deref().unwrap_or("-")
+            )));
+        }
+        descriptions.push(ShareGroupDescriptionWithCoordinator {
+            coordinator_id,
+            coordinator,
+            description,
+        });
+    }
+    descriptions.sort_by(|left, right| left.description.group_id.cmp(&right.description.group_id));
+    Ok(descriptions)
+}
+
+fn parse_share_group_states(value: &str) -> Result<BTreeSet<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|state| match state.to_ascii_lowercase().as_str() {
+            "empty" => Ok("Empty".into()),
+            "stable" => Ok("Stable".into()),
+            "dead" => Ok("Dead".into()),
+            _ => Err(Error::Usage(format!(
+                "invalid Share group state '{state}'; expected Empty, Stable, or Dead"
+            ))),
+        })
+        .collect()
+}
+
+async fn list_share_groups(
+    client: &krafka::admin::AdminClient,
+    format: OutputFormat,
+    state: Option<&str>,
+) -> Result<()> {
+    let group_ids = share_group_ids(client).await?;
+    let rows: Vec<ShareGroupListRow> = if let Some(state_filter) = state {
+        let states = if state_filter.is_empty() {
+            BTreeSet::new()
+        } else {
+            parse_share_group_states(state_filter)?
+        };
+        describe_share_groups(client, &group_ids)
+            .await?
+            .into_iter()
+            .filter(|group| states.is_empty() || states.contains(&group.description.group_state))
+            .map(|group| ShareGroupListRow {
+                group: group.description.group_id,
+                state: Some(group.description.group_state),
+            })
+            .collect()
+    } else {
+        group_ids
+            .into_iter()
+            .map(|group| ShareGroupListRow { group, state: None })
+            .collect()
+    };
+    output::write_value(format, "share-groups.list", &rows, |rows| {
+        if rows.iter().any(|row| row.state.is_some()) {
+            output::table(
+                ["GROUP", "STATE"],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.state.as_deref().unwrap_or("-").to_owned(),
+                    ]
+                }),
+            )
+        } else {
+            output::table(["GROUP"], rows.iter().map(|row| [row.group.clone()]))
+        }
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ShareGroupStateRow {
+    group: String,
+    coordinator: String,
+    coordinator_id: i32,
+    state: String,
+    group_epoch: Option<i32>,
+    assignment_epoch: Option<i32>,
+    members: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareGroupMemberRow {
+    group: String,
+    consumer_id: String,
+    host: String,
+    client_id: String,
+    partitions: usize,
+    member_epoch: Option<i32>,
+    assignment: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShareGroupOffsetRow {
+    group: String,
+    topic: String,
+    partition: i32,
+    leader_epoch: Option<i32>,
+    start_offset: Option<i64>,
+    lag: Option<i64>,
+    error: Option<String>,
+}
+
+async fn describe_share_group_offsets(
+    client: &krafka::admin::AdminClient,
+    group_ids: &[String],
+) -> Result<Vec<ShareGroupOffsetRow>> {
+    let mut rows = Vec::new();
+    for group_id in group_ids {
+        let (_, _, connection) = group_coordinator_connection(client, group_id).await?;
+        let api_key = ApiKey::Unknown(90);
+        let version = connection
+            .negotiate_api_version(api_key, 1, 0)
+            .await
+            .ok_or_else(|| {
+                Error::Unsupported("broker does not support DescribeShareGroupOffsets".into())
+            })?;
+        let mut response = connection
+            .send_request(api_key, version, |buffer| {
+                encode_unsigned_varint(2, buffer);
+                encode_compact_string(group_id, buffer);
+                buffer.put_u8(0); // nullable compact topics: null means all partitions
+                buffer.put_u8(0); // group tagged fields
+                buffer.put_u8(0); // top-level tagged fields
+                Ok(())
+            })
+            .await?;
+        drop(connection);
+        let _throttle_time_ms = i32::decode(&mut response)?;
+        let group_count = decode_compact_len(&mut response)?;
+        for _ in 0..group_count {
+            let response_group = decode_compact_string(&mut response)?;
+            let topic_count = decode_compact_len(&mut response)?;
+            let mut group_rows = Vec::new();
+            for _ in 0..topic_count {
+                let topic = decode_compact_string(&mut response)?;
+                if response.remaining() < 16 {
+                    return Err(Error::Config(
+                        "DescribeShareGroupOffsets response omitted topic ID bytes".into(),
+                    ));
+                }
+                response.advance(16);
+                let partition_count = decode_compact_len(&mut response)?;
+                for _ in 0..partition_count {
+                    let partition = i32::decode(&mut response)?;
+                    let start_offset = i64::decode(&mut response)?;
+                    let leader_epoch = i32::decode(&mut response)?;
+                    let lag = if version >= 1 {
+                        i64::decode(&mut response)?
+                    } else {
+                        -1
+                    };
+                    let error_code = i16::decode(&mut response)?;
+                    let error_message = decode_nullable_compact_string(&mut response)?;
+                    skip_tagged_fields(&mut response)?;
+                    group_rows.push(ShareGroupOffsetRow {
+                        group: response_group.clone(),
+                        topic: topic.clone(),
+                        partition,
+                        leader_epoch: (leader_epoch >= 0).then_some(leader_epoch),
+                        start_offset: (start_offset >= 0).then_some(start_offset),
+                        lag: (lag >= 0).then_some(lag),
+                        error: (error_code != 0).then(|| {
+                            error_message.unwrap_or_else(|| format!("Kafka error {error_code}"))
+                        }),
+                    });
+                }
+                skip_tagged_fields(&mut response)?;
+            }
+            let error_code = i16::decode(&mut response)?;
+            let error_message = decode_nullable_compact_string(&mut response)?;
+            skip_tagged_fields(&mut response)?;
+            if error_code != 0 {
+                return Err(Error::Config(format!(
+                    "DescribeShareGroupOffsets failed for {response_group}: {}",
+                    error_message.unwrap_or_else(|| format!("Kafka error {error_code}"))
+                )));
+            }
+            rows.extend(group_rows);
+        }
+        skip_tagged_fields(&mut response)?;
+    }
+    rows.sort_by(|left, right| {
+        (&left.group, &left.topic, left.partition).cmp(&(
+            &right.group,
+            &right.topic,
+            right.partition,
+        ))
+    });
+    Ok(rows)
+}
+
+fn write_share_group_offsets(
+    format: OutputFormat,
+    rows: &[ShareGroupOffsetRow],
+    verbose: bool,
+) -> Result<()> {
+    output::write_value(format, "share-groups.describe.offsets", &rows, |rows| {
+        if verbose {
+            output::table(
+                [
+                    "GROUP",
+                    "TOPIC",
+                    "PARTITION",
+                    "LEADER-EPOCH",
+                    "START-OFFSET",
+                    "LAG",
+                    "ERROR",
+                ],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.topic.clone(),
+                        row.partition.to_string(),
+                        row.leader_epoch
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.start_offset
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.lag.map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.error.as_deref().unwrap_or("-").to_owned(),
+                    ]
+                }),
+            )
+        } else {
+            output::table(
+                [
+                    "GROUP",
+                    "TOPIC",
+                    "PARTITION",
+                    "START-OFFSET",
+                    "LAG",
+                    "ERROR",
+                ],
+                rows.iter().map(|row| {
+                    [
+                        row.group.clone(),
+                        row.topic.clone(),
+                        row.partition.to_string(),
+                        row.start_offset
+                            .map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.lag.map_or_else(|| "-".into(), |v| v.to_string()),
+                        row.error.as_deref().unwrap_or("-").to_owned(),
+                    ]
+                }),
+            )
+        }
+    })
+}
+
+async fn delete_one_share_group(
+    client: &krafka::admin::AdminClient,
+    group_id: &str,
+) -> Result<Option<String>> {
+    let (_, _, connection) = group_coordinator_connection(client, group_id).await?;
+    let version = connection
+        .negotiate_api_version(
+            ApiKey::DeleteGroups,
+            versions::DELETE_GROUPS_MAX,
+            versions::DELETE_GROUPS_MIN,
+        )
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support DeleteGroups".into()))?;
+    let request = krafka::protocol::DeleteGroupsRequest::new(vec![group_id.to_owned()]);
+    let mut response = connection
+        .send_request(ApiKey::DeleteGroups, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(connection);
+    let response =
+        krafka::protocol::DeleteGroupsResponse::decode_versioned(version, &mut response)?;
+    let result =
+        response.results.into_iter().next().ok_or_else(|| {
+            Error::Config(format!("broker omitted deletion result for {group_id}"))
+        })?;
+    Ok((!result.error_code.is_ok()).then(|| format!("{:?}", result.error_code)))
+}
+
+async fn delete_share_groups(
+    client: &krafka::admin::AdminClient,
+    format: OutputFormat,
+    requested: Vec<String>,
+    all_groups: bool,
+    execute: bool,
+) -> Result<()> {
+    let available = share_group_ids(client).await?;
+    let groups = if all_groups {
+        available.clone()
+    } else {
+        requested
+    };
+    if groups.is_empty() {
+        return Err(Error::Usage("no Share groups matched".into()));
+    }
+    let available = available.into_iter().collect::<BTreeSet<_>>();
+    let existing = groups
+        .iter()
+        .filter(|group| available.contains(*group))
+        .cloned()
+        .collect::<Vec<_>>();
+    let descriptions = describe_share_groups(client, &existing).await?;
+    let states = descriptions
+        .into_iter()
+        .map(|group| (group.description.group_id, group.description.group_state))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::with_capacity(groups.len());
+    for group in groups {
+        let validation_error = if available.contains(&group) {
+            states.get(&group).and_then(|state| {
+                (state != "Empty").then(|| format!("Share group is not EMPTY (state: {state})"))
+            })
+        } else {
+            Some(format!("Group '{group}' is not a Share group"))
+        };
+        if let Some(error) = validation_error {
+            rows.push(MutationRow {
+                resource: group,
+                status: "FAILED".into(),
+                error: Some(error),
+            });
+        } else if !execute {
+            rows.push(MutationRow {
+                resource: group,
+                status: "PREVIEW".into(),
+                error: None,
+            });
+        } else {
+            let error = delete_one_share_group(client, &group).await?;
+            rows.push(MutationRow {
+                resource: group,
+                status: if error.is_some() { "FAILED" } else { "DELETED" }.into(),
+                error,
+            });
+        }
+    }
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_mutation_rows(format, "share-groups.delete", &rows)?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: failures,
+            total: rows.len(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ShareGroupTopicMutationRow {
+    group: String,
+    topic: String,
+    status: String,
+    error: Option<String>,
+}
+
+async fn delete_share_group_offsets(
+    client: &krafka::admin::AdminClient,
+    format: OutputFormat,
+    group_id: &str,
+    topics: &[String],
+    execute: bool,
+) -> Result<()> {
+    let topics = topics
+        .iter()
+        .map(|topic| topic.trim())
+        .filter(|topic| !topic.is_empty())
+        .collect::<BTreeSet<_>>();
+    if topics.is_empty() {
+        return Err(Error::Usage(
+            "at least one non-empty topic is required".into(),
+        ));
+    }
+    if !execute {
+        let rows = topics
+            .iter()
+            .map(|topic| ShareGroupTopicMutationRow {
+                group: group_id.into(),
+                topic: (*topic).into(),
+                status: "PREVIEW".into(),
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        return write_share_group_topic_mutations(format, "share-groups.delete-offsets", &rows);
+    }
+    let (_, _, connection) = group_coordinator_connection(client, group_id).await?;
+    let api_key = ApiKey::Unknown(92);
+    let version = connection
+        .negotiate_api_version(api_key, 0, 0)
+        .await
+        .ok_or_else(|| {
+            Error::Unsupported("broker does not support DeleteShareGroupOffsets".into())
+        })?;
+    let mut response = connection
+        .send_request(api_key, version, |buffer| {
+            encode_compact_string(group_id, buffer);
+            encode_unsigned_varint(topics.len() + 1, buffer);
+            for topic in &topics {
+                encode_compact_string(topic, buffer);
+                buffer.put_u8(0);
+            }
+            buffer.put_u8(0);
+            Ok(())
+        })
+        .await?;
+    drop(connection);
+    let _throttle_time_ms = i32::decode(&mut response)?;
+    let top_error = i16::decode(&mut response)?;
+    let top_message = decode_nullable_compact_string(&mut response)?;
+    let count = decode_compact_len(&mut response)?;
+    let mut rows = Vec::with_capacity(count);
+    for _ in 0..count {
+        let topic = decode_compact_string(&mut response)?;
+        if response.remaining() < 16 {
+            return Err(Error::Config(
+                "DeleteShareGroupOffsets response omitted topic ID bytes".into(),
+            ));
+        }
+        response.advance(16);
+        let error_code = i16::decode(&mut response)?;
+        let error_message = decode_nullable_compact_string(&mut response)?;
+        skip_tagged_fields(&mut response)?;
+        rows.push(ShareGroupTopicMutationRow {
+            group: group_id.into(),
+            topic,
+            status: if error_code == 0 { "DELETED" } else { "FAILED" }.into(),
+            error: (error_code != 0)
+                .then(|| error_message.unwrap_or_else(|| format!("Kafka error {error_code}"))),
+        });
+    }
+    skip_tagged_fields(&mut response)?;
+    if top_error != 0 {
+        return Err(Error::Config(format!(
+            "DeleteShareGroupOffsets failed for {group_id}: {}",
+            top_message.unwrap_or_else(|| format!("Kafka error {top_error}"))
+        )));
+    }
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_share_group_topic_mutations(format, "share-groups.delete-offsets", &rows)?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: failures,
+            total: rows.len(),
+        })
+    }
+}
+
+fn write_share_group_topic_mutations(
+    format: OutputFormat,
+    command: &str,
+    rows: &[ShareGroupTopicMutationRow],
+) -> Result<()> {
+    output::write_value(format, command, &rows, |rows| {
+        output::table(
+            ["GROUP", "TOPIC", "STATUS", "ERROR"],
+            rows.iter().map(|row| {
+                [
+                    row.group.clone(),
+                    row.topic.clone(),
+                    row.status.clone(),
+                    row.error.as_deref().unwrap_or("-").into(),
+                ]
+            }),
+        )
+    })
+}
+
+fn validate_share_reset_target(args: &ShareGroupResetOffsetsArgs) -> Result<()> {
+    if args.to_earliest
+        || args.to_latest
+        || args.to_offset.is_some()
+        || args.to_current
+        || args.to_datetime.is_some()
+        || args.from_file.is_some()
+    {
+        Ok(())
+    } else {
+        Err(Error::Usage("choose one Share group reset target".into()))
+    }
+}
+
+async fn alter_share_group_offsets(
+    client: &krafka::admin::AdminClient,
+    group_id: &str,
+    rows: &[ResetOffsetRow],
+) -> Result<Vec<String>> {
+    let mut topics = BTreeMap::<&str, Vec<&ResetOffsetRow>>::new();
+    for row in rows {
+        topics.entry(&row.topic).or_default().push(row);
+    }
+    let (_, _, connection) = group_coordinator_connection(client, group_id).await?;
+    let api_key = ApiKey::Unknown(91);
+    let version = connection
+        .negotiate_api_version(api_key, 0, 0)
+        .await
+        .ok_or_else(|| {
+            Error::Unsupported("broker does not support AlterShareGroupOffsets".into())
+        })?;
+    let mut response = connection
+        .send_request(api_key, version, |buffer| {
+            encode_compact_string(group_id, buffer);
+            encode_unsigned_varint(topics.len() + 1, buffer);
+            for (topic, partitions) in &topics {
+                encode_compact_string(topic, buffer);
+                encode_unsigned_varint(partitions.len() + 1, buffer);
+                for row in partitions {
+                    buffer.put_i32(row.partition);
+                    buffer.put_i64(row.new_offset);
+                    buffer.put_u8(0);
+                }
+                buffer.put_u8(0);
+            }
+            buffer.put_u8(0);
+            Ok(())
+        })
+        .await?;
+    drop(connection);
+    let _throttle_time_ms = i32::decode(&mut response)?;
+    let top_error = i16::decode(&mut response)?;
+    let top_message = decode_nullable_compact_string(&mut response)?;
+    let count = decode_compact_len(&mut response)?;
+    let mut errors = Vec::new();
+    for _ in 0..count {
+        let topic = decode_compact_string(&mut response)?;
+        if response.remaining() < 16 {
+            return Err(Error::Config(
+                "AlterShareGroupOffsets response omitted topic ID bytes".into(),
+            ));
+        }
+        response.advance(16);
+        let partition_count = decode_compact_len(&mut response)?;
+        for _ in 0..partition_count {
+            let partition = i32::decode(&mut response)?;
+            let error_code = i16::decode(&mut response)?;
+            let error_message = decode_nullable_compact_string(&mut response)?;
+            skip_tagged_fields(&mut response)?;
+            if error_code != 0 {
+                errors.push(format!(
+                    "{group_id}:{topic}:{partition}: {}",
+                    error_message.unwrap_or_else(|| format!("Kafka error {error_code}"))
+                ));
+            }
+        }
+        skip_tagged_fields(&mut response)?;
+    }
+    skip_tagged_fields(&mut response)?;
+    if top_error != 0 {
+        return Err(Error::Config(format!(
+            "AlterShareGroupOffsets failed for {group_id}: {}",
+            top_message.unwrap_or_else(|| format!("Kafka error {top_error}"))
+        )));
+    }
+    Ok(errors)
+}
+
+fn share_reset_partitions(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    topics: &[String],
+) -> Result<Vec<(String, i32)>> {
+    Ok(resolve_topic_partition_selections(config, timeout, topics)?
+        .into_iter()
+        .flat_map(|(topic, partitions)| {
+            partitions
+                .into_iter()
+                .map(move |partition| (topic.clone(), partition))
+        })
+        .collect())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Share reset planning keeps Kafka's mutually exclusive strategies and execution boundary together"
+)]
+async fn reset_share_group_offsets(
+    config: &rdkafka::ClientConfig,
+    client: &krafka::admin::AdminClient,
+    timeout: Duration,
+    format: OutputFormat,
+    args: &ShareGroupResetOffsetsArgs,
+) -> Result<()> {
+    validate_share_reset_target(args)?;
+    let share_groups = share_group_ids(client).await?;
+    if share_groups.contains(&args.group) {
+        let descriptions = describe_share_groups(client, std::slice::from_ref(&args.group)).await?;
+        if let Some(description) = descriptions.first()
+            && !matches!(
+                description.description.group_state.as_str(),
+                "Empty" | "Dead"
+            )
+        {
+            return Err(Error::Usage(format!(
+                "Share group '{}' is not empty (state: {})",
+                args.group, description.description.group_state
+            )));
+        }
+    }
+    let current_offsets = if args.all_topics || args.to_current {
+        describe_share_group_offsets(client, std::slice::from_ref(&args.group))
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                row.start_offset
+                    .map(|offset| ((row.topic, row.partition), offset))
+            })
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+    let mut rows = if let Some(path) = args.from_file.as_deref() {
+        read_reset_plan(
+            path,
+            std::slice::from_ref(&args.group),
+            true,
+            config,
+            timeout,
+        )?
+    } else {
+        let partitions = if args.all_topics {
+            current_offsets
+                .keys()
+                .map(|(topic, partition)| (topic.clone(), *partition))
+                .collect::<Vec<_>>()
+        } else {
+            share_reset_partitions(config, timeout, &args.topic)?
+        };
+        let consumer = base_consumer(config)?;
+        let timestamp = args
+            .to_datetime
+            .as_deref()
+            .map(parse_datetime_millis)
+            .transpose()?;
+        let timestamp_offsets = if let Some(timestamp) = timestamp {
+            let mut requested = TopicPartitionList::new();
+            for (topic, partition) in &partitions {
+                requested.add_partition_offset(topic, *partition, Offset::Offset(timestamp))?;
+            }
+            Some(consumer.offsets_for_times(requested, timeout)?)
+        } else {
+            None
+        };
+        partitions
+            .into_iter()
+            .map(|(topic, partition)| {
+                let (low, high) = consumer.fetch_watermarks(&topic, partition, timeout)?;
+                let offset = if args.to_earliest {
+                    low
+                } else if args.to_latest {
+                    high
+                } else if let Some(offset) = args.to_offset {
+                    offset.clamp(low, high)
+                } else if args.to_current {
+                    current_offsets
+                        .get(&(topic.clone(), partition))
+                        .copied()
+                        .unwrap_or(high)
+                } else if timestamp_offsets.is_some() {
+                    committed_offset(timestamp_offsets.as_ref(), &topic, partition).unwrap_or(high)
+                } else {
+                    return Err(Error::Usage("choose one Share group reset target".into()));
+                };
+                Ok(ResetOffsetRow {
+                    group: args.group.clone(),
+                    topic,
+                    partition,
+                    new_offset: offset,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    rows.sort_by(|left, right| (&left.topic, left.partition).cmp(&(&right.topic, right.partition)));
+    let errors = if args.execute && !rows.is_empty() {
+        alter_share_group_offsets(client, &args.group, &rows).await?
+    } else {
+        Vec::new()
+    };
+    write_reset_rows(format, &rows, args.export, true, &errors)?;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: errors.len(),
+            total: rows.len(),
+        })
+    }
+}
+
+fn share_assignment(assignment: &[krafka::protocol::ShareGroupDescribeTopicPartitions]) -> String {
+    share_assignment_parts(
+        assignment
+            .iter()
+            .map(|topic| (topic.topic_name.as_str(), topic.partitions.as_slice())),
+    )
+}
+
+fn share_assignment_parts<'a>(assignment: impl Iterator<Item = (&'a str, &'a [i32])>) -> String {
+    assignment
+        .map(|(topic, assigned)| {
+            let mut partitions = assigned.to_vec();
+            partitions.sort_unstable();
+            format!(
+                "{}:{}",
+                topic,
+                partitions
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Share describe dynamically selects Kafka's offsets, members, and state output schemas"
+)]
+async fn describe_share_group_details(
+    client: &krafka::admin::AdminClient,
+    format: OutputFormat,
+    group_ids: &[String],
+    members: bool,
+    state: bool,
+    verbose: bool,
+) -> Result<()> {
+    let descriptions = describe_share_groups(client, group_ids).await?;
+    if members {
+        let rows = descriptions
+            .into_iter()
+            .flat_map(|group| {
+                group.description.members.into_iter().map(move |member| {
+                    let partitions = member
+                        .assignment
+                        .iter()
+                        .map(|topic| topic.partitions.len())
+                        .sum();
+                    ShareGroupMemberRow {
+                        group: group.description.group_id.clone(),
+                        consumer_id: member.member_id,
+                        host: member.client_host,
+                        client_id: member.client_id,
+                        partitions,
+                        member_epoch: verbose.then_some(member.member_epoch),
+                        assignment: share_assignment(&member.assignment),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        return output::write_value(format, "share-groups.describe.members", &rows, |rows| {
+            if verbose {
+                output::table(
+                    [
+                        "GROUP",
+                        "CONSUMER-ID",
+                        "HOST",
+                        "CLIENT-ID",
+                        "#PARTITIONS",
+                        "MEMBER-EPOCH",
+                        "ASSIGNMENT",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.group.clone(),
+                            row.consumer_id.clone(),
+                            row.host.clone(),
+                            row.client_id.clone(),
+                            row.partitions.to_string(),
+                            row.member_epoch
+                                .map_or_else(|| "-".into(), |v| v.to_string()),
+                            row.assignment.clone(),
+                        ]
+                    }),
+                )
+            } else {
+                output::table(
+                    [
+                        "GROUP",
+                        "CONSUMER-ID",
+                        "HOST",
+                        "CLIENT-ID",
+                        "#PARTITIONS",
+                        "ASSIGNMENT",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.group.clone(),
+                            row.consumer_id.clone(),
+                            row.host.clone(),
+                            row.client_id.clone(),
+                            row.partitions.to_string(),
+                            row.assignment.clone(),
+                        ]
+                    }),
+                )
+            }
+        });
+    }
+    if state {
+        let rows = descriptions
+            .into_iter()
+            .map(|group| ShareGroupStateRow {
+                group: group.description.group_id,
+                coordinator: group.coordinator,
+                coordinator_id: group.coordinator_id,
+                state: group.description.group_state,
+                group_epoch: verbose.then_some(group.description.group_epoch),
+                assignment_epoch: verbose.then_some(group.description.assignment_epoch),
+                members: group.description.members.len(),
+            })
+            .collect::<Vec<_>>();
+        return output::write_value(format, "share-groups.describe.state", &rows, |rows| {
+            if verbose {
+                output::table(
+                    [
+                        "GROUP",
+                        "COORDINATOR (ID)",
+                        "STATE",
+                        "GROUP-EPOCH",
+                        "ASSIGNMENT-EPOCH",
+                        "#MEMBERS",
+                    ],
+                    rows.iter().map(|row| {
+                        [
+                            row.group.clone(),
+                            format!("{} ({})", row.coordinator, row.coordinator_id),
+                            row.state.clone(),
+                            row.group_epoch
+                                .map_or_else(|| "-".into(), |v| v.to_string()),
+                            row.assignment_epoch
+                                .map_or_else(|| "-".into(), |v| v.to_string()),
+                            row.members.to_string(),
+                        ]
+                    }),
+                )
+            } else {
+                output::table(
+                    ["GROUP", "COORDINATOR (ID)", "STATE", "#MEMBERS"],
+                    rows.iter().map(|row| {
+                        [
+                            row.group.clone(),
+                            format!("{} ({})", row.coordinator, row.coordinator_id),
+                            row.state.clone(),
+                            row.members.to_string(),
+                        ]
+                    }),
+                )
+            }
+        });
+    }
+    let rows = describe_share_group_offsets(client, group_ids).await?;
+    write_share_group_offsets(format, &rows, verbose)
+}
+
+async fn share_groups(
+    config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: ShareGroupAction,
+    verbose: bool,
+) -> Result<()> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    match action {
+        ShareGroupAction::List { state } => {
+            list_share_groups(&client, format, state.as_deref()).await
+        }
+        ShareGroupAction::Describe {
+            group,
+            all_groups,
+            members,
+            state,
+            offsets: _,
+        } => {
+            let group_ids = if all_groups {
+                share_group_ids(&client).await?
+            } else {
+                group
+            };
+            describe_share_group_details(&client, format, &group_ids, members, state, verbose).await
+        }
+        ShareGroupAction::Delete {
+            group,
+            all_groups,
+            execute,
+        } => delete_share_groups(&client, format, group, all_groups, execute).await,
+        ShareGroupAction::ResetOffsets(args) => {
+            reset_share_group_offsets(config, &client, timeout, format, &args).await
+        }
+        ShareGroupAction::DeleteOffsets {
+            group,
+            topic,
+            execute,
+        } => delete_share_group_offsets(&client, format, &group, &topic, execute).await,
     }
 }
 
@@ -12001,5 +13017,32 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn share_group_states_should_accept_all_original_values_case_insensitively() {
+        let states = parse_share_group_states("stable, EMPTY,Dead").expect("valid states");
+
+        assert_eq!(
+            states,
+            BTreeSet::from(["Dead".into(), "Empty".into(), "Stable".into()])
+        );
+    }
+
+    #[test]
+    fn share_group_states_should_reject_consumer_only_state() {
+        let error = parse_share_group_states("PreparingRebalance").expect_err("invalid state");
+
+        assert!(error.to_string().contains("Empty, Stable, or Dead"));
+    }
+
+    #[test]
+    fn share_assignment_should_sort_partitions() {
+        let partitions = [2, 0, 1];
+
+        assert_eq!(
+            share_assignment_parts(std::iter::once(("events", partitions.as_slice()))),
+            "events:0,1,2"
+        );
     }
 }
