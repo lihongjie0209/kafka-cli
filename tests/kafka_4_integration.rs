@@ -1282,6 +1282,47 @@ fn all_command_families_work_against_kafka_4_3_1() {
         &["configs", "describe", "--entity-type", "client-metrics"],
         "integration-metrics",
     );
+    success(
+        &bootstrap,
+        &[
+            "client-metrics",
+            "alter",
+            "--name",
+            "integration-client-metrics-command",
+            "--interval",
+            "5000",
+            "--match",
+            "client_id=integration",
+            "--metrics",
+            "org.apache.kafka.producer.",
+            "--execute",
+        ],
+    );
+    eventually_contains(
+        &bootstrap,
+        &["client-metrics", "list"],
+        "integration-client-metrics-command",
+    );
+    eventually_contains(
+        &bootstrap,
+        &[
+            "client-metrics",
+            "describe",
+            "--name",
+            "integration-client-metrics-command",
+        ],
+        "client_id=integration",
+    );
+    success(
+        &bootstrap,
+        &[
+            "client-metrics",
+            "delete",
+            "--name",
+            "integration-client-metrics-command",
+            "--execute",
+        ],
+    );
     let scram_alter: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[

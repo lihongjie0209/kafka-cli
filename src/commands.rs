@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt;
 use krafka::protocol::{
@@ -38,9 +39,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli::{
-        AclAction, Cli, ClusterAction, Command, ConfigAction, ConfigEntityArgs, ConfigEntityType,
-        DescribeTopicArgs, ElectionType, GroupAction, ListTopicArgs, OffsetTime, ReassignAction,
-        ResetOffsetsArgs, TopicAction,
+        AclAction, Cli, ClientMetricsAction, ClusterAction, Command, ConfigAction,
+        ConfigEntityArgs, ConfigEntityType, DescribeTopicArgs, ElectionType, GroupAction,
+        ListTopicArgs, OffsetTime, ReassignAction, ResetOffsetsArgs, TopicAction,
     },
     config,
     error::{Error, Result},
@@ -161,6 +162,16 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 timeout,
                 format,
                 &args.action,
+            )
+            .await
+        }
+        Command::ClientMetrics(args) => {
+            client_metrics(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                args.action,
             )
             .await
         }
@@ -3169,6 +3180,199 @@ fn shifted_offset(
         })
 }
 
+#[derive(Debug, Serialize)]
+struct ClientMetricsResourceRow {
+    name: String,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "branches mirror Kafka ClientMetricsCommand's four action contracts"
+)]
+async fn client_metrics(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    action: ClientMetricsAction,
+) -> Result<()> {
+    match action {
+        ClientMetricsAction::List => {
+            let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+            let mut names = client.list_client_metrics_resources().await?;
+            names.sort();
+            drop(client);
+            let rows = names
+                .into_iter()
+                .map(|name| ClientMetricsResourceRow { name })
+                .collect::<Vec<_>>();
+            output::write_value(format, "client-metrics.list", &rows, |rows| {
+                output::table(["NAME"], rows.iter().map(|row| [row.name.clone()]))
+            })
+        }
+        ClientMetricsAction::Describe { name } => {
+            describe_protocol_configs(
+                bootstrap,
+                command_config,
+                timeout,
+                format,
+                "client-metrics.describe",
+                ConfigEntityType::ClientMetrics,
+                name,
+                false,
+            )
+            .await
+        }
+        ClientMetricsAction::Alter {
+            name,
+            generate_name,
+            interval,
+            r#match,
+            metrics,
+            execute,
+        } => {
+            if let Some(value) = interval.as_deref().filter(|value| !value.is_empty()) {
+                value.parse::<i32>().map_err(|_| {
+                    Error::Usage(
+                        "invalid interval value; enter an integer, or leave empty to reset".into(),
+                    )
+                })?;
+            }
+            let name = if generate_name {
+                kafka_random_uuid()
+            } else {
+                name.ok_or_else(|| {
+                    Error::Usage("one of --name or --generate-name must be specified".into())
+                })?
+            };
+            let changes = [
+                ("interval.ms", interval),
+                ("match", (!r#match.is_empty()).then(|| r#match.join(","))),
+                ("metrics", (!metrics.is_empty()).then(|| metrics.join(","))),
+            ];
+            let additions = changes
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_ref()
+                        .filter(|value| !value.is_empty())
+                        .map(|value| ((*key).to_owned(), value.clone()))
+                })
+                .collect::<Vec<_>>();
+            let deletions = changes
+                .iter()
+                .filter(|(_, value)| value.as_ref().is_some_and(String::is_empty))
+                .map(|(key, _)| (*key).to_owned())
+                .collect::<Vec<_>>();
+            if !execute {
+                return config_change_preview(
+                    format,
+                    "client-metrics.alter.preview",
+                    &additions,
+                    &deletions,
+                );
+            }
+            alter_protocol_config(
+                bootstrap,
+                command_config,
+                timeout,
+                format,
+                "client-metrics.alter",
+                ConfigEntityType::ClientMetrics,
+                &name,
+                &additions,
+                &deletions,
+            )
+            .await
+        }
+        ClientMetricsAction::Delete { name, execute } => {
+            let keys =
+                client_metrics_config_keys(bootstrap, command_config, timeout, &name).await?;
+            if !execute {
+                return config_change_preview(format, "client-metrics.delete.preview", &[], &keys);
+            }
+            alter_protocol_config(
+                bootstrap,
+                command_config,
+                timeout,
+                format,
+                "client-metrics.delete",
+                ConfigEntityType::ClientMetrics,
+                &name,
+                &[],
+                &keys,
+            )
+            .await
+        }
+    }
+}
+
+fn kafka_random_uuid() -> String {
+    loop {
+        let encoded = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
+        if !encoded.contains('-') {
+            return encoded;
+        }
+    }
+}
+
+async fn client_metrics_config_keys(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    name: &str,
+) -> Result<Vec<String>> {
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let (broker_id, address) =
+        protocol_config_broker(&client, ConfigEntityType::ClientMetrics, name).await?;
+    let connection = client
+        .pool()
+        .get_connection_by_id(broker_id, &address)
+        .await?;
+    let request = DescribeConfigsRequest {
+        resources: vec![DescribeConfigsResource {
+            resource_type: ProtocolConfigResourceType::ClientMetrics,
+            resource_name: name.to_owned(),
+            config_names: None,
+        }],
+        include_synonyms: false,
+        include_documentation: false,
+    };
+    let version = connection
+        .negotiate_api_version(
+            ApiKey::DescribeConfigs,
+            versions::DESCRIBE_CONFIGS_MAX,
+            versions::DESCRIBE_CONFIGS_MIN,
+        )
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support DescribeConfigs".into()))?;
+    let mut response = connection
+        .send_request(ApiKey::DescribeConfigs, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await?;
+    drop(connection);
+    drop(client);
+    let response =
+        krafka::protocol::DescribeConfigsResponse::decode_versioned(version, &mut response)?;
+    let resource =
+        response.results.into_iter().next().ok_or_else(|| {
+            Error::Config(format!("broker did not describe client metrics {name}"))
+        })?;
+    if !resource.error_code.is_ok() {
+        return Err(Error::Config(
+            resource
+                .error_message
+                .unwrap_or_else(|| format!("{:?}", resource.error_code)),
+        ));
+    }
+    Ok(resource
+        .configs
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "branches mirror Kafka's resource, quota, and SCRAM config backends"
@@ -3215,6 +3419,7 @@ async fn configs(
                     command_config,
                     timeout,
                     format,
+                    "configs.describe",
                     entity_type,
                     entity_name,
                     all,
@@ -3286,7 +3491,7 @@ async fn configs(
                 );
             }
             if !execute {
-                return config_change_preview(format, &pairs, &delete);
+                return config_change_preview(format, "configs.alter.preview", &pairs, &delete);
             }
             if protocol_config_resource_type(entity_type).is_some()
                 && (!matches!(entity_type, ConfigEntityType::Broker)
@@ -3297,6 +3502,7 @@ async fn configs(
                     command_config,
                     timeout,
                     format,
+                    "configs.alter",
                     entity_type,
                     entity_name.as_deref().ok_or_else(|| {
                         Error::Usage("resource alteration requires --entity-name".into())
@@ -3807,7 +4013,7 @@ async fn alter_quota_configs(
         .chain(delete.iter().map(|key| Ok((key.as_str(), None))))
         .collect::<Result<Vec<_>>>()?;
     if !execute {
-        return config_change_preview(format, add, delete);
+        return config_change_preview(format, "configs.alter.preview", add, delete);
     }
     let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
     let filters = entities
@@ -3900,13 +4106,15 @@ async fn protocol_config_broker(
 
 #[expect(
     clippy::too_many_lines,
-    reason = "request routing, protocol decoding, and structured output form one config operation"
+    clippy::too_many_arguments,
+    reason = "request routing, output identity, protocol decoding, and shared command context form one config operation"
 )]
 async fn describe_protocol_configs(
     bootstrap: &str,
     command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
+    output_command: &str,
     kind: ConfigEntityType,
     name: Option<String>,
     all: bool,
@@ -3988,7 +4196,7 @@ async fn describe_protocol_configs(
             })
         }));
     }
-    output::write_value(format, "configs.describe", &rows, |rows| {
+    output::write_value(format, output_command, &rows, |rows| {
         output::table(
             [
                 "ENTITY_TYPE",
@@ -4030,6 +4238,7 @@ async fn alter_protocol_config(
     command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
+    output_command: &str,
     kind: ConfigEntityType,
     name: &str,
     add: &[(String, String)],
@@ -4103,7 +4312,7 @@ async fn alter_protocol_config(
         })
         .collect::<Vec<_>>();
     let failures = rows.iter().filter(|row| row.error.is_some()).count();
-    write_mutation_rows(format, "configs.alter", &rows)?;
+    write_mutation_rows(format, output_command, &rows)?;
     if failures == 0 {
         Ok(())
     } else {
@@ -4123,6 +4332,7 @@ struct ConfigChangeRow<'a> {
 
 fn config_change_preview(
     format: OutputFormat,
+    output_command: &str,
     pairs: &[(String, String)],
     delete: &[String],
 ) -> Result<()> {
@@ -4139,7 +4349,7 @@ fn config_change_preview(
             value: None,
         }))
         .collect::<Vec<_>>();
-    output::write_value(format, "configs.alter.preview", &rows, |rows| {
+    output::write_value(format, output_command, &rows, |rows| {
         output::table(
             ["OPERATION", "NAME", "VALUE"],
             rows.iter().map(|row| {
@@ -7221,6 +7431,21 @@ mod tests {
             at_min_isr_partitions: false,
             topics_with_overrides: false,
         }
+    }
+
+    #[test]
+    fn generated_client_metrics_name_should_match_kafka_uuid_format() {
+        let name = kafka_random_uuid();
+
+        assert_eq!(name.len(), 22);
+        assert!(!name.contains('-'));
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(name)
+                .expect("Kafka UUID encoding")
+                .len(),
+            16
+        );
     }
 
     #[test]

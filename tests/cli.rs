@@ -9,7 +9,8 @@ fn help_should_list_the_management_suite() {
         .assert()
         .success()
         .stdout(predicate::str::contains("leader-election"))
-        .stdout(predicate::str::contains("delete-records"));
+        .stdout(predicate::str::contains("delete-records"))
+        .stdout(predicate::str::contains("client-metrics"));
 }
 
 #[test]
@@ -120,4 +121,20 @@ fn kafka_configs_alias_alter_should_execute_instead_of_previewing() {
         .assert()
         .failure()
         .stdout(predicate::str::is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn kafka_client_metrics_alias_should_accept_original_action_flags() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-client-metrics.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-client-metrics alias");
+
+    Command::new(alias)
+        .args(["--list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage:"));
 }

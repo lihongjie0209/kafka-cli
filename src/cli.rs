@@ -85,6 +85,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-log-dirs" => Some("log-dirs"),
         "kafka-broker-api-versions" => Some("api-versions"),
         "kafka-cluster" => Some("cluster"),
+        "kafka-client-metrics" => Some("client-metrics"),
         _ => None,
     }
 }
@@ -145,6 +146,12 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             ("--execute", "execute", true),
             ("--verify", "verify", false),
             ("--cancel", "cancel", true),
+            ("--list", "list", false),
+        ],
+        "client-metrics" => &[
+            ("--alter", "alter", true),
+            ("--delete", "delete", true),
+            ("--describe", "describe", false),
             ("--list", "list", false),
         ],
         _ => &[],
@@ -281,6 +288,51 @@ pub enum Command {
     ApiVersions(ApiVersionsArgs),
     /// Inspect and manage cluster metadata.
     Cluster(ClusterArgs),
+    /// Inspect and manage client metrics subscriptions.
+    ClientMetrics(ClientMetricsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ClientMetricsArgs {
+    #[command(subcommand)]
+    pub action: ClientMetricsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ClientMetricsAction {
+    /// List client metrics resource names.
+    List,
+    /// Describe one or all client metrics resources.
+    Describe {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Alter a client metrics resource.
+    Alter {
+        #[arg(
+            long,
+            required_unless_present = "generate_name",
+            conflicts_with = "generate_name"
+        )]
+        name: Option<String>,
+        #[arg(long)]
+        generate_name: bool,
+        #[arg(long, allow_hyphen_values = true)]
+        interval: Option<String>,
+        #[arg(long)]
+        r#match: Vec<String>,
+        #[arg(long)]
+        metrics: Vec<String>,
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Delete all dynamic configuration for a client metrics resource.
+    Delete {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1046,6 +1098,10 @@ mod tests {
     #[test]
     fn compatibility_command_should_accept_sh_suffix() {
         assert_eq!(compatibility_command("kafka-topics.sh"), Some("topics"));
+        assert_eq!(
+            compatibility_command("kafka-client-metrics.sh"),
+            Some("client-metrics")
+        );
     }
 
     #[test]
@@ -1057,6 +1113,8 @@ mod tests {
             ("acls", "--add", "add"),
             ("reassign", "--execute", "execute"),
             ("reassign", "--cancel", "cancel"),
+            ("client-metrics", "--alter", "alter"),
+            ("client-metrics", "--delete", "delete"),
         ] {
             let mut arguments = vec![
                 OsString::from("kafka-compatible"),
@@ -1579,6 +1637,40 @@ mod tests {
     parses_command_family!(log_dirs_family_parses, "log-dirs");
     parses_command_family!(api_versions_family_parses, "api-versions");
     parses_command_family!(cluster_family_parses, "cluster", "cluster-id");
+    parses_command_family!(client_metrics_family_parses, "client-metrics", "list");
+
+    #[test]
+    fn client_metrics_should_collect_repeated_match_and_metrics_values() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "client-metrics",
+            "alter",
+            "--name",
+            "metrics",
+            "--match",
+            "client_id=a",
+            "--match",
+            "client_software_name=b",
+            "--metrics",
+            "org.apache.kafka.producer.",
+            "--metrics",
+            "org.apache.kafka.consumer.",
+        ])
+        .expect("repeated client metrics options");
+        let Command::ClientMetrics(ClientMetricsArgs {
+            action: ClientMetricsAction::Alter {
+                r#match, metrics, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected client metrics alter command");
+        };
+
+        assert_eq!(r#match.len(), 2);
+        assert_eq!(metrics.len(), 2);
+    }
 
     #[test]
     fn cluster_short_options_parse() {
