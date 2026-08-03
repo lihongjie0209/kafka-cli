@@ -590,11 +590,13 @@ async fn produce(
     timeout: Duration,
     args: crate::cli::ProduceArgs,
 ) -> Result<()> {
-    apply_client_properties(&mut config, &args.properties)?;
     config.set("compression.type", &args.compression_type);
     config.set("acks", &args.acks);
+    apply_producer_options(&mut config, &args);
+    apply_client_properties(&mut config, &args.properties)?;
     let producer: FutureProducer = config.create()?;
     let input = io::read_to_string(io::stdin())?;
+    let mut deliveries = Vec::new();
     for (index, line) in input.lines().enumerate() {
         let input = producer_input(line, &args).map_err(|error| {
             Error::Usage(format!(
@@ -619,12 +621,56 @@ async fn produce(
             }
             record = record.headers(headers);
         }
-        producer
-            .send(record, timeout)
+        if args.sync {
+            producer
+                .send(record, timeout)
+                .await
+                .map_err(|(error, _)| Error::Kafka(error))?;
+        } else {
+            deliveries.push(
+                producer
+                    .send_result(record)
+                    .map_err(|(error, _)| Error::Kafka(error))?,
+            );
+        }
+    }
+    for delivery in deliveries {
+        delivery
             .await
+            .map_err(|_| Error::Config("producer delivery channel was canceled".into()))?
             .map_err(|(error, _)| Error::Kafka(error))?;
     }
     Ok(())
+}
+
+fn apply_producer_options(config: &mut rdkafka::ClientConfig, args: &crate::cli::ProduceArgs) {
+    if let Some(value) = args.batch_size {
+        config.set("batch.size", value.to_string());
+    }
+    if let Some(value) = args.message_send_max_retries {
+        config.set("message.send.max.retries", value.to_string());
+    }
+    if let Some(value) = args.retry_backoff_ms {
+        config.set("retry.backoff.ms", value.to_string());
+    }
+    if let Some(value) = args.linger_ms {
+        config.set("linger.ms", value.to_string());
+    }
+    if let Some(value) = args.request_timeout_ms {
+        config.set("request.timeout.ms", value.to_string());
+    }
+    if let Some(value) = args.metadata_expiry_ms {
+        config.set("topic.metadata.refresh.interval.ms", value.to_string());
+    }
+    if let Some(value) = args.max_memory_bytes {
+        config.set(
+            "queue.buffering.max.kbytes",
+            value.div_ceil(1024).to_string(),
+        );
+    }
+    if let Some(value) = args.socket_buffer_size {
+        config.set("socket.send.buffer.bytes", value.to_string());
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -3780,6 +3826,15 @@ mod tests {
             parse_key: false,
             compression_type: "none".into(),
             acks: "all".into(),
+            sync: false,
+            batch_size: None,
+            message_send_max_retries: None,
+            retry_backoff_ms: None,
+            linger_ms: None,
+            request_timeout_ms: None,
+            metadata_expiry_ms: None,
+            max_memory_bytes: None,
+            socket_buffer_size: None,
             json: true,
             properties: Vec::new(),
         };
@@ -3803,6 +3858,15 @@ mod tests {
             parse_key: false,
             compression_type: "none".into(),
             acks: "all".into(),
+            sync: false,
+            batch_size: None,
+            message_send_max_retries: None,
+            retry_backoff_ms: None,
+            linger_ms: None,
+            request_timeout_ms: None,
+            metadata_expiry_ms: None,
+            max_memory_bytes: None,
+            socket_buffer_size: None,
             json: true,
             properties: Vec::new(),
         };
@@ -3810,6 +3874,51 @@ mod tests {
             producer_input(r#"{"value":"bad","partition":-1}"#, &args),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn producer_options_should_map_to_librdkafka_configuration() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--batch-size",
+            "4096",
+            "--message-send-max-retries",
+            "7",
+            "--retry-backoff-ms",
+            "250",
+            "--timeout",
+            "10",
+            "--request-timeout-ms",
+            "5000",
+            "--metadata-expiry-ms",
+            "60000",
+            "--max-memory-bytes",
+            "1048577",
+            "--socket-buffer-size",
+            "32768",
+        ])
+        .expect("producer options");
+        let Command::Produce(args) = cli.command else {
+            panic!("expected produce command");
+        };
+        let mut config = rdkafka::ClientConfig::new();
+        apply_producer_options(&mut config, &args);
+        assert_eq!(config.get("batch.size"), Some("4096"));
+        assert_eq!(config.get("message.send.max.retries"), Some("7"));
+        assert_eq!(config.get("retry.backoff.ms"), Some("250"));
+        assert_eq!(config.get("linger.ms"), Some("10"));
+        assert_eq!(config.get("request.timeout.ms"), Some("5000"));
+        assert_eq!(
+            config.get("topic.metadata.refresh.interval.ms"),
+            Some("60000")
+        );
+        assert_eq!(config.get("queue.buffering.max.kbytes"), Some("1025"));
+        assert_eq!(config.get("socket.send.buffer.bytes"), Some("32768"));
     }
 
     #[test]

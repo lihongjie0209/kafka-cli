@@ -243,10 +243,31 @@ pub struct ProduceArgs {
     pub key_separator: Option<char>,
     #[arg(long)]
     pub parse_key: bool,
-    #[arg(long, default_value = "none")]
+    #[arg(long, visible_alias = "compression-codec", default_value = "none")]
     pub compression_type: String,
-    #[arg(long, default_value = "all")]
+    #[arg(long, visible_alias = "request-required-acks", default_value = "all")]
     pub acks: String,
+    /// Wait for each delivery before reading and sending the next record.
+    #[arg(long)]
+    pub sync: bool,
+    #[arg(long)]
+    pub batch_size: Option<usize>,
+    #[arg(long)]
+    pub message_send_max_retries: Option<u32>,
+    #[arg(long)]
+    pub retry_backoff_ms: Option<u64>,
+    /// Maximum batching delay; maps to librdkafka linger.ms.
+    #[arg(long = "timeout")]
+    pub linger_ms: Option<u64>,
+    #[arg(long)]
+    pub request_timeout_ms: Option<u64>,
+    #[arg(long)]
+    pub metadata_expiry_ms: Option<u64>,
+    /// Maximum buffered producer memory in bytes.
+    #[arg(long)]
+    pub max_memory_bytes: Option<usize>,
+    #[arg(long)]
+    pub socket_buffer_size: Option<i32>,
     /// Parse each input line as {"key":...,"value":...,"partition":...,"headers":{...}}.
     #[arg(long)]
     pub json: bool,
