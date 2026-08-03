@@ -1,0 +1,15 @@
+FROM rust:1.88-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+       build-essential cmake libcurl4-openssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked --features bundled
+
+FROM debian:bookworm-slim
+COPY --from=builder /build/target/release/kafka /usr/local/bin/kafka
+ENTRYPOINT ["/usr/local/bin/kafka"]

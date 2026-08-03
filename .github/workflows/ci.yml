@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  bundled-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libcurl4-openssl-dev pkg-config
+      - run: cargo build --release --locked --features bundled
+
+  musl-release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+      - uses: taiki-e/install-action@cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo zigbuild --release --locked --target ${{ matrix.target }} --features bundled
+      - name: Verify static musl binary
+        run: file target/${{ matrix.target }}/release/kafka | tee binary-type.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kafka-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/kafka
+            binary-type.txt
+          if-no-files-found: error
+
+  kafka-4-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev
+      - run: cargo test --locked --test kafka_4_integration -- --ignored --nocapture
+
+  kafka-3-integration:
+    runs-on: ubuntu-latest
+    env:
+      KAFKA_36_HOME: ${{ github.workspace }}/.kafka/kafka_2.13-3.6.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y librdkafka-dev
+      - name: Download Apache Kafka 3.6.2
+        run: |
+          mkdir -p .kafka
+          curl --fail --location --retry 3 \
+            https://archive.apache.org/dist/kafka/3.6.2/kafka_2.13-3.6.2.tgz \
+            | tar -xz -C .kafka
+      - run: cargo test --locked --test kafka_3_integration -- --ignored --nocapture
