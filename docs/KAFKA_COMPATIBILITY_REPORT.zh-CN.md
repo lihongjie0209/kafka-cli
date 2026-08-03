@@ -7,12 +7,12 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `1c482f0`。
-- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 17 个兼容名称，入口覆盖率为 17/44（38.6%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
-- 按本报告的功能口径，17 个兼容入口中 7 个达到核心功能“已支持”，10 个为“部分支持”；另有 27 个原版入口未支持。因此不能把 38.6% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
+- 本项目审计实现基准：`master`，提交 `25a4cd2`。
+- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 18 个兼容名称，入口覆盖率为 18/44（40.9%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 按本报告的功能口径，18 个兼容入口中 8 个达到核心功能“已支持”，10 个为“部分支持”；另有 26 个原版入口未支持。因此不能把 40.9% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
-- Connect、Share Group、Streams Group、delegation token、metadata quorum、storage、性能测试、验证工具等原版工具尚未实现。
+- Connect、Share Group、Streams Group、metadata shell、storage、性能测试、验证工具等原版工具尚未实现；Metadata Quorum 和 Delegation Tokens 已新增，但其专用多 controller/SASL 集成矩阵仍待补充。
 - 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API。ACL create/describe/delete 已迁移到 librdkafka；少数其他管理路径仍使用 `krafka`，尚未完全统一。
 
 ## 2. 状态定义
@@ -38,15 +38,15 @@
 
 | 维度 | 结果 | 解读 |
 |---|---:|---|
-| Kafka `.sh` 入口 | 17 / 44（38.6%） | 27 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
-| 入口功能评级 | 7 已支持 / 10 部分支持 / 27 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
-| 已覆盖入口的一级动作 | 50 / 50 | 仅表示这 17 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
+| Kafka `.sh` 入口 | 18 / 44（40.9%） | 26 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
+| 入口功能评级 | 8 已支持 / 10 部分支持 / 26 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
+| 已覆盖入口的一级动作 | 54 / 54 | 仅表示这 18 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 194 个通过 | 183 个 library unit tests + 11 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 201 个通过 | 189 个 library unit tests + 12 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
-原版动作数 50 的构成：Topics 5、Consumer Groups 6、Transactions 6、Features 6、Client Metrics 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 7 个入口各 1。Console producer/consumer 属于单动作数据命令；本项目额外把 API versions 也放入 cluster 子命令。
+原版动作数 54 的构成：Topics 5、Consumer Groups 6、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 7 个入口各 1。Console producer/consumer 属于单动作数据命令；本项目额外把 API versions 也放入 cluster 子命令。
 
 ## 3. 顶层脚本覆盖
 
@@ -63,6 +63,7 @@
 | `kafka-features.sh` | `kafka features` | 部分支持 | describe、upgrade、downgrade、disable、version-mapping、feature-dependencies；缺 bootstrap-controller |
 | `kafka-transactions.sh` | `kafka transactions` | 已支持 | list、describe、describe-producers、abort、find-hanging、forceTerminateTransaction；保留 coordinator 与指定 broker 语义 |
 | `kafka-metadata-quorum.sh` | `kafka metadata-quorum` | 部分支持 | describe status/replication、add-controller、remove-controller；完整 DescribeQuorum v2 与动态 voter API，缺 bootstrap-controller |
+| `kafka-delegation-tokens.sh` | `kafka delegation-tokens` | 已支持 | create、renew、expire、describe；owner/requester/renewer、标准 Base64 HMAC 与 `-1` 时间语义 |
 | `kafka-get-offsets.sh` | `kafka offsets` | 部分支持 | 常规 OffsetSpec 使用 librdkafka ListOffsets；分层存储 `-4/-5/-6` 使用 ListOffsets v11 协议 fallback；过滤与逐 partition 语义已对齐，输出格式不同 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流/安全参数及 verify/cancel throttle 生命周期；缺 controller 模式 |
@@ -82,7 +83,6 @@
 | 新消费组模型 | `kafka-console-share-consumer.sh`、`kafka-share-groups.sh`、`kafka-share-consumer-perf-test.sh`、`kafka-verifiable-share-consumer.sh` |
 | Streams | `kafka-streams-application-reset.sh`、`kafka-streams-groups.sh` |
 | 集群与元数据高级工具 | `kafka-metadata-shell.sh`、`kafka-storage.sh` |
-| 安全 | `kafka-delegation-tokens.sh` |
 | 性能、校验与诊断 | `kafka-consumer-perf-test.sh`、`kafka-producer-perf-test.sh`、`kafka-e2e-latency.sh`、`kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-verifiable-producer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
 | 服务进程与基础启动器 | `kafka-run-class.sh`、`kafka-server-start.sh`、`kafka-server-stop.sh`、`kafka-jmx.sh` |
 | 其他 Group 工具 | `kafka-groups.sh` |
@@ -247,6 +247,14 @@ describe-producers 支持 leader 默认路由和 `--broker-id` 指定副本，�
 
 缺少 `--bootstrap-controller`：参数可识别但当前协议客户端初始化仍需要 broker Metadata，无法直接以 controller-only listener 建立会话。`--bootstrap-server` 模式会发现并连接 controller，describe 与动态 voter API 均有真实执行路径。Kafka 4.3.1 集成覆盖 status、replication v2 和 remove dry-run；真实 add/remove 会改变单节点测试集群 voter set，因此只在 codec/config 单元测试覆盖，后续需要专用多 controller fixture。
 
+### 4.18 Delegation Tokens
+
+已支持原版全部四个动作：create、renew、expire 和 describe，兼容入口会把原版 `--create/--renew/--expire/--describe` action flag 改写为原生子命令。所有动作与原版一样要求 `--command-config`，避免在没有安全身份配置时误导用户。principal 使用 `principalType:name` 校验；create 支持单 owner、重复 renewer 和 max-life-time-period，describe 支持重复 owner filter；owner override 需要并实际协商 CreateDelegationToken v3，不会在旧 broker 上静默丢弃。
+
+create/describe 保留 Kafka 4 v3 的 OWNER 与 REQUESTER 差异、renewers、token ID、标准 Base64 HMAC 及三类时间；renew/expire 接受标准 Base64 HMAC。三个 period 参数均接受原版 `-1` sentinel，并拒绝小于 -1 的值；renew 的 `-1` 使用原始协议字段，避免被 Rust `Duration` 错误转换为零。输出通过 `comfy-table`/JSON，日期按原版分钟精度展示，同时 renew/expire JSON 保留毫秒 timestamp。
+
+Kafka 的 delegation token 管理只在安全模式可用。当前 Kafka 4.3.1 PLAINTEXT 集成确认 describe 请求到达 broker 并被安全边界拒绝；完整 create→describe→renew→expire 数据闭环仍需新增 SASL 测试集群，因此认证矩阵是剩余测试缺口，不是命令动作或协议字段缺失。
+
 ## 5. 全局行为差异
 
 | 项目 | Apache Kafka 原版 | kafka-cli |
@@ -280,8 +288,8 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：194 个通过（183 个 library unit tests + 11 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试：Metadata Quorum status、replication v2 与 remove dry-run 已加入当前 CI；此前基准覆盖其余 16 个命令族。
+- Rust 单元测试与普通 CLI 测试：201 个通过（189 个 library unit tests + 12 个 CLI tests）。
+- Kafka 4.3.1 Docker 集成测试：Delegation Tokens PLAINTEXT 安全拒绝已加入当前 CI；此前基准覆盖全部 17 个命令族及 Metadata Quorum v2。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -304,8 +312,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-Transactions 实现 `ac4e3fb` 及报告提交 `d626fdd` 已由 GitHub Actions
-[`30853525172`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30853525172) 完整验证通过：fmt/Clippy/186 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。两种 musl artifact 均执行 `--version`/`--help` smoke test，ARM64 通过 QEMU user-mode emulator 启动；musl 没有在本地构建。
+Metadata Quorum 实现 `1c482f0` 及报告提交 `0262300` 已由 GitHub Actions
+[`30854327394`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30854327394) 完整验证通过：fmt/Clippy/194 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 DescribeQuorum v2 status/replication 和 remove dry-run。两种 musl artifact 均执行 smoke test，ARM64 通过 QEMU user-mode emulator 启动；musl 没有在本地构建。Delegation Tokens `25a4cd2` 的 201 个普通测试和 PLAINTEXT 安全边界将在当前推送 CI 验证。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -326,13 +334,13 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 ### P2：扩大原版工具覆盖面
 
-优先考虑 `kafka-delegation-tokens.sh`；Metadata Quorum 已完成三动作入口，但仍需 controller bootstrap 与多 controller 动态 voter 集成闭环。Transactions 下一步应增加隔离的真实悬挂事务/abort/fencing 集成闭环。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
+Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。后续新增入口优先考虑 `kafka-groups.sh` 与新 Share/Streams Group 管理工具。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
 
 ## 10. 最终评估
 
 当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、Transactions、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
 
-在对外发布时，建议使用“兼容 17 个常用 Kafka CLI 入口的 Rust 工具”表述，不应使用“100% 兼容 Apache Kafka CLI”。
+在对外发布时，建议使用“兼容 18 个常用 Kafka CLI 入口的 Rust 工具”表述，不应使用“100% 兼容 Apache Kafka CLI”。
 
 ### 10.1 二次代码审计发现的待修正项
 
@@ -357,6 +365,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | features | 完整 | 高 | 高/中 | 六个动作、指定 node、dry-run 与 Kafka 4.4 离线映射已实现；缺 controller bootstrap |
 | transactions | 完整 | 高 | 高/中 | 六个动作及 coordinator/指定 broker 语义已实现；破坏性 recovery 闭环仍需隔离集成 fixture |
 | metadata-quorum | 完整 | 高 | 中/高 | 三个动作、DescribeQuorum v2 和 API 80/81 已实现；缺 controller bootstrap 与多 controller mutation 集成 |
+| delegation-tokens | 完整 | 高 | 高/中 | 四动作与 v3 requester/owner 语义完整；缺 SASL 全生命周期集成 fixture |
 | get-offsets | 单动作 | 高 | 高/中 | 普通及分层存储 OffsetSpec、过滤与逐 partition 错误语义均已实现；结构化输出格式不同 |
 | acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
 | reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；仍缺 controller |
@@ -439,6 +448,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | Kafka Features 入口 | 新增 `kafka features` 和 `kafka-features.sh`；实现六个原版动作、指定 node describe、UpdateFeatures v0/v1 dry-run/更新，以及按 Kafka 4.4 源码对齐的 metadata/production feature 离线映射 | 163 个单元测试、9 个 CLI 测试；Kafka 4.3.1 任意/指定 node describe 与 metadata upgrade dry-run；CI `30851984283` 六项全绿 |
 | 2026-08-04 | Kafka Transactions 入口 | 新增 `kafka transactions` 和 `kafka-transactions.sh`；实现 list、describe、describe-producers、abort、find-hanging、forceTerminateTransaction，保留 coordinator、指定 broker、两类 abort spec 和 producer fencing 语义 | 176 个单元测试、10 个 CLI 测试；Kafka 4.3.1 list/指定 broker producer state/find-hanging；CI `30853525172` 六项全绿 |
 | 2026-08-04 | Kafka Metadata Quorum 入口 | 新增 `kafka metadata-quorum` 和 `kafka-metadata-quorum.sh`；实现 status/replication、add/remove controller，补足 DescribeQuorum v2 codec 和 Add/RemoveRaftVoter API 80/81 | 183 个单元测试、11 个 CLI 测试；Kafka 4.3.1 status/replication/remove dry-run 已加入当前 CI |
+| 2026-08-04 | Kafka Delegation Tokens 入口 | 新增 `kafka delegation-tokens` 和 `kafka-delegation-tokens.sh`；实现 create/renew/expire/describe、v3 owner/requester、renewer、标准 Base64 HMAC 和 `-1` period sentinel | 189 个单元测试、12 个 CLI 测试；Kafka 4.3.1 PLAINTEXT 安全拒绝已加入当前 CI |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
