@@ -4679,6 +4679,7 @@ const fn acl_wire_pattern(pattern: crate::cli::AclResourcePattern) -> AclPattern
     match pattern {
         crate::cli::AclResourcePattern::Any => AclPatternType::Any,
         crate::cli::AclResourcePattern::Literal => AclPatternType::Literal,
+        crate::cli::AclResourcePattern::Match => AclPatternType::Match,
         crate::cli::AclResourcePattern::Prefixed => AclPatternType::Prefixed,
     }
 }
@@ -4687,6 +4688,14 @@ fn acl_bindings(
     mutation: &crate::cli::AclMutationArgs,
     operations: &[AclOperation],
 ) -> Result<Vec<AclBinding>> {
+    if matches!(
+        mutation.filter.resource_pattern_type,
+        crate::cli::AclResourcePattern::Any | crate::cli::AclResourcePattern::Match
+    ) {
+        return Err(Error::Usage(
+            "ACL creation requires literal or prefixed resource pattern type".into(),
+        ));
+    }
     let resources = acl_mutation_resources(mutation, operations)?;
     let mut principals = mutation
         .allow_principal
@@ -4751,37 +4760,69 @@ fn acl_removal_filters(
         vec![(
             resource_type,
             resource_name.unwrap_or_default(),
-            if operations.is_empty() {
-                vec![AclOperation::Any]
-            } else {
-                operations.to_vec()
-            },
+            operations.to_vec(),
         )]
     };
-    let mut principals = mutation
+    let mut entries = mutation
         .allow_principal
         .iter()
-        .map(|principal| (Some(principal.as_str()), AclPermissionType::Allow))
-        .chain(
-            mutation
-                .deny_principal
-                .iter()
-                .map(|principal| (Some(principal.as_str()), AclPermissionType::Deny)),
-        )
+        .flat_map(|principal| {
+            let hosts = if mutation.allow_host.is_empty() {
+                vec![mutation.host.as_deref().unwrap_or("*")]
+            } else {
+                mutation.allow_host.iter().map(String::as_str).collect()
+            };
+            hosts
+                .into_iter()
+                .map(move |host| (principal.as_str(), host, AclPermissionType::Allow))
+        })
+        .chain(mutation.deny_principal.iter().flat_map(|principal| {
+            let hosts = if mutation.deny_host.is_empty() {
+                vec![mutation.host.as_deref().unwrap_or("*")]
+            } else {
+                mutation.deny_host.iter().map(String::as_str).collect()
+            };
+            hosts
+                .into_iter()
+                .map(move |host| (principal.as_str(), host, AclPermissionType::Deny))
+        }))
         .collect::<Vec<_>>();
-    if principals.is_empty() {
-        principals.push((mutation.filter.principal.as_deref(), AclPermissionType::Any));
+    if entries.is_empty()
+        && let Some(principal) = mutation.filter.principal.as_deref()
+    {
+        entries.push((
+            principal,
+            mutation.host.as_deref().unwrap_or("*"),
+            AclPermissionType::Any,
+        ));
     }
     let mut filters = Vec::new();
     for (resource_type, resource_name, operations) in resources {
-        for (principal, permission) in &principals {
+        if entries.is_empty() {
+            filters.push(AclBindingFilter {
+                resource_type,
+                resource_name: (!resource_name.is_empty()).then(|| resource_name.clone()),
+                pattern_type: acl_wire_pattern(mutation.filter.resource_pattern_type),
+                principal: None,
+                host: None,
+                operation: AclOperation::Any,
+                permission_type: AclPermissionType::Any,
+            });
+            continue;
+        }
+        let operations = if operations.is_empty() {
+            vec![AclOperation::All]
+        } else {
+            operations
+        };
+        for (principal, host, permission) in &entries {
             for operation in &operations {
                 filters.push(AclBindingFilter {
                     resource_type,
                     resource_name: (!resource_name.is_empty()).then(|| resource_name.clone()),
                     pattern_type: acl_wire_pattern(mutation.filter.resource_pattern_type),
-                    principal: principal.map(str::to_owned),
-                    host: mutation.host.clone(),
+                    principal: Some((*principal).to_owned()),
+                    host: Some((*host).to_owned()),
                     operation: *operation,
                     permission_type: *permission,
                 });
@@ -7332,6 +7373,125 @@ mod tests {
                 && binding.host == "*"
                 && binding.permission_type == AclPermissionType::Deny
         }));
+    }
+
+    #[test]
+    fn acl_add_should_reject_filter_only_pattern_types() {
+        for pattern in ["any", "match"] {
+            let cli = Cli::try_parse_from([
+                "kafka",
+                "--bootstrap-server",
+                "localhost:9092",
+                "acls",
+                "add",
+                "--topic",
+                "orders",
+                "--resource-pattern-type",
+                pattern,
+                "--allow-principal",
+                "User:reader",
+            ])
+            .expect("ACL command");
+            let Command::Acls(args) = cli.command else {
+                panic!("expected ACL command");
+            };
+            let AclAction::Add(mutation) = args.action else {
+                panic!("expected ACL add");
+            };
+            assert!(matches!(acl_bindings(&mutation, &[]), Err(Error::Usage(_))));
+        }
+    }
+
+    #[test]
+    fn acl_removal_should_preserve_permission_specific_hosts() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "remove",
+            "--topic",
+            "orders",
+            "--allow-principal",
+            "User:reader",
+            "--allow-host",
+            "10.0.0.1",
+            "--operation",
+            "read",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Remove(mutation) = args.action else {
+            panic!("expected ACL remove");
+        };
+        let operations = acl_operations(&mutation.operation).expect("operations");
+        let filters = acl_removal_filters(&mutation, &operations).expect("filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].principal.as_deref(), Some("User:reader"));
+        assert_eq!(filters[0].host.as_deref(), Some("10.0.0.1"));
+        assert_eq!(filters[0].operation, AclOperation::Read);
+        assert_eq!(filters[0].permission_type, AclPermissionType::Allow);
+    }
+
+    #[test]
+    fn acl_removal_without_principal_should_delete_all_matching_entries() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "remove",
+            "--topic",
+            "orders",
+            "--resource-pattern-type",
+            "match",
+            "--operation",
+            "read",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Remove(mutation) = args.action else {
+            panic!("expected ACL remove");
+        };
+        let operations = acl_operations(&mutation.operation).expect("operations");
+        let filters = acl_removal_filters(&mutation, &operations).expect("filters");
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].principal.is_none());
+        assert!(filters[0].host.is_none());
+        assert_eq!(filters[0].pattern_type, AclPatternType::Match);
+        assert_eq!(filters[0].operation, AclOperation::Any);
+        assert_eq!(filters[0].permission_type, AclPermissionType::Any);
+    }
+
+    #[test]
+    fn acl_removal_with_principal_should_default_to_all_operation() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "acls",
+            "remove",
+            "--topic",
+            "orders",
+            "--principal",
+            "User:reader",
+        ])
+        .expect("ACL command");
+        let Command::Acls(args) = cli.command else {
+            panic!("expected ACL command");
+        };
+        let AclAction::Remove(mutation) = args.action else {
+            panic!("expected ACL remove");
+        };
+        let filters = acl_removal_filters(&mutation, &[]).expect("filters");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].host.as_deref(), Some("*"));
+        assert_eq!(filters[0].operation, AclOperation::All);
+        assert_eq!(filters[0].permission_type, AclPermissionType::Any);
     }
 
     #[test]

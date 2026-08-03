@@ -737,6 +737,7 @@ pub enum AclResourcePattern {
     Any,
     #[default]
     Literal,
+    Match,
     Prefixed,
 }
 

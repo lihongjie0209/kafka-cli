@@ -1383,6 +1383,69 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("Prefixed")
     );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "acls",
+                "list",
+                "--topic",
+                "integration-events",
+                "--resource-pattern-type",
+                "match",
+                "--principal",
+                "User:prefix-reader",
+            ]
+        )
+        .contains("User:prefix-reader")
+    );
+    success(
+        &bootstrap,
+        &[
+            "acls",
+            "add",
+            "--topic",
+            "integration-events",
+            "--allow-principal",
+            "User:host-reader",
+            "--allow-host",
+            "10.0.0.1",
+            "--allow-host",
+            "10.0.0.2",
+            "--operation",
+            "read",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "acls",
+            "remove",
+            "--topic",
+            "integration-events",
+            "--allow-principal",
+            "User:host-reader",
+            "--allow-host",
+            "10.0.0.1",
+            "--operation",
+            "read",
+            "--execute",
+        ],
+    );
+    let remaining_host_acl = success(
+        &bootstrap,
+        &[
+            "acls",
+            "list",
+            "--topic",
+            "integration-events",
+            "--principal",
+            "User:host-reader",
+        ],
+    );
+    assert!(!remaining_host_acl.contains("10.0.0.1"));
+    assert!(remaining_host_acl.contains("10.0.0.2"));
     success(
         &bootstrap,
         &[
