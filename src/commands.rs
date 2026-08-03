@@ -28,6 +28,9 @@ use krafka::protocol::{
     KafkaString, ListPartitionReassignmentsTopic, ReassignablePartition, ReassignableTopic,
     TaggedFields, TryEncode, VersionedDecode, VersionedEncode, versions,
 };
+use krafka::share_consumer::{
+    AcknowledgeType as ShareAcknowledgeType, AcknowledgementMode, ShareConsumer,
+};
 use rdkafka::{
     Message, Offset,
     admin::{
@@ -49,9 +52,9 @@ use crate::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
         ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
         ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
-        ReassignAction, ResetOffsetsArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
-        StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
-        TransactionAction,
+        ReassignAction, ResetOffsetsArgs, ShareConsumeArgs, ShareGroupAction,
+        ShareGroupResetOffsetsArgs, StreamsApplicationResetArgs, StreamsGroupAction,
+        StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
     },
     config,
     error::{Error, Result},
@@ -148,6 +151,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Topics(args) => topics(&client_config, timeout, format, args.action).await,
         Command::Produce(args) => produce(client_config, args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
+        Command::ShareConsume(args) => {
+            Box::pin(share_consume(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                args,
+            ))
+            .await
+        }
         Command::Groups(args) => {
             Box::pin(groups(
                 &client_config,
@@ -1463,6 +1475,202 @@ async fn consume(
     Ok(())
 }
 
+async fn share_consume(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    request_timeout: Duration,
+    args: ShareConsumeArgs,
+) -> Result<()> {
+    let formatter = message_formatter_options(&args)?;
+    let mut properties = match command_config {
+        Some(path) => config::load_properties(path)?,
+        None => std::collections::HashMap::new(),
+    };
+    for (key, value) in parse_pairs(args.properties())? {
+        properties.insert(key, value);
+    }
+
+    let configured_group = properties.get("group.id").map(String::as_str);
+    if let (Some(argument), Some(configured)) = (args.group.as_deref(), configured_group)
+        && argument != configured
+    {
+        return Err(Error::Usage(format!(
+            "group ids supplied by --group and consumer properties must match: '{argument}', '{configured}'"
+        )));
+    }
+    let group = args
+        .group
+        .as_deref()
+        .or(configured_group)
+        .unwrap_or("console-share-consumer");
+    let client_id = properties
+        .get("client.id")
+        .map_or("console-share-consumer", String::as_str);
+
+    let mut builder = ShareConsumer::builder()
+        .bootstrap_servers(bootstrap)
+        .group_id(group)
+        .client_id(client_id)
+        .acknowledgement_mode(AcknowledgementMode::Explicit)
+        .request_timeout(
+            share_duration_property(&properties, "request.timeout.ms")?.unwrap_or(request_timeout),
+        );
+    if let Some(auth) = config::protocol_auth(&properties)? {
+        builder = builder.auth(auth);
+    }
+    if let Some(value) = share_i32_property(&properties, "max.poll.records")? {
+        builder = builder.max_poll_records(value);
+    } else if let Some(max_messages) = args.max_messages.filter(|value| *value > 0) {
+        builder = builder.max_poll_records(max_messages);
+    }
+    if let Some(value) = share_i32_property(&properties, "fetch.max.wait.ms")? {
+        builder = builder.fetch_max_wait_ms(value);
+    }
+    if let Some(value) = share_duration_property(&properties, "session.timeout.ms")? {
+        builder = builder.session_timeout(value);
+    }
+    if let Some(value) = share_duration_property(&properties, "heartbeat.interval.ms")? {
+        builder = builder.heartbeat_interval(value);
+    }
+    if let Some(value) = share_duration_property(&properties, "metadata.max.age.ms")? {
+        builder = builder.metadata_max_age(value);
+    }
+    if let Some(value) = share_duration_property(&properties, "metadata.max.idle.ms")? {
+        builder = builder.metadata_topic_cache_ttl(value);
+    }
+    if let Some(rack) = properties.get("client.rack") {
+        builder = builder.client_rack(rack);
+    }
+
+    let consumer = builder.build().await?;
+    consumer.subscribe(&[&args.topic]).await?;
+    let acknowledgement = if args.reject {
+        ShareAcknowledgeType::Reject
+    } else if args.release {
+        ShareAcknowledgeType::Release
+    } else {
+        ShareAcknowledgeType::Accept
+    };
+    let run_result = consume_share_records(&consumer, &formatter, &args, acknowledgement).await;
+    let close_result = consumer.close().await.map_err(Error::from);
+    drop(consumer);
+    eprintln!(
+        "Processed a total of {} messages",
+        run_result.as_ref().map_or(0, |count| *count)
+    );
+    if args.enable_systest_events {
+        println!("shutdown_complete");
+    }
+    run_result.map(|_| ()).and(close_result)
+}
+
+async fn consume_share_records(
+    consumer: &ShareConsumer,
+    formatter: &MessageFormatterOptions,
+    args: &ShareConsumeArgs,
+    acknowledgement: ShareAcknowledgeType,
+) -> Result<i64> {
+    let mut received = 0_i64;
+    while should_consume_more(args.max_messages, received) {
+        let poll_timeout = args
+            .timeout_ms
+            .filter(|timeout| *timeout != u64::MAX)
+            .map_or(Duration::from_secs(1), Duration::from_millis);
+        let records = tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            result = consumer.poll(poll_timeout) => result?,
+        };
+        if records.is_empty() {
+            if args.timeout_ms.is_some_and(|timeout| timeout != u64::MAX) {
+                break;
+            }
+            continue;
+        }
+        for record in records {
+            if !should_consume_more(args.max_messages, received) {
+                break;
+            }
+            let written = if args.json {
+                write_share_json(&record)
+            } else {
+                write_formatted_share_message(&record, formatter)
+            };
+            match written {
+                Ok(()) => consumer.acknowledge(&record, acknowledgement).await?,
+                Err(error) if args.reject_message_on_error => {
+                    eprintln!("error processing message, rejecting it: {error}");
+                    consumer
+                        .acknowledge(&record, ShareAcknowledgeType::Reject)
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+            received += 1;
+        }
+        consumer.commit_sync().await?;
+    }
+    Ok(received)
+}
+
+fn share_i32_property(
+    properties: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<Option<i32>> {
+    properties
+        .get(key)
+        .map(|value| {
+            value
+                .parse::<i32>()
+                .map_err(|error| Error::Config(format!("invalid {key} value '{value}': {error}")))
+        })
+        .transpose()
+}
+
+fn share_duration_property(
+    properties: &std::collections::HashMap<String, String>,
+    key: &str,
+) -> Result<Option<Duration>> {
+    properties
+        .get(key)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map(Duration::from_millis)
+                .map_err(|error| Error::Config(format!("invalid {key} value '{value}': {error}")))
+        })
+        .transpose()
+}
+
+fn write_share_json(record: &krafka::consumer::ConsumerRecord) -> Result<()> {
+    let headers = record
+        .headers
+        .iter()
+        .map(|(key, value)| {
+            (
+                String::from_utf8_lossy(key).into_owned(),
+                value
+                    .as_deref()
+                    .map(|value| String::from_utf8_lossy(value).into_owned()),
+            )
+        })
+        .collect();
+    output::write_json_line(&ConsumedRecord {
+        topic: &record.topic,
+        partition: record.partition,
+        offset: record.offset,
+        timestamp: Some(record.timestamp),
+        key: record
+            .key
+            .as_deref()
+            .map(|key| String::from_utf8_lossy(key).into_owned()),
+        value: record
+            .value
+            .as_deref()
+            .map(|value| String::from_utf8_lossy(value).into_owned()),
+        headers,
+    })
+}
+
 fn consumer_include_pattern(include: &str) -> String {
     format!("^({include})$")
 }
@@ -1597,6 +1805,76 @@ struct MessageFormatterOptions {
     headers_deserializer: NativeDeserializer,
 }
 
+trait FormatterArgs {
+    fn formatter(&self) -> &str;
+    fn key_deserializer(&self) -> Option<&str>;
+    fn value_deserializer(&self) -> Option<&str>;
+    fn print_key(&self) -> bool;
+    fn key_separator(&self) -> &str;
+    fn formatter_config(&self) -> Option<&Path>;
+    fn formatter_properties(&self) -> &[String];
+}
+
+impl FormatterArgs for crate::cli::ConsumeArgs {
+    fn formatter(&self) -> &str {
+        &self.formatter
+    }
+
+    fn key_deserializer(&self) -> Option<&str> {
+        self.key_deserializer.as_deref()
+    }
+
+    fn value_deserializer(&self) -> Option<&str> {
+        self.value_deserializer.as_deref()
+    }
+
+    fn print_key(&self) -> bool {
+        self.print_key
+    }
+
+    fn key_separator(&self) -> &str {
+        &self.key_separator
+    }
+
+    fn formatter_config(&self) -> Option<&Path> {
+        self.formatter_config.as_deref()
+    }
+
+    fn formatter_properties(&self) -> &[String] {
+        self.formatter_properties()
+    }
+}
+
+impl FormatterArgs for ShareConsumeArgs {
+    fn formatter(&self) -> &str {
+        &self.formatter
+    }
+
+    fn key_deserializer(&self) -> Option<&str> {
+        self.key_deserializer.as_deref()
+    }
+
+    fn value_deserializer(&self) -> Option<&str> {
+        self.value_deserializer.as_deref()
+    }
+
+    fn print_key(&self) -> bool {
+        self.print_key
+    }
+
+    fn key_separator(&self) -> &str {
+        &self.key_separator
+    }
+
+    fn formatter_config(&self) -> Option<&Path> {
+        self.formatter_config.as_deref()
+    }
+
+    fn formatter_properties(&self) -> &[String] {
+        self.formatter_properties()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum NativeDeserializer {
     #[default]
@@ -1636,28 +1914,25 @@ fn is_utf8_encoding(value: &str) -> bool {
         .eq_ignore_ascii_case("UTF8")
 }
 
-fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFormatterOptions> {
-    if args.formatter != "org.apache.kafka.tools.consumer.DefaultMessageFormatter" {
+fn message_formatter_options(args: &impl FormatterArgs) -> Result<MessageFormatterOptions> {
+    if args.formatter() != "org.apache.kafka.tools.consumer.DefaultMessageFormatter" {
         return Err(Error::Unsupported(format!(
             "Java formatter class {} cannot be loaded by the native client",
-            args.formatter
+            args.formatter()
         )));
     }
-    let properties = component_properties(
-        args.formatter_config.as_deref(),
-        args.formatter_properties(),
-    )?;
+    let properties = component_properties(args.formatter_config(), args.formatter_properties())?;
     let value = |key: &str| properties.get(key);
     let key_deserializer = native_deserializer(
         value("key.deserializer")
             .map(String::as_str)
-            .or(args.key_deserializer.as_deref()),
+            .or_else(|| args.key_deserializer()),
         "key",
     )?;
     let value_deserializer = native_deserializer(
         value("value.deserializer")
             .map(String::as_str)
-            .or(args.value_deserializer.as_deref()),
+            .or_else(|| args.value_deserializer()),
         "value",
     )?;
     let headers_deserializer =
@@ -1692,10 +1967,10 @@ fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFo
         print_delivery: flag("print.delivery", false),
         print_epoch: flag("print.epoch", false),
         print_headers: flag("print.headers", false),
-        print_key: flag("print.key", args.print_key),
+        print_key: flag("print.key", args.print_key()),
         print_value: flag("print.value", true),
         key_separator: value("key.separator")
-            .map_or_else(|| args.key_separator.as_bytes(), String::as_bytes)
+            .map_or_else(|| args.key_separator().as_bytes(), String::as_bytes)
             .to_vec(),
         line_separator: value("line.separator")
             .map_or(b"\n".as_slice(), String::as_bytes)
@@ -1770,6 +2045,64 @@ fn write_formatted_message(
     Ok(())
 }
 
+fn write_formatted_share_message(
+    record: &krafka::consumer::ConsumerRecord,
+    options: &MessageFormatterOptions,
+) -> Result<()> {
+    let mut fields = Vec::<Vec<u8>>::new();
+    if options.print_timestamp {
+        let kind = if record.timestamp_type == 1 {
+            "LogAppendTime"
+        } else {
+            "CreateTime"
+        };
+        fields.push(format!("{kind}:{}", record.timestamp).into_bytes());
+    }
+    if options.print_partition {
+        fields.push(format!("Partition:{}", record.partition).into_bytes());
+    }
+    if options.print_offset {
+        fields.push(format!("Offset:{}", record.offset).into_bytes());
+    }
+    if options.print_delivery {
+        fields.push(record.delivery_count.map_or_else(
+            || b"Delivery:NOT_PRESENT".to_vec(),
+            |count| format!("Delivery:{count}").into_bytes(),
+        ));
+    }
+    if options.print_epoch {
+        fields.push(formatted_leader_epoch(record.leader_epoch));
+    }
+    if options.print_headers {
+        fields.push(formatted_share_headers(&record.headers, options));
+    }
+    if options.print_key {
+        fields.push(deserialize_for_display(
+            record.key.as_deref(),
+            options.key_deserializer,
+            &options.null_literal,
+        ));
+    }
+    if options.print_value {
+        fields.push(deserialize_for_display(
+            record.value.as_deref(),
+            options.value_deserializer,
+            &options.null_literal,
+        ));
+    }
+    let mut stdout = io::stdout().lock();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            stdout.write_all(&options.key_separator)?;
+        }
+        stdout.write_all(field)?;
+    }
+    if options.print_value {
+        stdout.write_all(&options.line_separator)?;
+    }
+    Ok(())
+}
+
 fn formatted_leader_epoch(epoch: Option<i32>) -> Vec<u8> {
     epoch.map_or_else(
         || b"Epoch:NOT_PRESENT".to_vec(),
@@ -1793,6 +2126,29 @@ fn formatted_headers(
         result.push(b':');
         result.extend_from_slice(&deserialize_for_display(
             header.value,
+            options.headers_deserializer,
+            &options.null_literal,
+        ));
+    }
+    result
+}
+
+fn formatted_share_headers(
+    headers: &[(bytes::Bytes, Option<bytes::Bytes>)],
+    options: &MessageFormatterOptions,
+) -> Vec<u8> {
+    if headers.is_empty() {
+        return b"NO_HEADERS".to_vec();
+    }
+    let mut result = Vec::new();
+    for (index, (key, value)) in headers.iter().enumerate() {
+        if index > 0 {
+            result.extend_from_slice(&options.headers_separator);
+        }
+        result.extend_from_slice(key);
+        result.push(b':');
+        result.extend_from_slice(&deserialize_for_display(
+            value.as_deref(),
             options.headers_deserializer,
             &options.null_literal,
         ));
@@ -13841,6 +14197,53 @@ mod tests {
     #[test]
     fn formatted_leader_epoch_should_render_missing_epoch() {
         assert_eq!(formatted_leader_epoch(None), b"Epoch:NOT_PRESENT");
+    }
+
+    #[test]
+    fn share_consumer_formatter_should_preserve_delivery_and_headers() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "share-consume",
+            "--topic",
+            "events",
+            "--formatter-property",
+            "print.delivery=true",
+            "--formatter-property",
+            "print.headers=true",
+            "--formatter-property",
+            "headers.separator=|",
+        ])
+        .expect("share consumer formatter");
+        let Command::ShareConsume(args) = cli.command else {
+            panic!("expected share-consume command");
+        };
+        let options = message_formatter_options(&args).expect("formatter options");
+
+        assert!(options.print_delivery);
+        assert!(options.print_headers);
+        assert_eq!(
+            formatted_share_headers(
+                &[
+                    (
+                        bytes::Bytes::from_static(b"trace"),
+                        Some(bytes::Bytes::from_static(b"abc"))
+                    ),
+                    (bytes::Bytes::from_static(b"empty"), None),
+                ],
+                &options,
+            ),
+            b"trace:abc|empty:null"
+        );
+    }
+
+    #[test]
+    fn share_consumer_numeric_properties_should_validate_before_connecting() {
+        let mut properties = std::collections::HashMap::new();
+        properties.insert("max.poll.records".to_owned(), "invalid".to_owned());
+        assert!(matches!(
+            share_i32_property(&properties, "max.poll.records"),
+            Err(Error::Config(message)) if message.contains("max.poll.records")
+        ));
     }
 
     #[test]

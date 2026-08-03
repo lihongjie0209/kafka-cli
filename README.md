@@ -28,6 +28,9 @@ printf 'key\tvalue\n' | kafka --bootstrap-server localhost:9092 \
 kafka --bootstrap-server localhost:9092 consume \
   --topic events --from-beginning --max-messages 1 --json
 
+kafka --bootstrap-server localhost:9092 share-consume \
+  --topic events --group shared-workers --max-messages 1
+
 kafka --bootstrap-server localhost:9092 groups list --output json
 ```
 
@@ -37,7 +40,7 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `consume`, `groups`, `all-groups`,
+The binary exposes `topics`, `produce`, `consume`, `share-consume`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
 `features`, `transactions`, `metadata-quorum`, and `delegation-tokens` command families. Run
@@ -64,6 +67,12 @@ force-removes active classic group members, resets input offsets, seeks
 intermediate topics to their end offsets, and deletes only inferred Kafka
 Streams internal topics. Use `--dry-run` before executing this irreversible
 workflow.
+
+The console Share consumer uses KIP-932 ShareFetch/ShareAcknowledge with
+explicit acknowledgements. Successful records can be accepted (default),
+released, or rejected, and formatter failures can be rejected without stopping
+the process. Its formatter and JSON modes share the regular console consumer's
+native output implementation.
 
 ## Authentication
 

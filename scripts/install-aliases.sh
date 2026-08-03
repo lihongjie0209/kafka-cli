@@ -10,7 +10,7 @@ binary=$1
 directory=$(dirname "$binary")
 
 for name in \
-    kafka-topics kafka-console-producer kafka-console-consumer \
+    kafka-topics kafka-console-producer kafka-console-consumer kafka-console-share-consumer \
     kafka-consumer-groups kafka-groups kafka-share-groups kafka-streams-groups \
     kafka-streams-application-reset kafka-configs kafka-client-metrics \
     kafka-features kafka-transactions kafka-metadata-quorum \

@@ -644,6 +644,53 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .stdout(predicate::str::contains("json-value"))
         .stdout(predicate::str::contains("trace"));
 
+    success(
+        &bootstrap,
+        &[
+            "topics",
+            "create",
+            "--topic",
+            "console-share-events",
+            "--partitions",
+            "1",
+        ],
+    );
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
+            "console-share-events",
+            "--sync",
+        ])
+        .write_stdin("share-value\n")
+        .assert()
+        .success();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "share-consume",
+            "--topic",
+            "console-share-events",
+            "--group",
+            "console-share-integration",
+            "--max-messages",
+            "1",
+            "--timeout-ms",
+            "10000",
+            "--formatter-property",
+            "print.delivery=true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Delivery:1"))
+        .stdout(predicate::str::contains("share-value"))
+        .stderr(predicate::str::contains("Processed a total of 1 messages"));
+
     // groups, configs, offsets
     let runtime = tokio::runtime::Runtime::new().expect("Share consumer runtime");
     let share_consumer = runtime

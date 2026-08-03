@@ -75,6 +75,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-topics" => Some("topics"),
         "kafka-console-producer" => Some("produce"),
         "kafka-console-consumer" => Some("consume"),
+        "kafka-console-share-consumer" => Some("share-consume"),
         "kafka-consumer-groups" => Some("groups"),
         "kafka-groups" => Some("all-groups"),
         "kafka-share-groups" => Some("share-groups"),
@@ -106,6 +107,7 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
     let deprecated_configs: &[&str] = match command {
         "produce" => &["--producer.config"],
         "consume" => &["--consumer.config"],
+        "share-consume" => &["--consumer-config"],
         "leader-election" => &["--admin.config"],
         "cluster" => &["--config"],
         _ => &[],
@@ -294,6 +296,8 @@ pub enum Command {
     Produce(ProduceArgs),
     /// Consume records to stdout.
     Consume(ConsumeArgs),
+    /// Consume records through a Kafka Share group.
+    ShareConsume(ShareConsumeArgs),
     /// Inspect and manage consumer groups.
     Groups(GroupsArgs),
     /// List groups of every Kafka group type.
@@ -849,6 +853,82 @@ pub struct ConsumeArgs {
 }
 
 impl ConsumeArgs {
+    pub(crate) fn formatter_properties(&self) -> &[String] {
+        if self.formatter_properties.is_empty() {
+            &self.deprecated_formatter_properties
+        } else {
+            &self.formatter_properties
+        }
+    }
+
+    pub(crate) fn properties(&self) -> &[String] {
+        if self.properties.is_empty() {
+            &self.deprecated_properties
+        } else {
+            &self.properties
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka console share consumer exposes independent acknowledgement and formatting flags"
+)]
+pub struct ShareConsumeArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long)]
+    pub group: Option<String>,
+    /// Acknowledge every successfully formatted record as rejected.
+    #[arg(long, conflicts_with = "release")]
+    pub reject: bool,
+    /// Release every successfully formatted record for redelivery.
+    #[arg(long, conflicts_with = "reject")]
+    pub release: bool,
+    /// Reject a record when formatting it fails instead of stopping.
+    #[arg(long)]
+    pub reject_message_on_error: bool,
+    #[arg(long, allow_negative_numbers = true)]
+    pub max_messages: Option<i32>,
+    /// Exit successfully after this many milliseconds without a record.
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_consumer_timeout)]
+    pub timeout_ms: Option<u64>,
+    /// Kafka formatter class; only the built-in `DefaultMessageFormatter` is available natively.
+    #[arg(
+        long,
+        default_value = "org.apache.kafka.tools.consumer.DefaultMessageFormatter"
+    )]
+    pub formatter: String,
+    #[arg(long)]
+    pub key_deserializer: Option<String>,
+    #[arg(long)]
+    pub value_deserializer: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub print_key: bool,
+    #[arg(long, default_value = "\t")]
+    pub key_separator: String,
+    #[arg(
+        long = "formatter-property",
+        conflicts_with = "deprecated_formatter_properties"
+    )]
+    pub formatter_properties: Vec<String>,
+    #[arg(long = "property", conflicts_with = "formatter_properties")]
+    pub deprecated_formatter_properties: Vec<String>,
+    #[arg(long)]
+    pub formatter_config: Option<PathBuf>,
+    #[arg(long = "command-property", conflicts_with = "deprecated_properties")]
+    pub properties: Vec<String>,
+    #[arg(long = "consumer-property", conflicts_with = "properties")]
+    pub deprecated_properties: Vec<String>,
+    /// Emit the original tool's shutdown lifecycle marker.
+    #[arg(long)]
+    pub enable_systest_events: bool,
+}
+
+impl ShareConsumeArgs {
     pub(crate) fn formatter_properties(&self) -> &[String] {
         if self.formatter_properties.is_empty() {
             &self.deprecated_formatter_properties
@@ -1760,6 +1840,7 @@ mod tests {
         for (command, deprecated, expected) in [
             ("produce", "--producer.config", "--command-config"),
             ("consume", "--consumer.config", "--command-config"),
+            ("share-consume", "--consumer-config", "--command-config"),
             ("leader-election", "--admin.config", "--command-config"),
             (
                 "cluster",
@@ -1784,6 +1865,7 @@ mod tests {
         for (command, deprecated) in [
             ("produce", "--producer.config"),
             ("consume", "--consumer.config"),
+            ("share-consume", "--consumer-config"),
         ] {
             let mut arguments = vec![
                 OsString::from("kafka-compatible"),
@@ -1889,6 +1971,52 @@ mod tests {
         assert_eq!(
             (consumer.max_messages, consumer.timeout_ms),
             (Some(-1), Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn share_consumer_should_parse_original_acknowledgement_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "share-consume",
+            "--topic",
+            "events",
+            "--group",
+            "workers",
+            "--release",
+            "--reject-message-on-error",
+            "--max-messages",
+            "-1",
+            "--timeout-ms",
+            "-1",
+            "--formatter-property",
+            "print.delivery=true",
+        ])
+        .expect("Kafka console share consumer options");
+        let Command::ShareConsume(consumer) = cli.command else {
+            panic!("expected share-consume command");
+        };
+
+        assert_eq!(consumer.group.as_deref(), Some("workers"));
+        assert!(consumer.release);
+        assert!(!consumer.reject);
+        assert!(consumer.reject_message_on_error);
+        assert_eq!(consumer.max_messages, Some(-1));
+        assert_eq!(consumer.timeout_ms, Some(u64::MAX));
+    }
+
+    #[test]
+    fn share_consumer_should_reject_conflicting_acknowledgements() {
+        assert!(
+            Cli::try_parse_from([
+                "kafka",
+                "share-consume",
+                "--topic",
+                "events",
+                "--reject",
+                "--release",
+            ])
+            .is_err()
         );
     }
 

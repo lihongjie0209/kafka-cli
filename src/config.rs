@@ -54,7 +54,7 @@ pub async fn protocol_admin(
     Ok(builder.build().await?)
 }
 
-fn protocol_auth(values: &HashMap<String, String>) -> Result<Option<AuthConfig>> {
+pub(crate) fn protocol_auth(values: &HashMap<String, String>) -> Result<Option<AuthConfig>> {
     let security = values
         .get("security.protocol")
         .map_or("PLAINTEXT", String::as_str)
