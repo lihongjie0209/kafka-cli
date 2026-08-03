@@ -680,6 +680,9 @@ pub enum ElectionType {
 
 #[derive(Debug, Args)]
 pub struct LogDirsArgs {
+    /// Kafka-compatible action flag; log-dirs has only one action.
+    #[arg(long)]
+    pub describe: bool,
     #[arg(long)]
     pub broker_list: Option<String>,
     #[arg(long)]

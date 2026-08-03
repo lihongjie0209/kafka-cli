@@ -77,3 +77,19 @@ fn kafka_cluster_alias_should_accept_original_cluster_id_command() {
         .success()
         .stdout(predicate::str::contains("Usage:"));
 }
+
+#[cfg(unix)]
+#[test]
+fn kafka_log_dirs_alias_should_accept_original_describe_flag() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-log-dirs.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create kafka-log-dirs alias");
+
+    Command::new(alias)
+        .args(["--describe", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--describe"));
+}

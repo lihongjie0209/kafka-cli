@@ -1458,7 +1458,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("leader.replication.throttled.rate")
     );
-    assert!(success(&bootstrap, &["log-dirs"]).contains("integration-events"));
+    assert!(success(&bootstrap, &["log-dirs", "--describe"]).contains("integration-events"));
     assert!(success(&bootstrap, &["api-versions"]).contains("ApiVersions"));
     let api_versions: serde_json::Value =
         serde_json::from_str(&success(&bootstrap, &["--output", "json", "api-versions"]))
