@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `ddd0c11c4cae750d4cd57187213f672134cd3960`。
+- 本项目基准：`master`，提交 `223e7452061bbbe6ce3e6c56a74a88ea96f0a354`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -260,8 +260,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前实现基准 `ddd0c11` 已由 GitHub Actions 运行
-[`30839932685`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30839932685) 完整验证通过：fmt/Clippy/122 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。GetOffsetShell 的 client ID、Java 列表拆分、未知 offset 和 librdkafka 分层存储 OffsetSpec 能力边界均纳入回归；此前 topics、console 与配置闭环持续通过。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
+当前实现基准 `223e745` 已由 GitHub Actions 运行
+[`30840922262`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30840922262) 完整验证通过：fmt/Clippy/123 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl。GetOffsetShell 的 client ID、Java 列表拆分、未知 offset 和 librdkafka 分层存储 OffsetSpec 能力边界均纳入回归；console consumer 还实际验证了由 librdkafka POSIX ERE 接受、Rust regex 拒绝的订阅量词。两种 musl artifact 均执行 `--version`/`--help`，ARM64 通过 QEMU user-mode emulator 启动。CI Actions 使用 Node.js 24 主版本；Zig 0.15.2 从官方 release index 获取并校验 SHA-256。该运行的六个 job 全部成功。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
