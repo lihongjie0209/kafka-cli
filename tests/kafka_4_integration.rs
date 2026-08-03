@@ -164,6 +164,32 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "brokers",
+            "--entity-default",
+            "--add-config",
+            "message.max.bytes=1048588",
+            "--execute",
+        ],
+    );
+    assert!(
+        success(
+            &bootstrap,
+            &[
+                "configs",
+                "describe",
+                "--entity-type",
+                "brokers",
+                "--entity-default",
+            ],
+        )
+        .contains("message.max.bytes")
+    );
     let described_topic: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
@@ -510,6 +536,19 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--topic",
             "integration-events",
             "--to-earliest",
+            "--execute",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "brokers",
+            "--entity-default",
+            "--delete-config",
+            "message.max.bytes",
             "--execute",
         ],
     );

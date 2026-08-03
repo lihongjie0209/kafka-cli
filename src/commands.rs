@@ -2399,7 +2399,10 @@ async fn configs(
             }
             let (entity_type, entity_name) =
                 single_resource_entity(&entity_type, &entity_name, entity_default, false)?;
-            if protocol_config_resource_type(entity_type).is_some() {
+            if protocol_config_resource_type(entity_type).is_some()
+                && (!matches!(entity_type, ConfigEntityType::Broker)
+                    || entity_name.as_deref() == Some(""))
+            {
                 return describe_protocol_configs(
                     bootstrap,
                     command_config,
@@ -2470,7 +2473,10 @@ async fn configs(
             if !execute {
                 return config_change_preview(format, &pairs, &delete);
             }
-            if protocol_config_resource_type(entity_type).is_some() {
+            if protocol_config_resource_type(entity_type).is_some()
+                && (!matches!(entity_type, ConfigEntityType::Broker)
+                    || entity_name.as_deref() == Some(""))
+            {
                 return alter_protocol_config(
                     bootstrap,
                     command_config,
@@ -2586,9 +2592,11 @@ fn single_resource_entity(
         ));
     }
     if entity_default {
-        return Err(Error::Unsupported(
-            "default resource entities are not exposed by the current librdkafka ConfigResource API"
-                .into(),
+        if matches!(types[0], ConfigEntityType::Broker) {
+            return Ok((types[0], Some(String::new())));
+        }
+        return Err(Error::Usage(
+            "--entity-default is only valid for quota entities and brokers".into(),
         ));
     }
     if names.len() > 1 || (require_name && names.len() != 1) {
@@ -2859,6 +2867,7 @@ const fn protocol_config_resource_type(
     kind: ConfigEntityType,
 ) -> Option<ProtocolConfigResourceType> {
     match kind {
+        ConfigEntityType::Broker => Some(ProtocolConfigResourceType::Broker),
         ConfigEntityType::BrokerLogger => Some(ProtocolConfigResourceType::BrokerLogger),
         ConfigEntityType::ClientMetrics => Some(ProtocolConfigResourceType::ClientMetrics),
         _ => None,
@@ -2871,7 +2880,9 @@ async fn protocol_config_broker(
     name: &str,
 ) -> Result<(i32, String)> {
     let cluster = client.describe_cluster().await?;
-    let broker_id = if matches!(kind, ConfigEntityType::BrokerLogger) {
+    let broker_id = if matches!(kind, ConfigEntityType::BrokerLogger)
+        || (matches!(kind, ConfigEntityType::Broker) && !name.is_empty())
+    {
         name.parse::<i32>()
             .map_err(|_| Error::Usage("broker-logger entity name must be a broker ID".into()))?
     } else {
@@ -2901,6 +2912,14 @@ async fn describe_protocol_configs(
         vec![name]
     } else if matches!(kind, ConfigEntityType::ClientMetrics) {
         client.list_client_metrics_resources().await?
+    } else if matches!(kind, ConfigEntityType::Broker) {
+        client
+            .describe_cluster()
+            .await?
+            .brokers
+            .into_iter()
+            .map(|broker| broker.broker_id.to_string())
+            .collect()
     } else {
         return Err(Error::Usage(
             "broker-logger describe requires --entity-name".into(),
