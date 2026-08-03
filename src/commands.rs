@@ -724,9 +724,9 @@ async fn consume(
     _timeout: Duration,
     args: crate::cli::ConsumeArgs,
 ) -> Result<()> {
-    apply_client_properties(&mut config, &args.properties)?;
     config.set("group.id", args.group.as_deref().unwrap_or("kafka-cli"));
     config.set("enable.auto.commit", "true");
+    config.set("isolation.level", &args.isolation_level);
     config.set(
         "auto.offset.reset",
         if args.from_beginning {
@@ -735,17 +735,39 @@ async fn consume(
             "latest"
         },
     );
+    apply_client_properties(&mut config, &args.properties)?;
     let consumer: StreamConsumer = config.create()?;
     if let Some(partition) = args.partition {
+        let topic = args
+            .topic
+            .as_deref()
+            .ok_or_else(|| Error::Usage("--topic is required with --partition".into()))?;
         let mut assignment = TopicPartitionList::new();
         assignment.add_partition_offset(
-            &args.topic,
+            topic,
             partition,
-            args.offset.map_or(Offset::Beginning, Offset::Offset),
+            args.offset.map_or_else(
+                || {
+                    if args.from_beginning {
+                        Offset::Beginning
+                    } else {
+                        Offset::End
+                    }
+                },
+                Offset::Offset,
+            ),
         )?;
         consumer.assign(&assignment)?;
+    } else if let Some(include) = args.include.as_deref() {
+        Regex::new(include)
+            .map_err(|error| Error::Usage(format!("invalid topic regular expression: {error}")))?;
+        let pattern = format!("^({include})$");
+        consumer.subscribe(&[&pattern])?;
     } else {
-        consumer.subscribe(&[&args.topic])?;
+        consumer.subscribe(&[args
+            .topic
+            .as_deref()
+            .expect("clap requires topic or include")])?;
     }
 
     let mut stream = consumer.stream();
@@ -753,9 +775,16 @@ async fn consume(
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            message = stream.next() => {
-                let Some(message) = message else { break };
-                let message = message?;
+            message = next_consumer_message(&mut stream, args.timeout_ms) => {
+                let Some(message) = message? else { break };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(error) if args.skip_message_on_error => {
+                        eprintln!("skipping consumer error: {error}");
+                        continue;
+                    }
+                    Err(error) => return Err(Error::Kafka(error)),
+                };
                 if args.json {
                     let record = ConsumedRecord {
                         topic: message.topic(),
@@ -779,6 +808,28 @@ async fn consume(
         }
     }
     Ok(())
+}
+
+async fn next_consumer_message<'a>(
+    stream: &mut (
+             impl futures::Stream<
+        Item = std::result::Result<
+            rdkafka::message::BorrowedMessage<'a>,
+            rdkafka::error::KafkaError,
+        >,
+    > + Unpin
+         ),
+    timeout_ms: Option<u64>,
+) -> Result<
+    Option<std::result::Result<rdkafka::message::BorrowedMessage<'a>, rdkafka::error::KafkaError>>,
+> {
+    if let Some(timeout_ms) = timeout_ms {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), stream.next())
+            .await
+            .map_or_else(|_| Ok(None), Ok)
+    } else {
+        Ok(stream.next().await)
+    }
 }
 
 fn collect_headers(headers: Option<&BorrowedHeaders>) -> BTreeMap<String, Option<String>> {

@@ -277,9 +277,16 @@ pub struct ProduceArgs {
 }
 
 #[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka console consumer exposes independent formatting and error policy flags"
+)]
 pub struct ConsumeArgs {
-    #[arg(long)]
-    pub topic: String,
+    #[arg(long, required_unless_present = "include", conflicts_with = "include")]
+    pub topic: Option<String>,
+    /// Full-match librdkafka regular expression selecting topics.
+    #[arg(long, conflicts_with_all = ["topic", "partition", "offset"])]
+    pub include: Option<String>,
     #[arg(long)]
     pub group: Option<String>,
     #[arg(long)]
@@ -290,6 +297,14 @@ pub struct ConsumeArgs {
     pub from_beginning: bool,
     #[arg(long)]
     pub max_messages: Option<u64>,
+    /// Exit successfully after this many milliseconds without a message.
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
+    #[arg(long, value_parser = ["read_uncommitted", "read_committed"], default_value = "read_uncommitted")]
+    pub isolation_level: String,
+    /// Continue after a Kafka message/poll error.
+    #[arg(long)]
+    pub skip_message_on_error: bool,
     #[arg(long)]
     pub json: bool,
     #[arg(long)]
@@ -691,6 +706,17 @@ mod tests {
 
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");
     parses_command_family!(consume_family_parses, "consume", "--topic", "events");
+    parses_command_family!(
+        consume_include_parses,
+        "consume",
+        "--include",
+        "events-.*",
+        "--timeout-ms",
+        "1000",
+        "--isolation-level",
+        "read_committed",
+        "--skip-message-on-error"
+    );
     parses_command_family!(groups_family_parses, "groups", "list");
     parses_command_family!(
         groups_reset_from_file_parses,

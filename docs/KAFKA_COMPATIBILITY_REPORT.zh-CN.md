@@ -31,7 +31,7 @@
 |---|---|---|---|
 | `kafka-topics.sh` | `kafka topics` | 已支持 | list、describe、create、alter、delete |
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 行输入、sync/async、key、JSON、headers、partition 及主要 producer 调优参数；未复刻可插拔 reader |
-| `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/group/partition/offset/from-beginning/max-messages；未复刻 formatter/deserializer 全部选项 |
+| `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation；未复刻 Java formatter/deserializer |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group，以及 librdkafka SCRAM user credential；缺少其他 entity type |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
@@ -90,9 +90,9 @@
 
 ### 4.3 Console Consumer
 
-已支持：topic、group、partition、offset、from-beginning、max-messages、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`。
+已支持：topic 或整串 `--include` 正则、group、partition、offset、from-beginning、max-messages、`--timeout-ms` 空闲退出、read_committed/read_uncommitted isolation level、skip-message-on-error、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`。include 使用 librdkafka 的动态正则订阅（语法以 librdkafka/POSIX 能力为准）；isolation level 映射到 librdkafka，command-property 保持最高优先级。手工 partition 未指定 offset 时现在与原版一致默认为 latest，而不是 beginning。
 
-缺少：include 正则、timeout-ms、isolation-level 专用 flag、formatter/formatter-config/formatter-property、key/value deserializer、skip-message-on-error、systest events。部分底层 consumer 配置可通过 `--command-property` 传入，但 Java formatter/deserializer 插件不能直接复用。
+缺少：formatter/formatter-config/formatter-property、key/value deserializer 和 systest events。这些选项依赖 Java 类加载或 Kafka 测试工具协议，不能由 librdkafka直接复用；其他底层 consumer 配置可通过 `--command-property` 传入。
 
 ### 4.4 Consumer Groups
 
@@ -274,3 +274,4 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Leader Election JSON 批量目标 | 新增原版 `--path-to-json-file` 格式，校验空列表、非法/重复 partition；librdkafka `ElectLeaders` FFI 从单目标扩展为 partition list，预览改为统一结构化输出 | Clippy、54 个普通测试、bundled Kafka 4.3.1 单目标/批量目标集成测试通过 |
 | 2026-08-03 | Consumer Group reset CSV | 新增原版 `--export`/`--from-file` 无表头 CSV；支持单 group 三列与多 group 四列格式、CSV 转义、重复/选择范围校验和 offset 边界调整，执行复用 librdkafka `AlterConsumerGroupOffsets` | Clippy、55 个普通测试、bundled Kafka 4.3.1 export→import→execute 集成闭环通过 |
 | 2026-08-03 | Console Producer 主要参数 | 新增 sync/默认 async 发送模式，并将 batch、retries/backoff、linger、request timeout、metadata expiry、buffer memory、socket buffer 等原版参数映射到 librdkafka；补充原版 acks/compression 参数名 | Clippy、56 个普通测试、bundled Kafka 4.3.1 sync 调优参数与默认 async 发送/消费闭环通过 |
+| 2026-08-03 | Console Consumer librdkafka 选项 | 新增 include 正则订阅、空闲 timeout、isolation level 和 skip-message-on-error；修正手工 partition 无 offset 时默认为 latest，command-property 保持最高优先级 | Clippy、57 个普通测试、bundled Kafka 4.3.1 include/read_committed/timeout 参数消费闭环通过 |

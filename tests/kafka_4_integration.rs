@@ -325,6 +325,28 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "consume",
+            "--include",
+            "integration-json",
+            "--from-beginning",
+            "--max-messages",
+            "2",
+            "--timeout-ms",
+            "10000",
+            "--isolation-level",
+            "read_committed",
+            "--skip-message-on-error",
+            "--group",
+            "integration-regex",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("second"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "produce",
             "--topic",
             "integration-events",
