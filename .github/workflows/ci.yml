@@ -77,6 +77,21 @@ jobs:
       - run: cargo zigbuild --release --locked --target ${{ matrix.target }} --features bundled
       - name: Verify static musl binary
         run: file target/${{ matrix.target }}/release/kafka | tee binary-type.txt
+      - name: Install ARM64 user-mode emulator
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Smoke test musl binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/kafka"
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            runner=(qemu-aarch64-static "$binary")
+          else
+            runner=("$binary")
+          fi
+          "${runner[@]}" --version | grep --fixed-strings "kafka 0.1.0"
+          "${runner[@]}" --help >/dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: kafka-${{ matrix.target }}
