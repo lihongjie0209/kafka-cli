@@ -442,7 +442,7 @@ pub struct ConfigsArgs {
     pub action: ConfigAction,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum ConfigEntityType {
     #[value(name = "topics", alias = "topic")]
     Topic,
@@ -452,24 +452,32 @@ pub enum ConfigEntityType {
     Group,
     #[value(name = "users", alias = "user")]
     User,
+    #[value(name = "clients", alias = "client")]
+    Client,
+    #[value(name = "ips", alias = "ip")]
+    Ip,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigAction {
     Describe {
-        #[arg(long, value_enum)]
-        entity_type: ConfigEntityType,
+        #[arg(long, value_enum, required = true)]
+        entity_type: Vec<ConfigEntityType>,
         #[arg(long)]
-        entity_name: Option<String>,
+        entity_name: Vec<String>,
+        #[arg(long, conflicts_with = "entity_name")]
+        entity_default: bool,
         /// Include inherited/static/default configurations, not only dynamic overrides.
         #[arg(long)]
         all: bool,
     },
     Alter {
-        #[arg(long, value_enum)]
-        entity_type: ConfigEntityType,
+        #[arg(long, value_enum, required = true)]
+        entity_type: Vec<ConfigEntityType>,
         #[arg(long)]
-        entity_name: String,
+        entity_name: Vec<String>,
+        #[arg(long, conflicts_with = "entity_name")]
+        entity_default: bool,
         #[arg(long = "add-config")]
         add: Vec<String>,
         #[arg(long = "add-config-file", conflicts_with = "add")]
@@ -812,6 +820,21 @@ mod tests {
     );
     parses_command_family!(acls_family_parses, "acls", "list");
     parses_command_family!(reassign_family_parses, "reassign", "list");
+    parses_command_family!(
+        configs_user_client_quota_parses,
+        "configs",
+        "alter",
+        "--entity-type",
+        "users",
+        "--entity-type",
+        "clients",
+        "--entity-name",
+        "alice",
+        "--entity-name",
+        "billing",
+        "--add-config",
+        "request_percentage=25"
+    );
     parses_command_family!(
         delete_records_family_parses,
         "delete-records",

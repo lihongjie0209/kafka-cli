@@ -89,7 +89,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Groups(args) => {
             groups(&client_config, timeout, format, args.action, verbose).await
         }
-        Command::Configs(args) => configs(&client_config, timeout, format, args.action).await,
+        Command::Configs(args) => {
+            configs(
+                &client_config,
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                format,
+                args.action,
+            )
+            .await
+        }
         Command::Offsets(args) => offsets(&client_config, timeout, format, &args),
         Command::DeleteRecords(args) => {
             delete_records(
@@ -2354,6 +2364,8 @@ fn shifted_offset(
 
 async fn configs(
     config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
     timeout: Duration,
     format: OutputFormat,
     action: ConfigAction,
@@ -2362,16 +2374,30 @@ async fn configs(
         ConfigAction::Describe {
             entity_type,
             entity_name,
+            entity_default,
             all,
         } => {
-            if matches!(entity_type, ConfigEntityType::User) {
-                return describe_user_scram(config, timeout, format, entity_name);
+            if quota_entity_types(&entity_type) {
+                return describe_quota_configs(
+                    config,
+                    bootstrap,
+                    command_config,
+                    timeout,
+                    format,
+                    &entity_type,
+                    &entity_name,
+                    entity_default,
+                )
+                .await;
             }
+            let (entity_type, entity_name) =
+                single_resource_entity(&entity_type, &entity_name, entity_default, false)?;
             describe_resource_configs(config, timeout, format, entity_type, entity_name, all).await
         }
         ConfigAction::Alter {
             entity_type,
             entity_name,
+            entity_default,
             add,
             add_file,
             delete,
@@ -2391,12 +2417,32 @@ async fn configs(
                     "provide --add-config, --add-config-file, or --delete-config".into(),
                 ));
             }
+            validate_quota_change_names(&entity_type, &pairs, &delete)?;
+            if quota_entity_types(&entity_type) && !only_scram_changes(&pairs, &delete) {
+                return alter_quota_configs(
+                    bootstrap,
+                    command_config,
+                    timeout,
+                    format,
+                    &entity_type,
+                    &entity_name,
+                    entity_default,
+                    &pairs,
+                    &delete,
+                    execute,
+                )
+                .await;
+            }
+            let (entity_type, entity_name) =
+                single_resource_entity(&entity_type, &entity_name, entity_default, true)?;
             if matches!(entity_type, ConfigEntityType::User) {
                 return alter_user_scram(
                     config,
                     timeout,
                     format,
-                    &entity_name,
+                    entity_name.as_deref().ok_or_else(|| {
+                        Error::Usage("SCRAM alteration requires --entity-name".into())
+                    })?,
                     &pairs,
                     &delete,
                     execute,
@@ -2409,12 +2455,369 @@ async fn configs(
             crate::ffi::incremental_alter_config(
                 admin.inner().native_ptr(),
                 native_resource_type(entity_type),
-                &entity_name,
+                entity_name.as_deref().ok_or_else(|| {
+                    Error::Usage("resource alteration requires --entity-name".into())
+                })?,
                 &pairs,
                 &delete,
                 duration_ms(timeout)?,
             )
         }
+    }
+}
+
+fn quota_entity_types(types: &[ConfigEntityType]) -> bool {
+    !types.is_empty()
+        && types.iter().all(|kind| {
+            matches!(
+                kind,
+                ConfigEntityType::User | ConfigEntityType::Client | ConfigEntityType::Ip
+            )
+        })
+}
+
+fn only_scram_changes(add: &[(String, String)], delete: &[String]) -> bool {
+    add.iter()
+        .map(|(key, _)| key)
+        .chain(delete)
+        .all(|key| key.to_ascii_uppercase().starts_with("SCRAM-SHA-"))
+}
+
+fn validate_quota_change_names(
+    types: &[ConfigEntityType],
+    add: &[(String, String)],
+    delete: &[String],
+) -> Result<()> {
+    if !quota_entity_types(types) {
+        return Ok(());
+    }
+    let keys = add.iter().map(|(key, _)| key).chain(delete);
+    let mut scram = Vec::new();
+    let mut quota = Vec::new();
+    let mut unknown = Vec::new();
+    for key in keys {
+        if key.to_ascii_uppercase().starts_with("SCRAM-SHA-") {
+            scram.push(key.as_str());
+        } else if matches!(
+            key.as_str(),
+            "producer_byte_rate"
+                | "consumer_byte_rate"
+                | "request_percentage"
+                | "controller_mutation_rate"
+                | "connection_creation_rate"
+        ) {
+            quota.push(key.as_str());
+        } else {
+            unknown.push(key.as_str());
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(Error::Usage(format!(
+            "unexpected quota config name(s): {}",
+            unknown.join(",")
+        )));
+    }
+    if types.contains(&ConfigEntityType::Ip)
+        && quota.iter().any(|key| *key != "connection_creation_rate")
+    {
+        return Err(Error::Usage(
+            "IP entities only support connection_creation_rate".into(),
+        ));
+    }
+    if !types.contains(&ConfigEntityType::Ip) && quota.contains(&"connection_creation_rate") {
+        return Err(Error::Usage(
+            "connection_creation_rate is only valid for IP entities".into(),
+        ));
+    }
+    if (!scram.is_empty() && types != [ConfigEntityType::User])
+        || (!scram.is_empty() && !quota.is_empty())
+    {
+        return Err(Error::Usage(
+            "SCRAM credentials require a single named user and cannot be altered with quota configs"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn single_resource_entity(
+    types: &[ConfigEntityType],
+    names: &[String],
+    entity_default: bool,
+    require_name: bool,
+) -> Result<(ConfigEntityType, Option<String>)> {
+    if types.len() != 1 {
+        return Err(Error::Usage(
+            "multiple --entity-type values are only valid for user/client quota entities".into(),
+        ));
+    }
+    if entity_default {
+        return Err(Error::Unsupported(
+            "default resource entities are not exposed by the current librdkafka ConfigResource API"
+                .into(),
+        ));
+    }
+    if names.len() > 1 || (require_name && names.len() != 1) {
+        return Err(Error::Usage(
+            "specify exactly one --entity-name for this resource type".into(),
+        ));
+    }
+    Ok((types[0], names.first().cloned()))
+}
+
+const fn quota_entity_name(kind: ConfigEntityType) -> Option<&'static str> {
+    match kind {
+        ConfigEntityType::User => Some("user"),
+        ConfigEntityType::Client => Some("client-id"),
+        ConfigEntityType::Ip => Some("ip"),
+        _ => None,
+    }
+}
+
+fn quota_entities<'a>(
+    types: &'a [ConfigEntityType],
+    names: &'a [String],
+    entity_default: bool,
+    require_names: bool,
+) -> Result<Vec<(&'static str, Option<&'a str>)>> {
+    if !quota_entity_types(types) {
+        return Err(Error::Usage(
+            "quota entities must be users, clients, or ips".into(),
+        ));
+    }
+    if types.iter().copied().collect::<BTreeSet<_>>().len() != types.len() {
+        return Err(Error::Usage("duplicate --entity-type values".into()));
+    }
+    if entity_default {
+        if types.len() != 1 || !names.is_empty() {
+            return Err(Error::Usage(
+                "--entity-default requires exactly one entity type and no entity name".into(),
+            ));
+        }
+        return Ok(vec![(
+            quota_entity_name(types[0]).ok_or_else(|| Error::Usage("invalid quota type".into()))?,
+            None,
+        )]);
+    }
+    if require_names && names.len() != types.len() {
+        return Err(Error::Usage(
+            "exactly one --entity-name is required for every --entity-type".into(),
+        ));
+    }
+    if !names.is_empty() && names.len() != types.len() {
+        return Err(Error::Usage(
+            "exactly one --entity-name must be specified for every --entity-type".into(),
+        ));
+    }
+    types
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            Ok((
+                quota_entity_name(*kind)
+                    .ok_or_else(|| Error::Usage("invalid quota type".into()))?,
+                names.get(index).map(String::as_str),
+            ))
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+struct QuotaConfigRow {
+    entity: String,
+    config_type: String,
+    name: String,
+    value: String,
+}
+
+fn quota_entity_label(components: &[krafka::admin::QuotaEntityComponent]) -> String {
+    let mut values = components
+        .iter()
+        .map(|component| {
+            format!(
+                "{}={}",
+                component.entity_type,
+                component.entity_name.as_deref().unwrap_or("<default>")
+            )
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values.join(",")
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "arguments mirror Kafka's quota entity filter and shared command context"
+)]
+async fn describe_quota_configs(
+    config: &rdkafka::ClientConfig,
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    types: &[ConfigEntityType],
+    names: &[String],
+    entity_default: bool,
+) -> Result<()> {
+    let entities = quota_entities(types, names, entity_default, false)?;
+    let components = entities
+        .iter()
+        .map(|(kind, name)| {
+            (
+                *kind,
+                if entity_default {
+                    1
+                } else if name.is_some() {
+                    0
+                } else {
+                    2
+                },
+                *name,
+            )
+        })
+        .collect::<Vec<_>>();
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let result = client.describe_client_quotas(&components, true).await?;
+    drop(client);
+    if let Some(error) = result.error {
+        return Err(Error::Config(error));
+    }
+    let mut rows = result
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            let entity = quota_entity_label(&entry.entity);
+            entry.values.iter().map(move |value| QuotaConfigRow {
+                entity: entity.clone(),
+                config_type: "quota".into(),
+                name: value.key.clone(),
+                value: value.value.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if types == [ConfigEntityType::User] && !entity_default {
+        let admin = admin(config)?;
+        let users = names.first().cloned().into_iter().collect::<Vec<_>>();
+        rows.extend(
+            ffi::describe_user_scram_credentials(
+                admin.inner().native_ptr(),
+                &users,
+                duration_ms(timeout)?,
+            )?
+            .into_iter()
+            .map(|credential| QuotaConfigRow {
+                entity: format!("user={}", credential.user),
+                config_type: "scram".into(),
+                name: scram_mechanism_name(credential.mechanism).into(),
+                value: credential.iterations.to_string(),
+            }),
+        );
+    }
+    output::write_value(format, "configs.describe-quota", &rows, |rows| {
+        output::table(
+            ["ENTITY", "CONFIG_TYPE", "NAME", "VALUE"],
+            rows.iter().map(|row| {
+                [
+                    row.entity.clone(),
+                    row.config_type.clone(),
+                    row.name.clone(),
+                    row.value.clone(),
+                ]
+            }),
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "arguments mirror Kafka's quota alteration contract and shared command context"
+)]
+async fn alter_quota_configs(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    format: OutputFormat,
+    types: &[ConfigEntityType],
+    names: &[String],
+    entity_default: bool,
+    add: &[(String, String)],
+    delete: &[String],
+    execute: bool,
+) -> Result<()> {
+    let entities = quota_entities(types, names, entity_default, true)?;
+    let parsed = add
+        .iter()
+        .map(|(key, value)| {
+            let value = value.parse::<f64>().map_err(|_| {
+                Error::Usage(format!(
+                    "cannot parse quota configuration value for {key}: {value}"
+                ))
+            })?;
+            if !value.is_finite() {
+                return Err(Error::Usage(format!(
+                    "quota value for {key} must be finite"
+                )));
+            }
+            Ok((key.as_str(), Some(value)))
+        })
+        .chain(delete.iter().map(|key| Ok((key.as_str(), None))))
+        .collect::<Result<Vec<_>>>()?;
+    if !execute {
+        return config_change_preview(format, add, delete);
+    }
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+    let filters = entities
+        .iter()
+        .map(|(kind, name)| (*kind, i8::from(name.is_none()), *name))
+        .collect::<Vec<_>>();
+    let existing = client.describe_client_quotas(&filters, true).await?;
+    if let Some(error) = existing.error {
+        return Err(Error::Config(error));
+    }
+    let existing_keys = existing
+        .entries
+        .iter()
+        .flat_map(|entry| entry.values.iter().map(|value| value.key.as_str()))
+        .collect::<BTreeSet<_>>();
+    let missing = delete
+        .iter()
+        .filter(|key| !existing_keys.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Error::Config(format!(
+            "invalid quota config(s): {}",
+            missing.join(",")
+        )));
+    }
+    let alteration = krafka::admin::QuotaAlteration {
+        entity: entities,
+        ops: parsed,
+    };
+    let results = client.alter_client_quotas(&[alteration], false).await?;
+    drop(client);
+    let rows = results
+        .iter()
+        .map(|result| MutationRow {
+            resource: quota_entity_label(&result.entity),
+            status: if result.error.is_some() {
+                "FAILED"
+            } else {
+                "ALTERED"
+            }
+            .into(),
+            error: result.error.clone(),
+        })
+        .collect::<Vec<_>>();
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_mutation_rows(format, "configs.alter-quota", &rows)?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(Error::Partial {
+            failed: failures,
+            total: rows.len(),
+        })
     }
 }
 
@@ -2451,33 +2854,6 @@ fn config_change_preview(
                     row.operation.to_owned(),
                     row.name.to_owned(),
                     row.value.unwrap_or("-").to_owned(),
-                ]
-            }),
-        )
-    })
-}
-
-fn describe_user_scram(
-    config: &rdkafka::ClientConfig,
-    timeout: Duration,
-    format: OutputFormat,
-    user: Option<String>,
-) -> Result<()> {
-    let client = admin(config)?;
-    let users = user.into_iter().collect::<Vec<_>>();
-    let rows = ffi::describe_user_scram_credentials(
-        client.inner().native_ptr(),
-        &users,
-        duration_ms(timeout)?,
-    )?;
-    output::write_value(format, "configs.describe-user", &rows, |rows| {
-        output::table(
-            ["USER", "MECHANISM", "ITERATIONS"],
-            rows.iter().map(|row| {
-                [
-                    row.user.clone(),
-                    scram_mechanism_name(row.mechanism).to_owned(),
-                    row.iterations.to_string(),
                 ]
             }),
         )
@@ -2596,6 +2972,9 @@ fn config_entity_names(
         ConfigEntityType::User => Err(Error::Usage(
             "SCRAM users must use the credential Admin API".into(),
         )),
+        ConfigEntityType::Client | ConfigEntityType::Ip => Err(Error::Usage(
+            "client and IP entities must use the quota Admin API".into(),
+        )),
     }
 }
 
@@ -2605,6 +2984,8 @@ const fn config_entity_type_name(kind: ConfigEntityType) -> &'static str {
         ConfigEntityType::Broker => "brokers",
         ConfigEntityType::Group => "groups",
         ConfigEntityType::User => "users",
+        ConfigEntityType::Client => "clients",
+        ConfigEntityType::Ip => "ips",
     }
 }
 
@@ -2679,6 +3060,9 @@ const fn native_resource_type(kind: ConfigEntityType) -> rdkafka_sys::rd_kafka_R
         ConfigEntityType::Broker => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
         ConfigEntityType::Group => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_GROUP,
         ConfigEntityType::User => rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_UNKNOWN,
+        ConfigEntityType::Client | ConfigEntityType::Ip => {
+            rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_UNKNOWN
+        }
     }
 }
 
@@ -2693,6 +3077,11 @@ fn resource(kind: ConfigEntityType, name: &str) -> Result<ResourceSpecifier<'_>>
         ConfigEntityType::User => {
             return Err(Error::Config(
                 "user configuration must use the SCRAM Admin API".into(),
+            ));
+        }
+        ConfigEntityType::Client | ConfigEntityType::Ip => {
+            return Err(Error::Config(
+                "client and IP configuration must use the quota Admin API".into(),
             ));
         }
     })
@@ -5073,6 +5462,32 @@ mod tests {
             ),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn quota_entities_should_pair_user_and_client_names() {
+        let names = ["alice".to_owned(), "billing".to_owned()];
+        let entities = quota_entities(
+            &[ConfigEntityType::User, ConfigEntityType::Client],
+            &names,
+            false,
+            true,
+        )
+        .expect("valid composite quota entity");
+
+        assert_eq!(
+            entities,
+            [("user", Some("alice")), ("client-id", Some("billing"))]
+        );
+    }
+
+    #[test]
+    fn quota_entities_should_represent_default_ip() {
+        assert_eq!(
+            quota_entities(&[ConfigEntityType::Ip], &[], true, true)
+                .expect("valid default IP quota"),
+            [("ip", None)]
+        );
     }
 
     #[test]
