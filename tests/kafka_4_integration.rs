@@ -1337,6 +1337,27 @@ fn all_command_families_work_against_kafka_4_3_1() {
     ))
     .expect("ACL create JSON");
     assert_eq!(acl_created["command"], "acls.add");
+    let acl_repeated: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "acls",
+            "add",
+            "--topic",
+            "integration-events",
+            "--principal",
+            "User:integration",
+            "--operation",
+            "read",
+            "--execute",
+        ],
+    ))
+    .expect("repeated ACL create JSON");
+    assert_eq!(
+        acl_repeated["data"][0]["status"],
+        "CREATED 0; ALREADY_EXISTS 1"
+    );
     assert!(
         success(
             &bootstrap,

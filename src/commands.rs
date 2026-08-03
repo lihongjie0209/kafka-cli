@@ -1,7 +1,7 @@
 //! Kafka command implementations.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, Write},
     path::Path,
     process,
@@ -4524,11 +4524,24 @@ fn acls(
                     acl_table(rows)
                 });
             }
-            let result = ffi::create_acls(client.inner().native_ptr(), &bindings, timeout_ms)?;
+            let (bindings, already_exists) =
+                missing_acl_bindings(client.inner().native_ptr(), bindings, timeout_ms)?;
+            let result = if bindings.is_empty() {
+                ffi::AclMutationResult {
+                    matched: 0,
+                    failures: 0,
+                    errors: Vec::new(),
+                }
+            } else {
+                ffi::create_acls(client.inner().native_ptr(), &bindings, timeout_ms)?
+            };
             write_acl_mutation_result(
                 format,
                 "acls.add",
-                &format!("CREATED {}", result.matched.saturating_sub(result.failures)),
+                &format!(
+                    "CREATED {}; ALREADY_EXISTS {already_exists}",
+                    result.matched.saturating_sub(result.failures)
+                ),
                 &result,
             )?;
             if result.failures == 0 {
@@ -4574,6 +4587,51 @@ fn acls(
             }
         }
     }
+}
+
+fn missing_acl_bindings(
+    client: *mut rdkafka_sys::rd_kafka_t,
+    requested: Vec<AclBinding>,
+    timeout_ms: i32,
+) -> Result<(Vec<AclBinding>, usize)> {
+    let mut queried_resources = HashSet::new();
+    let mut existing = HashSet::new();
+    for binding in &requested {
+        let resource = (
+            binding.resource_type,
+            binding.resource_name.clone(),
+            binding.pattern_type,
+        );
+        if queried_resources.insert(resource) {
+            existing.extend(ffi::describe_acls(
+                client,
+                &AclBindingFilter {
+                    resource_type: binding.resource_type,
+                    resource_name: Some(binding.resource_name.clone()),
+                    pattern_type: binding.pattern_type,
+                    principal: None,
+                    host: None,
+                    operation: AclOperation::Any,
+                    permission_type: AclPermissionType::Any,
+                },
+                timeout_ms,
+            )?);
+        }
+    }
+    Ok(filter_missing_acl_bindings(requested, &existing))
+}
+
+fn filter_missing_acl_bindings(
+    requested: Vec<AclBinding>,
+    existing: &HashSet<AclBinding>,
+) -> (Vec<AclBinding>, usize) {
+    let requested_count = requested.len();
+    let missing = requested
+        .into_iter()
+        .filter(|binding| !existing.contains(binding))
+        .collect::<Vec<_>>();
+    let already_exists = requested_count.saturating_sub(missing.len());
+    (missing, already_exists)
 }
 
 fn acl_list_rows(
@@ -4651,26 +4709,32 @@ fn write_acl_mutation_result(
 }
 
 fn acl_operations(values: &[String]) -> Result<Vec<AclOperation>> {
-    values
-        .iter()
-        .map(|value| match value.to_ascii_lowercase().as_str() {
-            "all" => Ok(AclOperation::All),
-            "read" => Ok(AclOperation::Read),
-            "write" => Ok(AclOperation::Write),
-            "create" => Ok(AclOperation::Create),
-            "delete" => Ok(AclOperation::Delete),
-            "alter" => Ok(AclOperation::Alter),
-            "describe" => Ok(AclOperation::Describe),
-            "cluster-action" => Ok(AclOperation::ClusterAction),
-            "describe-configs" => Ok(AclOperation::DescribeConfigs),
-            "alter-configs" => Ok(AclOperation::AlterConfigs),
-            "idempotent-write" => Ok(AclOperation::IdempotentWrite),
-            "two-phase-commit" | "create-tokens" | "describe-tokens" => Err(Error::Unsupported(
-                format!("librdkafka 2.12 does not support ACL operation: {value}"),
-            )),
-            _ => Err(Error::Usage(format!("unknown ACL operation: {value}"))),
-        })
-        .collect()
+    let mut operations = Vec::new();
+    for value in values {
+        let operation = match value.trim().to_ascii_lowercase().as_str() {
+            "all" => AclOperation::All,
+            "read" => AclOperation::Read,
+            "write" => AclOperation::Write,
+            "create" => AclOperation::Create,
+            "delete" => AclOperation::Delete,
+            "alter" => AclOperation::Alter,
+            "describe" => AclOperation::Describe,
+            "cluster-action" => AclOperation::ClusterAction,
+            "describe-configs" => AclOperation::DescribeConfigs,
+            "alter-configs" => AclOperation::AlterConfigs,
+            "idempotent-write" => AclOperation::IdempotentWrite,
+            "two-phase-commit" | "create-tokens" | "describe-tokens" => {
+                return Err(Error::Unsupported(format!(
+                    "librdkafka 2.12 does not support ACL operation: {value}"
+                )));
+            }
+            _ => return Err(Error::Usage(format!("unknown ACL operation: {value}"))),
+        };
+        if !operations.contains(&operation) {
+            operations.push(operation);
+        }
+    }
+    Ok(operations)
 }
 
 fn normalized_acl_values(values: &[String], label: &str) -> Result<BTreeSet<String>> {
@@ -4754,13 +4818,15 @@ fn acl_bindings(
             "provide --allow-principal or --deny-principal".into(),
         ));
     }
+    let allow_hosts = normalized_acl_values(&mutation.allow_host, "allow host")?;
+    let deny_hosts = normalized_acl_values(&mutation.deny_host, "deny host")?;
     let mut bindings = Vec::new();
     for (resource_type, resource_name, operations) in resources {
         for (principal, permission) in &principals {
             let configured_hosts = if *permission == AclPermissionType::Allow {
-                &mutation.allow_host
+                &allow_hosts
             } else {
-                &mutation.deny_host
+                &deny_hosts
             };
             let hosts = if configured_hosts.is_empty() {
                 vec![mutation.host.as_deref().map_or("*", str::trim)]
@@ -7676,6 +7742,36 @@ mod tests {
         let error = acl_operations(&["two-phase-commit".into()])
             .expect_err("unsupported librdkafka operation");
         assert!(error.to_string().contains("librdkafka 2.12"));
+    }
+
+    #[test]
+    fn acl_operations_should_trim_and_deduplicate_values() {
+        assert_eq!(
+            acl_operations(&[" read ".into(), "READ".into()]).expect("operations"),
+            [AclOperation::Read]
+        );
+    }
+
+    #[test]
+    fn filter_missing_acl_bindings_should_skip_existing_exact_binding() {
+        let existing_binding = AclBinding {
+            resource_type: AclResourceType::Topic,
+            resource_name: "orders".into(),
+            pattern_type: AclPatternType::Literal,
+            principal: "User:reader".into(),
+            host: "*".into(),
+            operation: AclOperation::Read,
+            permission_type: AclPermissionType::Allow,
+        };
+        let missing_binding = AclBinding {
+            principal: "User:writer".into(),
+            ..existing_binding.clone()
+        };
+        let (missing, already_exists) = filter_missing_acl_bindings(
+            vec![existing_binding.clone(), missing_binding.clone()],
+            &HashSet::from([existing_binding]),
+        );
+        assert_eq!((missing, already_exists), (vec![missing_binding], 1));
     }
 
     #[test]

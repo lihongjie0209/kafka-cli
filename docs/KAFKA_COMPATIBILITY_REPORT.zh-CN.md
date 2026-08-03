@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 138 个通过 | 131 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 140 个通过 | 133 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -163,7 +163,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 
 ### 4.7 ACLs
 
-已支持：list/add/remove；Topic、Group、Cluster、Transactional ID；单次命令可重复指定 topic/group/transactional-id，list 可重复指定 principal，并对重叠查询结果去重；Literal/Prefixed，以及查询和删除使用的 Any/Match；allow/deny principal 与各自 host 的笛卡尔积；常见 operations；producer、consumer、idempotent 快捷角色。add 与原版一样拒绝只适用于过滤器的 Any/Match；显式 operation 会按 Kafka `AclEntry.supportedOperations` 与各 resource type 预校验。consumer-only 角色拒绝 cluster/transactional-id，producer+consumer 时允许这些 producer 资源。remove 指定 principal 时按 permission、host、operation 精确删除且 operation 默认 All；未指定 principal 时使用全 ACL entry filter，删除资源过滤器匹配的全部条目。原生子命令使用预览与 `--execute`；兼容脚本 `--add` 立即执行，`--remove --force` 接受原版 force 语义。Create、Describe 和 Delete 均通过 librdkafka Admin API 执行。
+已支持：list/add/remove；Topic、Group、Cluster、Transactional ID；单次命令可重复指定 topic/group/transactional-id，list 可重复指定 principal，并对重叠查询结果去重；Literal/Prefixed，以及查询和删除使用的 Any/Match；allow/deny principal 与各自 host 的笛卡尔积；常见 operations；producer、consumer、idempotent 快捷角色。add 与原版一样拒绝只适用于过滤器的 Any/Match；显式 operation 会按 Kafka `AclEntry.supportedOperations` 与各 resource type 预校验。add 执行前按资源查询已有 binding，只把缺失项交给 CreateAcls，重复执行返回 `ALREADY_EXISTS` 计数而不会创建重复记录。consumer-only 角色拒绝 cluster/transactional-id，producer+consumer 时允许这些 producer 资源。remove 指定 principal 时按 permission、host、operation 精确删除且 operation 默认 All；未指定 principal 时使用全 ACL entry filter，删除资源过滤器匹配的全部条目。原生子命令使用预览与 `--execute`；兼容脚本 `--add` 立即执行，`--remove --force` 接受原版 force 语义。Create、Describe 和 Delete 均通过 librdkafka Admin API 执行。
 
 缺少或有差异：
 
@@ -238,7 +238,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：138 个通过（131 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：140 个通过（133 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -379,6 +379,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | AclCommand 删除过滤语义复审 | 补齐 Match pattern；add 拒绝 Any/Match；remove 精确应用 allow/deny host，principal 缺省时按原版删除资源过滤器匹配的全部 ACL，principal 存在而 operation 缺省时默认 All | 125 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Match 查询和双 host 精确删除闭环 |
 | 2026-08-04 | AclCommand 批量资源语义复审 | topic/group/transactional-id 改为可重复资源选择；list 支持重复 principal 并在客户端精确过滤，对多个资源过滤器的重叠结果去重；资源、principal 和 host 按原版 trim/去重 | 127 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加三资源批量 add/list/remove 闭环 |
 | 2026-08-04 | AclCommand operation/resource 复审 | 直接对齐 Kafka `AclEntry.supportedOperations`；拒绝非法 resource-operation 组合和 consumer-only 的 cluster/transactional-id；TwoPhaseCommit/CreateTokens/DescribeTokens 明确标注 librdkafka 2.12 边界 | 131 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Group AlterConfigs 创建、查询、删除闭环 |
+| 2026-08-04 | AclCommand add 幂等语义复审 | 按 Kafka 原版在 CreateAcls 前逐资源查询完整 binding 集合，只提交缺失项；重复 operation/host 去重；全量已存在时不发 CreateAcls 并输出 ALREADY_EXISTS 计数 | 133 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加同一 ACL 连续执行两次的幂等闭环 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

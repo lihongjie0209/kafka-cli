@@ -108,7 +108,7 @@ impl Drop for TopicCollection {
 }
 
 /// ACL resource types supported by librdkafka.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AclResourceType {
     Any,
     Topic,
@@ -118,7 +118,7 @@ pub enum AclResourceType {
 }
 
 /// ACL resource pattern types supported by librdkafka.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AclPatternType {
     Any,
     Match,
@@ -127,7 +127,7 @@ pub enum AclPatternType {
 }
 
 /// Kafka ACL operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AclOperation {
     Any,
     All,
@@ -144,7 +144,7 @@ pub enum AclOperation {
 }
 
 /// Kafka ACL permission types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AclPermissionType {
     Any,
     Deny,
@@ -152,7 +152,7 @@ pub enum AclPermissionType {
 }
 
 /// One concrete ACL binding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AclBinding {
     pub resource_type: AclResourceType,
     pub resource_name: String,
