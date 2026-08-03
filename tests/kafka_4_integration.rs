@@ -757,9 +757,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
         ],
     );
     assert!(!missing_streams_group.status.success());
+    let missing_streams_error = String::from_utf8_lossy(&missing_streams_group.stderr);
     assert!(
-        String::from_utf8_lossy(&missing_streams_group.stderr)
-            .contains("StreamsGroupDescribe failed")
+        (missing_streams_error.contains("StreamsGroupDescribe failed")
+            || missing_streams_error.contains("does not support StreamsGroupDescribe v0"))
+            && !missing_streams_error.contains("connection closed"),
+        "unexpected StreamsGroupDescribe boundary: {missing_streams_error}"
     );
     let all_groups = success(&bootstrap, &["all-groups", "list"]);
     assert!(all_groups.contains("integration-suite"));
