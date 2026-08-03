@@ -1019,6 +1019,19 @@ fn all_command_families_work_against_kafka_4_3_1() {
         ],
     );
     assert!(proposal.contains("integration-events"));
+    let reassignment_preview: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "reassign",
+            "execute",
+            "--reassignment-json-file",
+            reassignment_file.to_str().expect("fixture path"),
+        ],
+    ))
+    .expect("reassignment preview JSON");
+    assert_eq!(reassignment_preview["command"], "reassign.execute");
     success(
         &bootstrap,
         &[
@@ -1061,7 +1074,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
     );
     assert!(success(&bootstrap, &["cluster", "id"]).contains("CLUSTER_ID"));
     assert!(success(&bootstrap, &["cluster", "list-endpoints"]).contains("127.0.0.1"));
-    success(&bootstrap, &["cluster", "unregister", "--id", "999"]);
+    let unregister_preview: serde_json::Value = serde_json::from_str(&success(
+        &bootstrap,
+        &["--output", "json", "cluster", "unregister", "--id", "999"],
+    ))
+    .expect("unregister preview JSON");
+    assert_eq!(unregister_preview["command"], "cluster.unregister");
 
     success(
         &bootstrap,

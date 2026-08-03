@@ -447,8 +447,15 @@ async fn topics(
                         .is_none_or(|topic| topic.error().is_some())
                 })
             {
-                println!("Topic {} does not exist.", args.topic);
-                return Ok(());
+                return write_mutation_rows(
+                    format,
+                    "topics.alter",
+                    &[MutationRow {
+                        resource: args.topic,
+                        status: "NOT_FOUND".into(),
+                        error: None,
+                    }],
+                );
             }
             let assignments = args
                 .replica_assignment
@@ -532,8 +539,15 @@ async fn topics(
                 .collect::<Vec<_>>();
             if topics.is_empty() {
                 if args.if_exists {
-                    println!("No matching topics exist.");
-                    return Ok(());
+                    return write_mutation_rows(
+                        format,
+                        "topics.delete",
+                        &[MutationRow {
+                            resource: "topic-selector".into(),
+                            status: "NO_MATCH".into(),
+                            error: None,
+                        }],
+                    );
                 }
                 return Err(Error::Usage("no topics matched --topic".into()));
             }
@@ -2818,11 +2832,27 @@ async fn cluster(
         }
         ClusterAction::Unregister { id, execute } => {
             if !execute {
-                println!("Would unregister broker {id}");
-                return Ok(());
+                return write_mutation_rows(
+                    format,
+                    "cluster.unregister",
+                    &[MutationRow {
+                        resource: format!("broker:{id}"),
+                        status: "PREVIEW".into(),
+                        error: None,
+                    }],
+                );
             }
             let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
-            unregister_broker(&client, *id).await
+            unregister_broker(&client, *id).await?;
+            write_mutation_rows(
+                format,
+                "cluster.unregister",
+                &[MutationRow {
+                    resource: format!("broker:{id}"),
+                    status: "UNREGISTERED".into(),
+                    error: None,
+                }],
+            )
         }
     }
 }
@@ -2841,7 +2871,6 @@ async fn unregister_broker(client: &krafka::admin::AdminClient, broker_id: i32) 
     let error_message = KafkaString::decode_compact(&mut response)?.0;
     let _tagged_fields = TaggedFields::decode(&mut response)?;
     if error_code == 0 {
-        println!("Broker {broker_id} is no longer registered.");
         Ok(())
     } else {
         Err(Error::Config(error_message.unwrap_or_else(|| {
@@ -3348,11 +3377,12 @@ async fn reassign(
         } => {
             let plan = read_reassignment(reassignment_json_file)?;
             if !execute {
-                println!(
-                    "Would execute {} partition reassignment(s)",
-                    plan.partitions.len()
+                return write_reassignment_mutation_rows(
+                    format,
+                    "reassign.execute",
+                    &plan,
+                    "PREVIEW EXECUTE",
                 );
-                return Ok(());
             }
             let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
             let result = client
@@ -3374,8 +3404,7 @@ async fn reassign(
                         total: plan.partitions.len(),
                     });
                 }
-                println!("Successfully started partition reassignment.");
-                Ok(())
+                write_reassignment_mutation_rows(format, "reassign.execute", &plan, "STARTED")
             } else {
                 drop(client);
                 Err(Error::Partial {
@@ -3390,11 +3419,12 @@ async fn reassign(
         } => {
             let plan = read_reassignment(reassignment_json_file)?;
             if !execute {
-                println!(
-                    "Would cancel {} partition reassignment(s)",
-                    plan.partitions.len()
+                return write_reassignment_mutation_rows(
+                    format,
+                    "reassign.cancel",
+                    &plan,
+                    "PREVIEW CANCEL",
                 );
-                return Ok(());
             }
             let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
             let result = client
@@ -3409,8 +3439,7 @@ async fn reassign(
                 .count()
                 + usize::from(result.error.is_some());
             if failures == 0 {
-                println!("Successfully cancelled partition reassignment.");
-                Ok(())
+                write_reassignment_mutation_rows(format, "reassign.cancel", &plan, "CANCELLED")
             } else {
                 Err(Error::Partial {
                     failed: failures,
@@ -3459,6 +3488,24 @@ async fn reassign(
             })
         }
     }
+}
+
+fn write_reassignment_mutation_rows(
+    format: OutputFormat,
+    command: &str,
+    plan: &ReassignmentFile,
+    status: &str,
+) -> Result<()> {
+    let rows = plan
+        .partitions
+        .iter()
+        .map(|partition| MutationRow {
+            resource: format!("{}:{}", partition.topic, partition.partition),
+            status: status.into(),
+            error: None,
+        })
+        .collect::<Vec<_>>();
+    write_mutation_rows(format, command, &rows)
 }
 
 type BrokerLogDirPlan = BTreeMap<i32, BTreeMap<String, BTreeMap<String, Vec<i32>>>>;

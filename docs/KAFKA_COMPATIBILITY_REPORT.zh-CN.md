@@ -210,7 +210,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。本项目�
 | Java 插件 | formatter、reader、deserializer 可加载类 | 不支持加载 Java 类 |
 | 超时 | 各工具分别定义 | 全局 `--timeout-ms`，部分命令有原版语义差异 |
 
-JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。结构化结果集的表格由 `comfy-table` 生成；producer/consumer 的记录流、reset-offsets 的 CSV 导出以及状态提示仍有意使用流式或普通文本。Topics mutation、group delete、SCRAM mutation、ACL mutation 和 delete-records 已统一为 table/JSON；reassignment、cluster unregister 及部分无结果提示仍是手工文本，因此不能宣称所有非流式输出均已统一。项目当前不支持 YAML 输出。
+JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理结果集和 mutation 结果均通过统一输出层生成，表格由 `comfy-table` 渲染，JSON 使用稳定 envelope。producer/consumer 的记录流、reset-offsets 的 CSV 导出，以及 consumer `--skip-message-on-error` 诊断仍有意使用 stdout/stderr 流，不属于表格结果集。项目当前不支持 YAML 输出。
 
 ## 6. 客户端实现架构
 
@@ -337,6 +337,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Consumer Group delete-offsets 批量 topic | delete-offsets 支持重复 topic 与 `topic:partition,partition`，校验不存在 partition；librdkafka DeleteConsumerGroupOffsets FFI 扩展为跨 topic partition list，预览改用统一表格/JSON | Clippy、62 个普通测试、bundled Kafka 4.3.1 跨 topic 删除集成测试通过 |
 | 2026-08-03 | Consumer Group 二次语义审计 | reset-offsets 仅处理 Empty/Dead/不存在的 group，活动组写入结构化 errors；无 committed topic 的 group 不再中断批次；重复 topic selector 合并；group delete 统一 table/JSON 结果 | Clippy、66 个普通测试、Kafka 4.3.1 active-group/重复 selector/delete JSON 集成测试通过 |
 | 2026-08-03 | 管理结果结构化输出 | Topics create/alter/delete、SCRAM alter、ACL add/remove、delete-records 统一接入 `comfy-table`/JSON envelope；ACL FFI 不再直接写 stderr，逐请求错误进入 envelope | Clippy、66 个普通测试、Kafka 4.3.1 Topics/SCRAM/ACL/delete-records JSON 集成测试通过 |
+| 2026-08-03 | 非流式输出闭环 | Reassignment execute/cancel、cluster unregister 及 Topics no-op 结果接入统一 mutation table/JSON；生产/消费流和 CSV 保持专用流格式 | Clippy、66 个普通测试、Kafka 4.3.1 reassignment/unregister JSON 集成测试通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
