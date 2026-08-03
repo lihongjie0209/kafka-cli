@@ -6,6 +6,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::output::OutputFormat;
 
+fn parse_consumer_timeout(value: &str) -> Result<u64, String> {
+    let timeout = value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid timeout '{value}': {error}"))?;
+    Ok(u64::try_from(timeout).unwrap_or(u64::MAX))
+}
+
 /// Native Kafka command-line client.
 #[derive(Debug, Parser)]
 #[command(name = "kafka", version, about, propagate_version = true)]
@@ -19,8 +26,8 @@ pub struct Cli {
     pub command_config: Option<PathBuf>,
 
     /// Request timeout in milliseconds.
-    #[arg(long, global = true, default_value_t = 30_000)]
-    pub timeout_ms: u64,
+    #[arg(long, global = true)]
+    pub timeout_ms: Option<u64>,
 
     /// Output encoding.
     #[arg(long, global = true, value_enum, default_value_t)]
@@ -55,7 +62,10 @@ impl Cli {
     /// Returns the configured timeout.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
-        Duration::from_millis(self.timeout_ms)
+        Duration::from_millis(match self.timeout_ms {
+            Some(timeout_ms) => timeout_ms,
+            None => 30_000,
+        })
     }
 }
 
@@ -335,14 +345,41 @@ pub struct ProduceArgs {
     #[arg(long)]
     pub json: bool,
     /// Default `LineMessageReader` property in key=value form.
-    #[arg(long = "reader-property", visible_alias = "property")]
+    #[arg(
+        long = "reader-property",
+        conflicts_with = "deprecated_reader_properties"
+    )]
     pub reader_properties: Vec<String>,
+    /// Deprecated alias for --reader-property.
+    #[arg(long = "property", conflicts_with = "reader_properties")]
+    pub deprecated_reader_properties: Vec<String>,
     /// Java properties file used to configure the default `LineMessageReader`.
     #[arg(long)]
     pub reader_config: Option<PathBuf>,
     /// Producer property in key=value form; overrides --command-config.
-    #[arg(long = "command-property", visible_alias = "producer-property")]
+    #[arg(long = "command-property", conflicts_with = "deprecated_properties")]
     pub properties: Vec<String>,
+    /// Deprecated alias for --command-property.
+    #[arg(long = "producer-property", conflicts_with = "properties")]
+    pub deprecated_properties: Vec<String>,
+}
+
+impl ProduceArgs {
+    pub(crate) fn reader_properties(&self) -> &[String] {
+        if self.reader_properties.is_empty() {
+            &self.deprecated_reader_properties
+        } else {
+            &self.reader_properties
+        }
+    }
+
+    pub(crate) fn properties(&self) -> &[String] {
+        if self.properties.is_empty() {
+            &self.deprecated_properties
+        } else {
+            &self.properties
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -377,10 +414,14 @@ pub struct ConsumeArgs {
     pub offset: Option<String>,
     #[arg(long, conflicts_with = "offset")]
     pub from_beginning: bool,
-    #[arg(long)]
-    pub max_messages: Option<u64>,
+    #[arg(long, allow_negative_numbers = true)]
+    pub max_messages: Option<i32>,
     /// Exit successfully after this many milliseconds without a message.
-    #[arg(long)]
+    #[arg(
+        long,
+        allow_negative_numbers = true,
+        value_parser = parse_consumer_timeout
+    )]
     pub timeout_ms: Option<u64>,
     #[arg(long, value_parser = ["read_uncommitted", "read_committed"])]
     pub isolation_level: Option<String>,
@@ -394,14 +435,41 @@ pub struct ConsumeArgs {
     #[arg(long, default_value = "\t")]
     pub key_separator: String,
     /// `DefaultMessageFormatter` property in key=value form.
-    #[arg(long = "formatter-property", visible_alias = "property")]
+    #[arg(
+        long = "formatter-property",
+        conflicts_with = "deprecated_formatter_properties"
+    )]
     pub formatter_properties: Vec<String>,
+    /// Deprecated alias for --formatter-property.
+    #[arg(long = "property", conflicts_with = "formatter_properties")]
+    pub deprecated_formatter_properties: Vec<String>,
     /// Java properties file used to configure the default message formatter.
     #[arg(long)]
     pub formatter_config: Option<PathBuf>,
     /// Consumer property in key=value form; overrides --command-config.
-    #[arg(long = "command-property", visible_alias = "consumer-property")]
+    #[arg(long = "command-property", conflicts_with = "deprecated_properties")]
     pub properties: Vec<String>,
+    /// Deprecated alias for --command-property.
+    #[arg(long = "consumer-property", conflicts_with = "properties")]
+    pub deprecated_properties: Vec<String>,
+}
+
+impl ConsumeArgs {
+    pub(crate) fn formatter_properties(&self) -> &[String] {
+        if self.formatter_properties.is_empty() {
+            &self.deprecated_formatter_properties
+        } else {
+            &self.formatter_properties
+        }
+    }
+
+    pub(crate) fn properties(&self) -> &[String] {
+        if self.properties.is_empty() {
+            &self.deprecated_properties
+        } else {
+            &self.properties
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -919,6 +987,31 @@ mod tests {
     }
 
     #[test]
+    fn console_should_reject_deprecated_and_current_config_together() {
+        for (command, deprecated) in [
+            ("produce", "--producer.config"),
+            ("consume", "--consumer.config"),
+        ] {
+            let mut arguments = vec![
+                OsString::from("kafka-compatible"),
+                OsString::from(command),
+                OsString::from("--topic"),
+                OsString::from("events"),
+                OsString::from("--command-config"),
+                OsString::from("current.properties"),
+                OsString::from(deprecated),
+                OsString::from("deprecated.properties"),
+            ];
+            rewrite_legacy_action(&mut arguments, command);
+
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "accepted conflicting config options for {command}"
+            );
+        }
+    }
+
+    #[test]
     fn compression_codec_without_value_should_default_to_gzip() {
         let cli = Cli::try_parse_from([
             "kafka",
@@ -935,6 +1028,123 @@ mod tests {
             panic!("expected produce command");
         };
         assert_eq!(args.compression_type, "gzip");
+    }
+
+    #[test]
+    fn producer_should_reject_deprecated_and_current_properties_together() {
+        for pair in [
+            ["--command-property", "--producer-property"],
+            ["--reader-property", "--property"],
+        ] {
+            let result = Cli::try_parse_from([
+                "kafka",
+                "--bootstrap-server",
+                "localhost:9092",
+                "produce",
+                "--topic",
+                "events",
+                pair[0],
+                "first=value",
+                pair[1],
+                "second=value",
+            ]);
+
+            assert!(result.is_err(), "accepted conflicting options {pair:?}");
+        }
+    }
+
+    #[test]
+    fn consumer_should_reject_deprecated_and_current_properties_together() {
+        for pair in [
+            ["--command-property", "--consumer-property"],
+            ["--formatter-property", "--property"],
+        ] {
+            let result = Cli::try_parse_from([
+                "kafka",
+                "--bootstrap-server",
+                "localhost:9092",
+                "consume",
+                "--topic",
+                "events",
+                pair[0],
+                "first=value",
+                pair[1],
+                "second=value",
+            ]);
+
+            assert!(result.is_err(), "accepted conflicting options {pair:?}");
+        }
+    }
+
+    #[test]
+    fn consumer_should_accept_kafka_unbounded_numeric_sentinels() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "consume",
+            "--topic",
+            "events",
+            "--max-messages",
+            "-1",
+            "--timeout-ms",
+            "-1",
+        ])
+        .expect("Kafka unbounded consumer sentinels");
+        let Command::Consume(consumer) = cli.command else {
+            panic!("expected consume command");
+        };
+
+        assert_eq!(
+            (consumer.max_messages, consumer.timeout_ms),
+            (Some(-1), Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn consumer_should_have_no_idle_timeout_by_default() {
+        let cli = Cli::try_parse_from(["kafka", "consume", "--topic", "events"])
+            .expect("consumer defaults");
+        let Command::Consume(consumer) = cli.command else {
+            panic!("expected consume command");
+        };
+
+        assert_eq!(consumer.timeout_ms, None);
+    }
+
+    #[test]
+    fn deprecated_console_properties_should_keep_their_values() {
+        let producer = Cli::try_parse_from([
+            "kafka",
+            "produce",
+            "--topic",
+            "events",
+            "--producer-property",
+            "acks=1",
+            "--property",
+            "parse.key=true",
+        ])
+        .expect("deprecated producer properties");
+        let Command::Produce(producer) = producer.command else {
+            panic!("expected produce command");
+        };
+        assert_eq!(producer.properties(), &["acks=1"]);
+        assert_eq!(producer.reader_properties(), &["parse.key=true"]);
+
+        let consumer = Cli::try_parse_from([
+            "kafka",
+            "consume",
+            "--topic",
+            "events",
+            "--consumer-property",
+            "fetch.min.bytes=2",
+            "--property",
+            "print.key=true",
+        ])
+        .expect("deprecated consumer properties");
+        let Command::Consume(consumer) = consumer.command else {
+            panic!("expected consume command");
+        };
+        assert_eq!(consumer.properties(), &["fetch.min.bytes=2"]);
+        assert_eq!(consumer.formatter_properties(), &["print.key=true"]);
     }
 
     #[test]

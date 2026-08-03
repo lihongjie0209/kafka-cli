@@ -357,6 +357,20 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "consume",
             "--topic",
             "integration-json",
+            "--max-messages",
+            "0",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "consume",
+            "--topic",
+            "integration-json",
             "--from-beginning",
             "--max-messages",
             "2",

@@ -656,7 +656,7 @@ fn topic_results(
 }
 
 async fn produce(mut config: rdkafka::ClientConfig, args: crate::cli::ProduceArgs) -> Result<()> {
-    apply_client_properties(&mut config, &args.properties)?;
+    apply_client_properties(&mut config, args.properties())?;
     let max_block_ms = configure_producer(&mut config, &args)?;
     let reader = line_reader_options(&args)?;
     let producer: FutureProducer = config.create()?;
@@ -900,7 +900,7 @@ fn line_reader_options(args: &crate::cli::ProduceArgs) -> Result<LineReaderOptio
             args.line_reader
         )));
     }
-    let properties = component_properties(args.reader_config.as_deref(), &args.reader_properties)?;
+    let properties = component_properties(args.reader_config.as_deref(), args.reader_properties())?;
     let value = |key: &str| properties.get(key);
     let parse_key = value("parse.key").map_or(args.parse_key, |value| bool_property(value));
     let key_separator = value("key.separator")
@@ -1116,8 +1116,8 @@ async fn consume(
     }
 
     let mut stream = consumer.stream();
-    let mut received = 0_u64;
-    loop {
+    let mut received = 0_i64;
+    while should_consume_more(args.max_messages, received) {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             message = next_consumer_message(&mut stream, args.timeout_ms) => {
@@ -1145,11 +1145,17 @@ async fn consume(
                     write_formatted_message(&message, &formatter)?;
                 }
                 received += 1;
-                if args.max_messages.is_some_and(|max| received >= max) { break; }
             }
         }
     }
     Ok(())
+}
+
+fn should_consume_more(max_messages: Option<i32>, received: i64) -> bool {
+    match max_messages {
+        None | Some(-1) => true,
+        Some(max_messages) => received < i64::from(max_messages),
+    }
 }
 
 static CONSUMER_GROUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1159,7 +1165,7 @@ fn configure_consumer(
     args: &crate::cli::ConsumeArgs,
 ) -> Result<()> {
     let file_group = config.get("group.id").map(str::to_owned);
-    let inline = parse_pairs(&args.properties)?;
+    let inline = parse_pairs(args.properties())?;
     let inline_group = inline
         .iter()
         .rev()
@@ -1321,8 +1327,10 @@ fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFo
             args.formatter
         )));
     }
-    let properties =
-        component_properties(args.formatter_config.as_deref(), &args.formatter_properties)?;
+    let properties = component_properties(
+        args.formatter_config.as_deref(),
+        args.formatter_properties(),
+    )?;
     let value = |key: &str| properties.get(key);
     let key_deserializer = native_deserializer(
         value("key.deserializer")
@@ -1482,7 +1490,7 @@ async fn next_consumer_message<'a>(
 ) -> Result<
     Option<std::result::Result<rdkafka::message::BorrowedMessage<'a>, rdkafka::error::KafkaError>>,
 > {
-    if let Some(timeout_ms) = timeout_ms {
+    if let Some(timeout_ms) = timeout_ms.filter(|value| *value != u64::MAX) {
         tokio::time::timeout(Duration::from_millis(timeout_ms), stream.next())
             .await
             .map_or_else(|_| Ok(None), Ok)
@@ -6303,8 +6311,10 @@ mod tests {
             socket_buffer_size: None,
             json: true,
             reader_properties: Vec::new(),
+            deprecated_reader_properties: Vec::new(),
             reader_config: None,
             properties: Vec::new(),
+            deprecated_properties: Vec::new(),
         };
         let options = line_reader_options(&args).expect("reader options");
         let input = producer_input(
@@ -6352,8 +6362,10 @@ mod tests {
             socket_buffer_size: None,
             json: true,
             reader_properties: Vec::new(),
+            deprecated_reader_properties: Vec::new(),
             reader_config: None,
             properties: Vec::new(),
+            deprecated_properties: Vec::new(),
         };
         let options = line_reader_options(&args).expect("reader options");
         assert!(matches!(
@@ -6667,6 +6679,21 @@ mod tests {
             consumer_offset(Some("middle"), false),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn consumer_should_stop_before_polling_when_max_messages_is_zero() {
+        assert!(!should_consume_more(Some(0), 0));
+    }
+
+    #[test]
+    fn consumer_should_continue_without_limit_when_max_messages_is_minus_one() {
+        assert!(should_consume_more(Some(-1), i64::MAX));
+    }
+
+    #[test]
+    fn consumer_should_stop_at_positive_max_messages_limit() {
+        assert!(!should_consume_more(Some(2), 2));
     }
 
     #[test]
