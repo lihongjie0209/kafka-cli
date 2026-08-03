@@ -572,8 +572,17 @@ impl ConsumeArgs {
 
 #[derive(Debug, Args)]
 pub struct GroupsArgs {
+    /// Kafka `ConsumerGroupCommand` request/stabilization timeout in milliseconds.
+    #[arg(long = "timeout", global = true)]
+    pub timeout_ms: Option<u64>,
     #[command(subcommand)]
     pub action: GroupAction,
+}
+
+impl GroupsArgs {
+    pub(crate) fn timeout(&self, default: Duration) -> Duration {
+        self.timeout_ms.map_or(default, Duration::from_millis)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1419,6 +1428,13 @@ mod tests {
         "--skip-message-on-error"
     );
     parses_command_family!(groups_family_parses, "groups", "list");
+    parses_command_family!(
+        groups_original_timeout_parses,
+        "groups",
+        "list",
+        "--timeout",
+        "5000"
+    );
     parses_command_family!(
         groups_validate_regex_parses,
         "groups",

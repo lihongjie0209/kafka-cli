@@ -76,6 +76,10 @@ fn write_mutation_rows(format: OutputFormat, command: &str, rows: &[MutationRow]
 }
 
 /// Executes one top-level command.
+#[expect(
+    clippy::too_many_lines,
+    reason = "top-level dispatch explicitly routes every Kafka command family"
+)]
 pub async fn execute(cli: Cli) -> Result<()> {
     if let Command::Groups(args) = &cli.command
         && let GroupAction::ValidateRegex { regex } = &args.action
@@ -96,7 +100,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Produce(args) => produce(client_config, args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::Groups(args) => {
-            groups(&client_config, timeout, format, args.action, verbose).await
+            groups(
+                &client_config,
+                args.timeout(timeout),
+                format,
+                args.action,
+                verbose,
+            )
+            .await
         }
         Command::Configs(args) => {
             Box::pin(configs(
