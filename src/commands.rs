@@ -44,6 +44,28 @@ use crate::{
 
 type Admin = AdminClient<DefaultClientContext>;
 
+#[derive(Debug, Serialize)]
+struct MutationRow {
+    resource: String,
+    status: String,
+    error: Option<String>,
+}
+
+fn write_mutation_rows(format: OutputFormat, command: &str, rows: &[MutationRow]) -> Result<()> {
+    output::write_value(format, command, &rows, |rows| {
+        output::table(
+            ["RESOURCE", "STATUS", "ERROR"],
+            rows.iter().map(|row| {
+                [
+                    row.resource.clone(),
+                    row.status.clone(),
+                    row.error.as_deref().unwrap_or("-").to_owned(),
+                ]
+            }),
+        )
+    })
+}
+
 /// Executes one top-level command.
 pub async fn execute(cli: Cli) -> Result<()> {
     if let Command::Groups(args) = &cli.command
@@ -401,9 +423,8 @@ async fn topics(
                     &AdminOptions::new().operation_timeout(Some(timeout)),
                 )
                 .await?;
-            let failures = topic_results(result, args.if_not_exists);
+            let failures = topic_results(format, "topics.create", result, args.if_not_exists)?;
             if failures == 0 {
-                println!("Created topic {}.", args.topic);
                 Ok(())
             } else {
                 Err(Error::Partial {
@@ -473,7 +494,7 @@ async fn topics(
                     &AdminOptions::new().operation_timeout(Some(timeout)),
                 )
                 .await?;
-            let failures = topic_results(result, false);
+            let failures = topic_results(format, "topics.alter", result, false)?;
             if failures == 0 {
                 Ok(())
             } else {
@@ -519,7 +540,7 @@ async fn topics(
             let result = admin(config)?
                 .delete_topics(&topics, &AdminOptions::new())
                 .await?;
-            let failures = topic_results(result, false);
+            let failures = topic_results(format, "topics.delete", result, false)?;
             if failures == 0 {
                 Ok(())
             } else {
@@ -568,29 +589,39 @@ fn topic_pattern(expression: &str) -> Result<Regex> {
 }
 
 fn topic_results(
+    format: OutputFormat,
+    command: &str,
     results: Vec<std::result::Result<String, (String, rdkafka::types::RDKafkaErrorCode)>>,
     ignore_exists: bool,
-) -> usize {
-    results
+) -> Result<usize> {
+    let rows = results
         .into_iter()
-        .filter_map(|result| match result {
-            Ok(name) => {
-                println!("{name}: OK");
-                None
-            }
+        .map(|result| match result {
+            Ok(name) => MutationRow {
+                resource: name,
+                status: "OK".into(),
+                error: None,
+            },
             Err((name, code))
                 if ignore_exists
                     && code == rdkafka::types::RDKafkaErrorCode::TopicAlreadyExists =>
             {
-                println!("{name}: already exists");
-                None
+                MutationRow {
+                    resource: name,
+                    status: "ALREADY_EXISTS".into(),
+                    error: None,
+                }
             }
-            Err((name, code)) => {
-                eprintln!("{name}: {code}");
-                Some(())
-            }
+            Err((name, code)) => MutationRow {
+                resource: name,
+                status: "FAILED".into(),
+                error: Some(code.to_string()),
+            },
         })
-        .count()
+        .collect::<Vec<_>>();
+    let failures = rows.iter().filter(|row| row.error.is_some()).count();
+    write_mutation_rows(format, command, &rows)?;
+    Ok(failures)
 }
 
 async fn produce(
@@ -2010,7 +2041,15 @@ async fn configs(
                 ));
             }
             if matches!(entity_type, ConfigEntityType::User) {
-                return alter_user_scram(config, timeout, &entity_name, &pairs, &delete, execute);
+                return alter_user_scram(
+                    config,
+                    timeout,
+                    format,
+                    &entity_name,
+                    &pairs,
+                    &delete,
+                    execute,
+                );
             }
             if !execute {
                 return config_change_preview(format, &pairs, &delete);
@@ -2235,37 +2274,50 @@ const fn dynamic_config_source(source: &ConfigSource) -> bool {
 fn alter_user_scram(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
+    format: OutputFormat,
     user: &str,
     add: &[(String, String)],
     delete: &[String],
     execute: bool,
 ) -> Result<()> {
     let changes = parse_scram_changes(add, delete)?;
-    if !execute {
-        for change in &changes {
-            match change {
-                ffi::ScramCredentialAlteration::Upsert {
-                    mechanism,
-                    iterations,
-                    ..
-                } => println!(
-                    "Would set {} with {iterations} iterations",
-                    scram_mechanism_name(*mechanism)
-                ),
-                ffi::ScramCredentialAlteration::Delete { mechanism } => {
-                    println!("Would delete {}", scram_mechanism_name(*mechanism));
-                }
-            }
-        }
-        return Ok(());
+    let rows = changes
+        .iter()
+        .map(|change| match change {
+            ffi::ScramCredentialAlteration::Upsert {
+                mechanism,
+                iterations,
+                ..
+            } => MutationRow {
+                resource: format!("{user}:{}", scram_mechanism_name(*mechanism)),
+                status: if execute {
+                    format!("UPSERTED ({iterations} iterations)")
+                } else {
+                    format!("PREVIEW UPSERT ({iterations} iterations)")
+                },
+                error: None,
+            },
+            ffi::ScramCredentialAlteration::Delete { mechanism } => MutationRow {
+                resource: format!("{user}:{}", scram_mechanism_name(*mechanism)),
+                status: if execute {
+                    "DELETED".into()
+                } else {
+                    "PREVIEW DELETE".into()
+                },
+                error: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    if execute {
+        let client = admin(config)?;
+        ffi::alter_user_scram_credentials(
+            client.inner().native_ptr(),
+            user,
+            &changes,
+            duration_ms(timeout)?,
+        )?;
     }
-    let client = admin(config)?;
-    ffi::alter_user_scram_credentials(
-        client.inner().native_ptr(),
-        user,
-        &changes,
-        duration_ms(timeout)?,
-    )
+    write_mutation_rows(format, "configs.alter.scram", &rows)
 }
 
 const fn native_resource_type(kind: ConfigEntityType) -> rdkafka_sys::rd_kafka_ResourceType_t {
@@ -2550,18 +2602,26 @@ struct DeleteRecordsPartition {
 async fn delete_records(
     config: &rdkafka::ClientConfig,
     timeout: Duration,
-    _format: OutputFormat,
+    format: OutputFormat,
     path: &Path,
     execute: bool,
 ) -> Result<()> {
     let input = read_delete_records(path)?;
     let mut offsets = TopicPartitionList::new();
     for item in &input.partitions {
-        println!("{}:{} before {}", item.topic, item.partition, item.offset);
         offsets.add_partition_offset(&item.topic, item.partition, Offset::Offset(item.offset))?;
     }
     if !execute {
-        return Ok(());
+        let rows = input
+            .partitions
+            .iter()
+            .map(|item| MutationRow {
+                resource: format!("{}:{}", item.topic, item.partition),
+                status: format!("PREVIEW BEFORE {}", item.offset),
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        return write_mutation_rows(format, "delete-records", &rows);
     }
     let result = admin(config)?
         .delete_records(
@@ -2569,15 +2629,16 @@ async fn delete_records(
             &AdminOptions::new().operation_timeout(Some(timeout)),
         )
         .await?;
-    for element in result.elements() {
-        println!(
-            "{}:{} {:?}",
-            element.topic(),
-            element.partition(),
-            element.offset()
-        );
-    }
-    Ok(())
+    let rows = result
+        .elements()
+        .into_iter()
+        .map(|element| MutationRow {
+            resource: format!("{}:{}", element.topic(), element.partition()),
+            status: format!("LOW_WATERMARK {:?}", element.offset()),
+            error: element.error().err().map(|error| error.to_string()),
+        })
+        .collect::<Vec<_>>();
+    write_mutation_rows(format, "delete-records", &rows)
 }
 
 fn read_delete_records(path: &Path) -> Result<DeleteRecordsFile> {
@@ -2818,10 +2879,18 @@ fn acls(
                 };
             let bindings = acl_bindings(mutation, &operations)?;
             if !mutation.execute {
-                println!("Would create {} ACL binding(s)", bindings.len());
-                return Ok(());
+                let rows = bindings.into_iter().map(acl_row).collect::<Vec<_>>();
+                return output::write_value(format, "acls.add.preview", &rows, |rows| {
+                    acl_table(rows)
+                });
             }
             let result = ffi::create_acls(client.inner().native_ptr(), &bindings, timeout_ms)?;
+            write_acl_mutation_result(
+                format,
+                "acls.add",
+                &format!("CREATED {}", result.matched.saturating_sub(result.failures)),
+                &result,
+            )?;
             if result.failures == 0 {
                 Ok(())
             } else {
@@ -2849,8 +2918,13 @@ fn acls(
             }
             let total = filters.len();
             let result = ffi::delete_acls(client.inner().native_ptr(), &filters, timeout_ms)?;
+            write_acl_mutation_result(
+                format,
+                "acls.remove",
+                &format!("DELETED {}", result.matched),
+                &result,
+            )?;
             if result.failures == 0 {
-                println!("Deleted {} ACL binding(s).", result.matched);
                 Ok(())
             } else {
                 Err(Error::Partial {
@@ -2860,6 +2934,31 @@ fn acls(
             }
         }
     }
+}
+
+fn write_acl_mutation_result(
+    format: OutputFormat,
+    command: &str,
+    status: &str,
+    result: &ffi::AclMutationResult,
+) -> Result<()> {
+    let rows = [MutationRow {
+        resource: "acl-bindings".into(),
+        status: status.into(),
+        error: None,
+    }];
+    output::write_value_with_errors(format, command, &rows, &result.errors, |rows| {
+        output::table(
+            ["RESOURCE", "STATUS", "ERROR"],
+            rows.iter().map(|row| {
+                [
+                    row.resource.clone(),
+                    row.status.clone(),
+                    row.error.as_deref().unwrap_or("-").to_owned(),
+                ]
+            }),
+        )
+    })
 }
 
 fn acl_filter(

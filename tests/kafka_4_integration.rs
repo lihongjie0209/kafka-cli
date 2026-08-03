@@ -87,9 +87,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
     .expect("topic config fixture");
 
     // topics
-    success(
+    let topic_created: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
+            "--output",
+            "json",
             "topics",
             "create",
             "--topic",
@@ -97,7 +99,9 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--partitions",
             "1",
         ],
-    );
+    ))
+    .expect("topic create JSON");
+    assert_eq!(topic_created["command"], "topics.create");
     success(
         &bootstrap,
         &[
@@ -747,9 +751,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    success(
+    let scram_alter: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
+            "--output",
+            "json",
             "configs",
             "alter",
             "--entity-type",
@@ -760,7 +766,9 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "SCRAM-SHA-256=[iterations=4096,password=integration-secret]",
             "--execute",
         ],
-    );
+    ))
+    .expect("SCRAM alter JSON");
+    assert_eq!(scram_alter["command"], "configs.alter.scram");
     assert!(
         success(
             &bootstrap,
@@ -829,9 +837,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
 
     // ACL and destructive commands use their mandatory safe preview mode.
     success(&bootstrap, &["acls", "list"]);
-    success(
+    let acl_created: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
+            "--output",
+            "json",
             "acls",
             "add",
             "--topic",
@@ -842,7 +852,9 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "read",
             "--execute",
         ],
-    );
+    ))
+    .expect("ACL create JSON");
+    assert_eq!(acl_created["command"], "acls.add");
     assert!(
         success(
             &bootstrap,
@@ -935,15 +947,19 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--execute",
         ],
     );
-    success(
+    let deleted_records: serde_json::Value = serde_json::from_str(&success(
         &bootstrap,
         &[
+            "--output",
+            "json",
             "delete-records",
             "--offset-json-file",
             delete_file.to_str().expect("fixture path"),
             "--execute",
         ],
-    );
+    ))
+    .expect("delete-records JSON");
+    assert_eq!(deleted_records["command"], "delete-records");
     success(
         &bootstrap,
         &[

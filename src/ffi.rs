@@ -176,10 +176,11 @@ pub struct AclBindingFilter {
 }
 
 /// Outcome of a bulk ACL mutation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AclMutationResult {
     pub matched: usize,
     pub failures: usize,
+    pub errors: Vec<String>,
 }
 
 /// SCRAM mechanisms supported by Kafka and librdkafka.
@@ -1169,10 +1170,11 @@ pub fn create_acls(
     }
     let mut count = 0;
     let results = unsafe { sys::rd_kafka_CreateAcls_result_acls(result, &raw mut count) };
-    let failures = acl_result_failures(results, count, "ACL creation")?;
+    let errors = acl_result_errors(results, count, "ACL creation")?;
     Ok(AclMutationResult {
         matched: count,
-        failures,
+        failures: errors.len(),
+        errors,
     })
 }
 
@@ -1251,7 +1253,7 @@ pub fn delete_acls(
         ));
     }
     let mut matched = 0;
-    let mut failures = 0;
+    let mut errors = Vec::new();
     for index in 0..response_count {
         let response = unsafe { *responses.add(index) };
         if response.is_null() {
@@ -1259,10 +1261,9 @@ pub fn delete_acls(
         }
         let error = unsafe { sys::rd_kafka_DeleteAcls_result_response_error(response) };
         if !error.is_null() {
-            failures += 1;
-            eprintln!("ACL deletion failed: {}", unsafe {
+            errors.push(format!("ACL deletion failed: {}", unsafe {
                 c_string(sys::rd_kafka_error_string(error))
-            });
+            }));
         }
         let mut matching_count = 0;
         let matching = unsafe {
@@ -1284,14 +1285,17 @@ pub fn delete_acls(
             }
             let error = unsafe { sys::rd_kafka_AclBinding_error(binding) };
             if !error.is_null() {
-                failures += 1;
-                eprintln!("ACL binding deletion failed: {}", unsafe {
+                errors.push(format!("ACL binding deletion failed: {}", unsafe {
                     c_string(sys::rd_kafka_error_string(error))
-                });
+                }));
             }
         }
     }
-    Ok(AclMutationResult { matched, failures })
+    Ok(AclMutationResult {
+        matched,
+        failures: errors.len(),
+        errors,
+    })
 }
 
 fn native_acl_binding(binding: &AclBinding) -> Result<NativeAcl> {
@@ -1375,17 +1379,17 @@ fn optional_c_string(value: Option<&str>, field: &str) -> Result<Option<CString>
         .transpose()
 }
 
-fn acl_result_failures(
+fn acl_result_errors(
     results: *mut *const sys::rd_kafka_acl_result_t,
     count: usize,
     operation: &str,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     if count > 0 && results.is_null() {
         return Err(Error::Config(format!(
             "broker returned a null {operation} result array"
         )));
     }
-    let mut failures = 0;
+    let mut errors = Vec::new();
     for index in 0..count {
         let result = unsafe { *results.add(index) };
         if result.is_null() {
@@ -1395,13 +1399,12 @@ fn acl_result_failures(
         }
         let error = unsafe { sys::rd_kafka_acl_result_error(result) };
         if !error.is_null() {
-            failures += 1;
-            eprintln!("{operation} failed: {}", unsafe {
+            errors.push(format!("{operation} failed: {}", unsafe {
                 c_string(sys::rd_kafka_error_string(error))
-            });
+            }));
         }
     }
-    Ok(failures)
+    Ok(errors)
 }
 
 unsafe fn acl_binding_from_native(
