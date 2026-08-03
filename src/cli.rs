@@ -622,10 +622,14 @@ pub enum ReassignAction {
     Verify {
         #[arg(long)]
         reassignment_json_file: PathBuf,
+        #[arg(long)]
+        preserve_throttles: bool,
     },
     Cancel {
         #[arg(long)]
         reassignment_json_file: PathBuf,
+        #[arg(long)]
+        preserve_throttles: bool,
         #[arg(long)]
         execute: bool,
     },

@@ -3777,6 +3777,7 @@ async fn reassign(
         }
         ReassignAction::Cancel {
             reassignment_json_file,
+            preserve_throttles,
             execute,
         } => {
             let plan = read_reassignment(reassignment_json_file)?;
@@ -3792,10 +3793,20 @@ async fn reassign(
             let result = client
                 .alter_partition_reassignments(reassignment_topics(&plan, true), timeout)
                 .await?;
+            let brokers = client
+                .describe_cluster()
+                .await?
+                .brokers
+                .into_iter()
+                .map(|broker| broker.broker_id)
+                .collect::<BTreeSet<_>>();
             drop(client);
             let rows = reassignment_result_rows(&result, "CANCELLED");
             let failures = rows.iter().filter(|row| row.error.is_some()).count();
             if failures == 0 {
+                if !preserve_throttles {
+                    clear_reassignment_throttles(config, timeout, &plan, &brokers)?;
+                }
                 write_reassignment_mutation_rows(format, "reassign.cancel", &plan, "CANCELLED")
             } else {
                 write_mutation_rows(format, "reassign.cancel", &rows)?;
@@ -3807,16 +3818,25 @@ async fn reassign(
         }
         ReassignAction::Verify {
             reassignment_json_file,
+            preserve_throttles,
         } => {
             let plan = read_reassignment(reassignment_json_file)?;
-            let filters = reassignment_filters(&plan);
             let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
-            let running = client
-                .list_partition_reassignments(Some(filters), timeout)
-                .await?;
+            let running = client.list_partition_reassignments(None, timeout).await?;
+            let log_dirs_ongoing = reassignment_log_dirs_ongoing(&client, &plan).await?;
+            let brokers = client
+                .describe_cluster()
+                .await?
+                .brokers
+                .into_iter()
+                .map(|broker| broker.broker_id)
+                .collect::<BTreeSet<_>>();
             drop(client);
             let current = current_replicas(config, timeout, &plan)?;
             let statuses = reassignment_statuses(&plan, &running, &current);
+            if reassignment_count(&running) == 0 && !log_dirs_ongoing && !preserve_throttles {
+                clear_reassignment_throttles(config, timeout, &plan, &brokers)?;
+            }
             output::write_value(format, "reassign.verify", &statuses, |rows| {
                 reassignment_table(rows)
             })
@@ -4053,6 +4073,96 @@ fn apply_reassignment_throttles(
                 timeout_ms,
             )?;
         }
+    }
+    Ok(())
+}
+
+async fn reassignment_log_dirs_ongoing(
+    client: &krafka::admin::AdminClient,
+    plan: &ReassignmentFile,
+) -> Result<bool> {
+    let targets = plan
+        .partitions
+        .iter()
+        .flat_map(|partition| {
+            partition
+                .replicas
+                .iter()
+                .zip(&partition.log_dirs)
+                .filter(|(_, directory)| directory.as_str() != "any")
+                .map(|(broker, _)| (partition.topic.as_str(), partition.partition, *broker))
+        })
+        .collect::<BTreeSet<_>>();
+    if targets.is_empty() {
+        return Ok(false);
+    }
+    let topics = reassignment_filters(plan)
+        .into_iter()
+        .map(|topic| DescribableLogDirTopic {
+            topic: topic.name,
+            partitions: topic.partition_indexes,
+        })
+        .collect();
+    Ok(client
+        .describe_log_dirs(Some(topics))
+        .await?
+        .iter()
+        .any(|directory| {
+            directory.topics.iter().any(|topic| {
+                topic.partitions.iter().any(|partition| {
+                    partition.is_future_key
+                        && targets.contains(&(
+                            topic.name.as_str(),
+                            partition.partition_index,
+                            directory.broker_id,
+                        ))
+                })
+            })
+        }))
+}
+
+fn clear_reassignment_throttles(
+    config: &rdkafka::ClientConfig,
+    timeout: Duration,
+    plan: &ReassignmentFile,
+    cluster_brokers: &BTreeSet<i32>,
+) -> Result<()> {
+    let admin = admin(config)?;
+    let timeout_ms = duration_ms(timeout)?;
+    let mut brokers = cluster_brokers.clone();
+    let mut topics = BTreeSet::new();
+    for partition in &plan.partitions {
+        topics.insert(partition.topic.as_str());
+        brokers.extend(&partition.replicas);
+    }
+    let topic_deletes = [
+        "leader.replication.throttled.replicas".into(),
+        "follower.replication.throttled.replicas".into(),
+    ];
+    for topic in topics {
+        ffi::incremental_alter_config(
+            admin.inner().native_ptr(),
+            rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_TOPIC,
+            topic,
+            &[],
+            &topic_deletes,
+            timeout_ms,
+        )?;
+    }
+    let broker_deletes = [
+        "leader.replication.throttled.rate".into(),
+        "follower.replication.throttled.rate".into(),
+        "replica.alter.log.dirs.io.max.bytes.per.second".into(),
+    ];
+    for broker in brokers {
+        ffi::incremental_alter_config(
+            admin.inner().native_ptr(),
+            rdkafka_sys::rd_kafka_ResourceType_t::RD_KAFKA_RESOURCE_BROKER,
+            &broker.to_string(),
+            &[],
+            &broker_deletes,
+            timeout_ms,
+        )?;
     }
     Ok(())
 }
