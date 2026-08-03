@@ -46,6 +46,11 @@ type Admin = AdminClient<DefaultClientContext>;
 
 /// Executes one top-level command.
 pub async fn execute(cli: Cli) -> Result<()> {
+    if let Command::Groups(args) = &cli.command
+        && let GroupAction::ValidateRegex { regex } = &args.action
+    {
+        return validate_group_regex(cli.output, regex);
+    }
     let bootstrap = cli.bootstrap_server.as_deref().ok_or_else(|| {
         Error::Usage("--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into())
     })?;
@@ -864,6 +869,7 @@ async fn groups(
     action: GroupAction,
 ) -> Result<()> {
     match action {
+        GroupAction::ValidateRegex { .. } => unreachable!("handled before client configuration"),
         GroupAction::List { state, group_type } => list_groups(
             config,
             timeout,
@@ -959,6 +965,32 @@ async fn groups(
             )
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct RegexValidationRow<'a> {
+    regex: &'a str,
+    valid: bool,
+    error: Option<String>,
+}
+
+fn validate_group_regex(format: OutputFormat, regex: &str) -> Result<()> {
+    let validation = Regex::new(regex);
+    let row = RegexValidationRow {
+        regex,
+        valid: validation.is_ok(),
+        error: validation.err().map(|error| error.to_string()),
+    };
+    output::write_value(format, "groups.validate-regex", &row, |row| {
+        output::table(
+            ["REGEX", "VALID", "ERROR"],
+            [[
+                row.regex.to_owned(),
+                row.valid.to_string(),
+                row.error.as_deref().unwrap_or("-").to_owned(),
+            ]],
+        )
+    })
 }
 
 fn list_groups(

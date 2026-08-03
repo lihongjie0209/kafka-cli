@@ -89,6 +89,7 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
             ("--list", "list"),
         ],
         "groups" => &[
+            ("--validate-regex", "validate-regex"),
             ("--describe", "describe"),
             ("--delete-offsets", "delete-offsets"),
             ("--reset-offsets", "reset-offsets"),
@@ -324,6 +325,9 @@ pub struct GroupsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum GroupAction {
+    ValidateRegex {
+        regex: String,
+    },
     List {
         /// Include state and optionally filter by comma-separated group states.
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
@@ -723,6 +727,12 @@ mod tests {
         "--skip-message-on-error"
     );
     parses_command_family!(groups_family_parses, "groups", "list");
+    parses_command_family!(
+        groups_validate_regex_parses,
+        "groups",
+        "validate-regex",
+        "orders-.*"
+    );
     parses_command_family!(
         groups_reset_from_file_parses,
         "groups",

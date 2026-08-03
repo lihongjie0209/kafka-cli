@@ -21,3 +21,14 @@ fn missing_bootstrap_server_should_return_usage_exit_code() {
         .code(2)
         .stderr(predicate::str::contains("--bootstrap-server is required"));
 }
+
+#[test]
+fn group_regex_validation_should_not_require_a_broker() {
+    let mut command = Command::cargo_bin("kafka").expect("kafka binary");
+    command
+        .args(["groups", "validate-regex", "orders-.*"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("orders-.*"))
+        .stdout(predicate::str::contains("true"));
+}
