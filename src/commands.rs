@@ -4,6 +4,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Write},
     path::Path,
+    process,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -993,19 +995,12 @@ async fn consume(
     _timeout: Duration,
     args: crate::cli::ConsumeArgs,
 ) -> Result<()> {
-    config.set("group.id", args.group.as_deref().unwrap_or("kafka-cli"));
-    config.set("enable.auto.commit", "true");
-    config.set("isolation.level", &args.isolation_level);
-    config.set(
-        "auto.offset.reset",
-        if args.from_beginning {
-            "earliest"
-        } else {
-            "latest"
-        },
-    );
-    apply_client_properties(&mut config, &args.properties)?;
+    configure_consumer(&mut config, &args)?;
     let formatter = message_formatter_options(&args)?;
+    let manual_offset = args
+        .partition
+        .map(|_| consumer_offset(args.offset.as_deref(), args.from_beginning))
+        .transpose()?;
     let consumer: StreamConsumer = config.create()?;
     if let Some(partition) = args.partition {
         let topic = args
@@ -1013,20 +1008,7 @@ async fn consume(
             .as_deref()
             .ok_or_else(|| Error::Usage("--topic is required with --partition".into()))?;
         let mut assignment = TopicPartitionList::new();
-        assignment.add_partition_offset(
-            topic,
-            partition,
-            args.offset.map_or_else(
-                || {
-                    if args.from_beginning {
-                        Offset::Beginning
-                    } else {
-                        Offset::End
-                    }
-                },
-                Offset::Offset,
-            ),
-        )?;
+        assignment.add_partition_offset(topic, partition, manual_offset.unwrap_or(Offset::End))?;
         consumer.assign(&assignment)?;
     } else if let Some(include) = args.include.as_deref() {
         Regex::new(include)
@@ -1076,6 +1058,107 @@ async fn consume(
         }
     }
     Ok(())
+}
+
+static CONSUMER_GROUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn configure_consumer(
+    config: &mut rdkafka::ClientConfig,
+    args: &crate::cli::ConsumeArgs,
+) -> Result<()> {
+    let file_group = config.get("group.id").map(str::to_owned);
+    let inline = parse_pairs(&args.properties)?;
+    let inline_group = inline
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "group.id")
+        .map(|(_, value)| value.clone());
+    let groups = [
+        args.group.as_ref(),
+        file_group.as_ref(),
+        inline_group.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<BTreeSet<_>>();
+    if groups.len() > 1 {
+        return Err(Error::Usage(format!(
+            "group ids supplied by --group, --command-config, and --command-property must match: {}",
+            groups
+                .into_iter()
+                .map(|group| format!("'{group}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if args.partition.is_some() && !groups.is_empty() {
+        return Err(Error::Usage(
+            "--group/group.id and --partition cannot be specified together".into(),
+        ));
+    }
+
+    for (key, value) in inline {
+        config.set(key, value);
+    }
+    if config.get("client.id").is_none() {
+        config.set("client.id", "console-consumer");
+    }
+    if let Some(group) = args.group.as_deref().or_else(|| config.get("group.id")) {
+        let group = group.to_owned();
+        config.set("group.id", group);
+    } else {
+        config.set("group.id", ephemeral_consumer_group());
+        if config.get("enable.auto.commit").is_none() {
+            config.set("enable.auto.commit", "false");
+        }
+    }
+
+    if args.from_beginning {
+        if config
+            .get("auto.offset.reset")
+            .is_some_and(|value| value != "earliest")
+        {
+            return Err(Error::Usage(
+                "--from-beginning conflicts with auto.offset.reset other than earliest".into(),
+            ));
+        }
+        config.set("auto.offset.reset", "earliest");
+    } else if config.get("auto.offset.reset").is_none() {
+        config.set("auto.offset.reset", "latest");
+    }
+    if let Some(isolation) = &args.isolation_level {
+        config.set("isolation.level", isolation);
+    } else if config.get("isolation.level").is_none() {
+        config.set("isolation.level", "read_uncommitted");
+    }
+    Ok(())
+}
+
+fn ephemeral_consumer_group() -> String {
+    format!(
+        "console-consumer-{}-{}",
+        process::id(),
+        CONSUMER_GROUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn consumer_offset(value: Option<&str>, from_beginning: bool) -> Result<Offset> {
+    match value {
+        Some(value) if value.eq_ignore_ascii_case("earliest") => Ok(Offset::Beginning),
+        Some(value) if value.eq_ignore_ascii_case("latest") => Ok(Offset::End),
+        Some(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|offset| *offset >= 0)
+            .map(Offset::Offset)
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "invalid offset '{value}'; expected earliest, latest, or a non-negative integer"
+                ))
+            }),
+        None if from_beginning => Ok(Offset::Beginning),
+        None => Ok(Offset::End),
+    }
 }
 
 #[expect(
@@ -6175,6 +6258,105 @@ mod tests {
         assert!(options.print_partition && options.print_headers && options.print_key);
         assert_eq!(options.key_separator, b"|");
         assert_eq!(options.null_literal, b"NULL");
+    }
+
+    #[test]
+    fn consumer_without_group_should_use_ephemeral_non_committing_group() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+        ])
+        .expect("consumer arguments");
+        let Command::Consume(args) = cli.command else {
+            panic!("expected consume command");
+        };
+        let mut config = rdkafka::ClientConfig::new();
+
+        configure_consumer(&mut config, &args).expect("consumer configuration");
+
+        assert!(
+            config
+                .get("group.id")
+                .is_some_and(|group| group.starts_with("console-consumer-"))
+        );
+        assert_eq!(config.get("enable.auto.commit"), Some("false"));
+        assert_eq!(config.get("client.id"), Some("console-consumer"));
+        assert_eq!(config.get("auto.offset.reset"), Some("latest"));
+        assert_eq!(config.get("isolation.level"), Some("read_uncommitted"));
+    }
+
+    #[test]
+    fn consumer_should_reject_conflicting_group_and_offset_reset_sources() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--group",
+            "cli-group",
+            "--command-property",
+            "group.id=property-group",
+        ])
+        .expect("consumer arguments");
+        let Command::Consume(args) = cli.command else {
+            panic!("expected consume command");
+        };
+        let mut config = rdkafka::ClientConfig::new();
+        assert!(matches!(
+            configure_consumer(&mut config, &args),
+            Err(Error::Usage(message)) if message.contains("must match")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--from-beginning",
+            "--command-property",
+            "auto.offset.reset=latest",
+        ])
+        .expect("consumer arguments");
+        let Command::Consume(args) = cli.command else {
+            panic!("expected consume command");
+        };
+        let mut config = rdkafka::ClientConfig::new();
+        assert!(matches!(
+            configure_consumer(&mut config, &args),
+            Err(Error::Usage(message)) if message.contains("auto.offset.reset")
+        ));
+    }
+
+    #[test]
+    fn consumer_offset_should_accept_kafka_names_and_reject_invalid_values() {
+        assert_eq!(
+            consumer_offset(Some("earliest"), false).expect("earliest"),
+            Offset::Beginning
+        );
+        assert_eq!(
+            consumer_offset(Some("LATEST"), false).expect("latest"),
+            Offset::End
+        );
+        assert_eq!(
+            consumer_offset(Some("42"), false).expect("numeric offset"),
+            Offset::Offset(42)
+        );
+        assert!(matches!(
+            consumer_offset(Some("-1"), false),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            consumer_offset(Some("middle"), false),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]

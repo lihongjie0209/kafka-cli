@@ -355,19 +355,20 @@ pub struct ConsumeArgs {
     pub include: Option<String>,
     #[arg(long)]
     pub group: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires = "topic", conflicts_with = "group", value_parser = clap::value_parser!(i32).range(0..))]
     pub partition: Option<i32>,
-    #[arg(long)]
-    pub offset: Option<i64>,
-    #[arg(long)]
+    /// Numeric offset, `earliest`, or `latest`; valid only with --partition.
+    #[arg(long, requires = "partition", conflicts_with = "from_beginning")]
+    pub offset: Option<String>,
+    #[arg(long, conflicts_with = "offset")]
     pub from_beginning: bool,
     #[arg(long)]
     pub max_messages: Option<u64>,
     /// Exit successfully after this many milliseconds without a message.
     #[arg(long)]
     pub timeout_ms: Option<u64>,
-    #[arg(long, value_parser = ["read_uncommitted", "read_committed"], default_value = "read_uncommitted")]
-    pub isolation_level: String,
+    #[arg(long, value_parser = ["read_uncommitted", "read_committed"])]
+    pub isolation_level: Option<String>,
     /// Continue after a Kafka message/poll error.
     #[arg(long)]
     pub skip_message_on_error: bool,
@@ -919,6 +920,35 @@ mod tests {
             panic!("expected produce command");
         };
         assert_eq!(args.compression_type, "gzip");
+    }
+
+    #[test]
+    fn consumer_offset_should_require_manual_partition() {
+        let missing_partition = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--offset",
+            "earliest",
+        ]);
+        assert!(missing_partition.is_err());
+
+        let conflicting_group = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--partition",
+            "0",
+            "--group",
+            "orders",
+        ]);
+        assert!(conflicting_group.is_err());
     }
 
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");

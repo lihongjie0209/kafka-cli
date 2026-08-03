@@ -362,6 +362,25 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .assert()
         .success()
         .stdout(predicate::str::contains("first"));
+    for _ in 0..2 {
+        Command::cargo_bin("kafka")
+            .expect("kafka binary")
+            .args([
+                "--bootstrap-server",
+                &bootstrap,
+                "consume",
+                "--topic",
+                "integration-json",
+                "--from-beginning",
+                "--max-messages",
+                "1",
+                "--timeout-ms",
+                "10000",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("first"));
+    }
     Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([
@@ -459,7 +478,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--max-messages",
             "1",
             "--offset",
-            "0",
+            "earliest",
             "--json",
         ])
         .assert()
