@@ -7,7 +7,7 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目基准：`master`，提交 `c56ac2fdebce8dee322a8f88af132008e9f9af82`。
+- 本项目基准：`master`，提交 `874b0f91908bc0030ec53bda31fdfd50d1524888`。
 - Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 13 个兼容名称，入口覆盖率为 13/44（29.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
@@ -41,7 +41,7 @@
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
 | 普通自动化测试 | 76 个通过 | 72 个 library unit tests + 4 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
-| 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 均为单 broker 代表性路径，不等于完整兼容矩阵 |
+| 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
 原版动作数 31 的构成：Topics 5、Consumer Groups 6、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 7 个入口各 1。Console producer/consumer 属于单动作数据命令；本项目额外把 API versions 也放入 cluster 子命令。
@@ -56,7 +56,7 @@
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 行输入、sync/async、key、JSON、headers、partition 及主要 producer 调优参数；未复刻可插拔 reader |
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation；未复刻 Java formatter/deserializer |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
-| `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker、group，以及 librdkafka SCRAM user credential；缺少其他 entity type |
+| `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；缺 bootstrap-controller |
 | `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | librdkafka ListOffsets；topic 正则、partition 模式、earliest/latest/max-timestamp/timestamp、排除内部主题 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
 | `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流/安全参数及 verify/cancel throttle 生命周期；缺 controller 模式 |
@@ -138,7 +138,7 @@
 
 已支持：
 
-- topic、broker、group 的 describe 和增量 add/delete config。
+- topic、broker、group 的 describe 和增量 add/delete config；broker 支持命名实体和 `--entity-default` 默认实体。
 - describe 可省略 entity-name 枚举该类型的全部实体；默认只显示动态 override，原版 `--all` 显示继承、静态和默认配置。多实体输出包含 entity type/name 与 config source。
 - 原版复数 entity type（`topics`、`brokers`、`groups`、`users`）以及兼容的单数别名。
 - user SCRAM credential describe、upsert 和 delete，支持 SCRAM-SHA-256、SCRAM-SHA-512、iterations 与 password。
@@ -148,7 +148,7 @@
 - alter 支持原版 `--add-config-file` Java properties 文件，并与 `--add-config` 互斥；普通 config 预览统一使用表格/JSON，而非手工文本。
 - 预览与 `--execute`。
 
-缺少：broker default entity、bootstrap-controller。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 使用 DescribeConfigs/IncrementalAlterConfigs 32/44 及 ListConfigResources 74。librdkafka 2.12 没有这些资源类型或 quota 的公开 C API，因此当前由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。broker default entity 必须使用空 ConfigResource name，但 librdkafka 2.12 的 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时直接返回 NULL，因此不能通过该库表达。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
+缺少：bootstrap-controller。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity 还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
 
 ### 4.6 Get Offsets
 
@@ -231,7 +231,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
 - Rust 单元测试与普通 CLI 测试：76 个通过。
-- Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
+- Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -254,8 +254,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-当前实现基准 `c56ac2f` 已由 GitHub Actions 运行
-[`30828851029`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30828851029) 完整验证通过：fmt/Clippy/76 个普通测试、bundled glibc、Kafka 3.6.2、包含 quota、broker-logger、client-metrics 与 reassignment 闭环的 Kafka 4.3.1、x86_64 musl 和 aarch64 musl。
+当前实现基准 `874b0f9` 已由 GitHub Actions 运行
+[`30829902697`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30829902697) 完整验证通过：fmt/Clippy/76 个普通测试、bundled glibc、Kafka 3.6.2、包含 broker default、quota、broker-logger、client-metrics 与 reassignment 闭环的 Kafka 4.3.1、x86_64 musl 和 aarch64 musl。配置写入后的集成断言采用最多 5 秒的有界重试处理 Kafka 配置传播，超时仍会保留最后一次实际输出并使测试失败。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -270,7 +270,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 
 ### P1：补齐已支持脚本的主要差距
 
-1. Configs 增加 broker default entity 与 bootstrap-controller。
+1. Configs 增加 bootstrap-controller；broker default entity 已实现并完成 Kafka 4 回归验证。
 2. Reassignment 增加 bootstrap-controller，并补多 broker 长时间迁移的限流差分测试。
 3. 在 librdkafka 增加相应 OffsetSpec 后，为 Get Offsets 增加 earliest-local、latest-tiered、earliest-pending-upload。
 4. Topics 增加 `partition-size-limit-per-response`（需要 librdkafka 暴露对应请求选项）。
@@ -303,7 +303,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | console-producer | 单动作 | 中 | 中 | 可做常规生产，不替代 Java reader 插件体系 |
 | console-consumer | 单动作 | 中 | 中 | 可做常规消费，不替代 formatter/deserializer 插件体系 |
 | consumer-groups | 完整 | 高 | 高/中 | reset 已对齐 inactive group、空 group、重复 selector 和结构化批量输出；epoch 列仍受 librdkafka 限制 |
-| configs | 完整 | 高 | 中/高 | topic/broker/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 default broker/controller |
+| configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 bootstrap-controller |
 | get-offsets | 单动作 | 高 | 中 | 查询能力较完整，缺分层存储相关 OffsetSpec |
 | acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
 | reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；仍缺 controller |
@@ -349,6 +349,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | Reassignment throttle 生命周期 | verify 同时核对全局活动 partition reassignment 与目标 future log-dir replica，结束后清理目标 topic、集群及计划 broker 的全部 throttle；cancel 成功后同样清理，preserve-throttles 可显式保留 | all-features Clippy、73 个普通测试通过；Kafka 4.3.1 集成增加设置→describe→verify→清理闭环 |
 | 2026-08-03 | Client quota entities | configs 新增 users/clients/ips quota、user+client 复合实体和 default entity；Describe/AlterClientQuotas API 48/49 负责查询、写入、删除校验和 controller 路由；user describe 同时合并 quota 与 SCRAM | all-features Clippy、76 个普通测试、Kafka 3.6.2/4.3.1 client/user+client/default IP 设置→查询→删除闭环及双 musl CI 通过 |
 | 2026-08-03 | Broker logger 与 client metrics configs | 新增 ConfigResource type 8/16；broker logger 直连指定 broker，client metrics 使用 API 74 枚举并由 controller 处理增量修改，所有结果进入统一 table/JSON envelope | all-features Clippy、76 个普通测试、Kafka 3.6.2/4.3.1 设置→查询/枚举→删除闭环及双 musl CI 通过 |
+| 2026-08-03 | Broker default config entity | `configs` 使用空名称 ConfigResource 支持 broker `--entity-default` 的 describe/add/delete，并按动态默认 broker source 过滤结果 | 76 个普通测试、Kafka 3.6.2/4.3.1 设置→查询→删除闭环、glibc release 及 x86_64/aarch64 musl CI 全部通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
