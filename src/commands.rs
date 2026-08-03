@@ -1184,6 +1184,48 @@ struct MessageFormatterOptions {
     line_separator: Vec<u8>,
     headers_separator: Vec<u8>,
     null_literal: Vec<u8>,
+    key_deserializer: NativeDeserializer,
+    value_deserializer: NativeDeserializer,
+    headers_deserializer: NativeDeserializer,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NativeDeserializer {
+    #[default]
+    Raw,
+    Utf8String,
+}
+
+fn native_deserializer(class: Option<&str>, field: &str) -> Result<NativeDeserializer> {
+    match class {
+        None | Some("") => Ok(NativeDeserializer::Raw),
+        Some("org.apache.kafka.common.serialization.StringDeserializer") => {
+            Ok(NativeDeserializer::Utf8String)
+        }
+        Some(class) => Err(Error::Unsupported(format!(
+            "Java {field} deserializer class {class} cannot be loaded by the native client"
+        ))),
+    }
+}
+
+fn deserialize_for_display(
+    bytes: Option<&[u8]>,
+    deserializer: NativeDeserializer,
+    null_literal: &[u8],
+) -> Vec<u8> {
+    let bytes = bytes.unwrap_or(null_literal);
+    match deserializer {
+        NativeDeserializer::Raw => bytes.to_vec(),
+        NativeDeserializer::Utf8String => String::from_utf8_lossy(bytes).into_owned().into_bytes(),
+    }
+}
+
+fn is_utf8_encoding(value: &str) -> bool {
+    value
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_'))
+        .collect::<String>()
+        .eq_ignore_ascii_case("UTF8")
 }
 
 fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFormatterOptions> {
@@ -1196,14 +1238,39 @@ fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFo
     let properties =
         component_properties(args.formatter_config.as_deref(), &args.formatter_properties)?;
     let value = |key: &str| properties.get(key);
-    for key in [
-        "key.deserializer",
-        "value.deserializer",
-        "headers.deserializer",
+    let key_deserializer = native_deserializer(
+        value("key.deserializer")
+            .map(String::as_str)
+            .or(args.key_deserializer.as_deref()),
+        "key",
+    )?;
+    let value_deserializer = native_deserializer(
+        value("value.deserializer")
+            .map(String::as_str)
+            .or(args.value_deserializer.as_deref()),
+        "value",
+    )?;
+    let headers_deserializer =
+        native_deserializer(value("headers.deserializer").map(String::as_str), "headers")?;
+    for (key, applies) in [
+        (
+            "deserializer.encoding",
+            key_deserializer == NativeDeserializer::Utf8String
+                || value_deserializer == NativeDeserializer::Utf8String,
+        ),
+        (
+            "key.deserializer.encoding",
+            key_deserializer == NativeDeserializer::Utf8String,
+        ),
+        (
+            "value.deserializer.encoding",
+            value_deserializer == NativeDeserializer::Utf8String,
+        ),
     ] {
-        if value(key).is_some() {
+        if applies && let Some(encoding) = value(key).filter(|encoding| !is_utf8_encoding(encoding))
+        {
             return Err(Error::Unsupported(format!(
-                "Java formatter property {key} cannot be loaded by the native client"
+                "StringDeserializer encoding {encoding} is not supported by the native client"
             )));
         }
     }
@@ -1229,6 +1296,9 @@ fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFo
         null_literal: value("null.literal")
             .map_or(b"null".as_slice(), String::as_bytes)
             .to_vec(),
+        key_deserializer,
+        value_deserializer,
+        headers_deserializer,
     })
 }
 
@@ -1264,18 +1334,18 @@ fn write_formatted_message(
         fields.push(formatted_headers(message.headers(), options));
     }
     if options.print_key {
-        fields.push(
-            message
-                .key()
-                .map_or_else(|| options.null_literal.clone(), <[u8]>::to_vec),
-        );
+        fields.push(deserialize_for_display(
+            message.key(),
+            options.key_deserializer,
+            &options.null_literal,
+        ));
     }
     if options.print_value {
-        fields.push(
-            message
-                .payload()
-                .map_or_else(|| options.null_literal.clone(), <[u8]>::to_vec),
-        );
+        fields.push(deserialize_for_display(
+            message.payload(),
+            options.value_deserializer,
+            &options.null_literal,
+        ));
     }
     let mut stdout = io::stdout().lock();
     for (index, field) in fields.iter().enumerate() {
@@ -1304,7 +1374,11 @@ fn formatted_headers(
         }
         result.extend_from_slice(header.key.as_bytes());
         result.push(b':');
-        result.extend_from_slice(header.value.unwrap_or(&options.null_literal));
+        result.extend_from_slice(&deserialize_for_display(
+            header.value,
+            options.headers_deserializer,
+            &options.null_literal,
+        ));
     }
     result
 }
@@ -6272,6 +6346,66 @@ mod tests {
         assert!(options.print_partition && options.print_headers && options.print_key);
         assert_eq!(options.key_separator, b"|");
         assert_eq!(options.null_literal, b"NULL");
+    }
+
+    #[test]
+    fn string_deserializer_should_follow_kafka_utf8_display_semantics() {
+        assert_eq!(
+            native_deserializer(
+                Some("org.apache.kafka.common.serialization.StringDeserializer"),
+                "value"
+            )
+            .expect("string deserializer"),
+            NativeDeserializer::Utf8String
+        );
+        assert_eq!(
+            deserialize_for_display(
+                Some(b"valid UTF-8"),
+                NativeDeserializer::Utf8String,
+                b"null"
+            ),
+            b"valid UTF-8"
+        );
+        assert_eq!(
+            String::from_utf8(deserialize_for_display(
+                Some(&[b'a', 0xff, b'b']),
+                NativeDeserializer::Utf8String,
+                b"null"
+            ))
+            .expect("lossy UTF-8 result"),
+            "a\u{fffd}b"
+        );
+        assert!(matches!(
+            native_deserializer(Some("example.CustomDeserializer"), "value"),
+            Err(Error::Unsupported(message)) if message.contains("example.CustomDeserializer")
+        ));
+    }
+
+    #[test]
+    fn formatter_property_should_override_deserializer_option() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--key-deserializer",
+            "example.CustomDeserializer",
+            "--formatter-property",
+            "key.deserializer=org.apache.kafka.common.serialization.StringDeserializer",
+            "--value-deserializer",
+            "org.apache.kafka.common.serialization.StringDeserializer",
+            "--formatter-property",
+            "value.deserializer.encoding=UTF8",
+        ])
+        .expect("consumer deserializers");
+        let Command::Consume(args) = cli.command else {
+            panic!("expected consume command");
+        };
+        let options = message_formatter_options(&args).expect("formatter options");
+        assert_eq!(options.key_deserializer, NativeDeserializer::Utf8String);
+        assert_eq!(options.value_deserializer, NativeDeserializer::Utf8String);
     }
 
     #[test]

@@ -364,6 +364,12 @@ pub struct ConsumeArgs {
         default_value = "org.apache.kafka.tools.consumer.DefaultMessageFormatter"
     )]
     pub formatter: String,
+    /// Kafka key deserializer class used by the default formatter.
+    #[arg(long)]
+    pub key_deserializer: Option<String>,
+    /// Kafka value deserializer class used by the default formatter.
+    #[arg(long)]
+    pub value_deserializer: Option<String>,
     #[arg(long, requires = "topic", conflicts_with = "group", value_parser = clap::value_parser!(i32).range(0..))]
     pub partition: Option<i32>,
     /// Numeric offset, `earliest`, or `latest`; valid only with --partition.
