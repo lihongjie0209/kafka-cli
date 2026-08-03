@@ -272,7 +272,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
 - Rust 单元测试与普通 CLI 测试：186 个通过（176 个 library unit tests + 10 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试：已加入 Transactions list、指定 broker describe-producers 与 find-hanging，等待当前提交 CI 验证；此前基准覆盖其余 15 个命令族。
+- Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 16 个命令族；Transactions 覆盖 list、指定 broker describe-producers 与 find-hanging。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -295,8 +295,8 @@ CI workflow 包含：
 - `x86_64-unknown-linux-musl` 静态构建及 artifact。
 - `aarch64-unknown-linux-musl` 静态交叉构建及 artifact。
 
-最近一个完整绿色基准仍为 `3a0c0b2` 的 GitHub Actions
-[`30851984283`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30851984283)：fmt/Clippy/172 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 全部通过。当前 `ac4e3fb` 新增 Transactions 与 186 个普通测试，推送后由同一六 job 矩阵验证；报告不会在 CI 完成前把它表述为已全绿。
+Transactions 实现 `ac4e3fb` 及报告提交 `d626fdd` 已由 GitHub Actions
+[`30853525172`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30853525172) 完整验证通过：fmt/Clippy/186 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。两种 musl artifact 均执行 `--version`/`--help` smoke test，ARM64 通过 QEMU user-mode emulator 启动；musl 没有在本地构建。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -427,7 +427,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | Get Offsets tiered specs | `-4/-5/-6` 从解析后能力错误升级为 ListOffsets v11 协议 fallback；普通 spec 保持 librdkafka，逐 partition error/unknown offset 语义保持一致 | 156 个单元测试、7 个 CLI 测试；Kafka 4.3.1 实际请求 earliest-local/latest-tiered/earliest-pending-upload；CI `30850201584` 六项全绿 |
 | 2026-08-04 | Client Metrics 独立入口 | 新增 `kafka client-metrics` 和 `kafka-client-metrics.sh`；完整实现 list/describe/alter/delete、Kafka UUID generate-name、interval/match/metrics 与空值删除语义，复用 API 74/32/44 后端 | 159 个单元测试、8 个 CLI 测试；Kafka 4.3.1 设置→list→describe→delete 闭环；CI `30851053389` 六项全绿 |
 | 2026-08-04 | Kafka Features 入口 | 新增 `kafka features` 和 `kafka-features.sh`；实现六个原版动作、指定 node describe、UpdateFeatures v0/v1 dry-run/更新，以及按 Kafka 4.4 源码对齐的 metadata/production feature 离线映射 | 163 个单元测试、9 个 CLI 测试；Kafka 4.3.1 任意/指定 node describe 与 metadata upgrade dry-run；CI `30851984283` 六项全绿 |
-| 2026-08-04 | Kafka Transactions 入口 | 新增 `kafka transactions` 和 `kafka-transactions.sh`；实现 list、describe、describe-producers、abort、find-hanging、forceTerminateTransaction，保留 coordinator、指定 broker、两类 abort spec 和 producer fencing 语义 | 176 个单元测试、10 个 CLI 测试；Kafka 4.3.1 list/指定 broker producer state/find-hanging 已加入当前 CI |
+| 2026-08-04 | Kafka Transactions 入口 | 新增 `kafka transactions` 和 `kafka-transactions.sh`；实现 list、describe、describe-producers、abort、find-hanging、forceTerminateTransaction，保留 coordinator、指定 broker、两类 abort spec 和 producer fencing 语义 | 176 个单元测试、10 个 CLI 测试；Kafka 4.3.1 list/指定 broker producer state/find-hanging；CI `30853525172` 六项全绿 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
