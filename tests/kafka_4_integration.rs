@@ -339,6 +339,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "102400",
             "--command-property",
             "client.id=integration-producer",
+            "--command-property",
+            "buffer.memory=1048576",
+            "--command-property",
+            "send.buffer.bytes=4096",
+            "--command-property",
+            "max.block.ms=1000",
         ])
         .write_stdin("alpha\tfirst\nbeta\tsecond\n")
         .assert()

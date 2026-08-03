@@ -656,10 +656,8 @@ fn topic_results(
 }
 
 async fn produce(mut config: rdkafka::ClientConfig, args: crate::cli::ProduceArgs) -> Result<()> {
-    config.set("compression.type", &args.compression_type);
-    config.set("acks", &args.acks);
-    apply_producer_options(&mut config, &args);
     apply_client_properties(&mut config, &args.properties)?;
+    let max_block_ms = configure_producer(&mut config, &args)?;
     let reader = line_reader_options(&args)?;
     let producer: FutureProducer = config.create()?;
     let input = io::read_to_string(io::stdin())?;
@@ -693,12 +691,12 @@ async fn produce(mut config: rdkafka::ClientConfig, args: crate::cli::ProduceArg
         }
         if args.sync {
             producer
-                .send(record, Duration::from_millis(args.max_block_ms))
+                .send(record, Duration::from_millis(max_block_ms))
                 .await
                 .map_err(|(error, _)| Error::Kafka(error))?;
         } else {
             deliveries.push(
-                enqueue_with_timeout(&producer, record, Duration::from_millis(args.max_block_ms))
+                enqueue_with_timeout(&producer, record, Duration::from_millis(max_block_ms))
                     .await?,
             );
         }
@@ -741,37 +739,125 @@ where
     }
 }
 
-fn apply_producer_options(config: &mut rdkafka::ClientConfig, args: &crate::cli::ProduceArgs) {
-    if let Some(value) = args.batch_size {
-        config.set("batch.size", value.to_string());
+fn configure_producer(
+    config: &mut rdkafka::ClientConfig,
+    args: &crate::cli::ProduceArgs,
+) -> Result<u64> {
+    let property_max_block = config
+        .get("max.block.ms")
+        .map(|value| parse_u64("max.block.ms", value))
+        .transpose()?;
+    config.remove("max.block.ms");
+    if let Some(buffer_memory) = config.get("buffer.memory") {
+        let bytes = parse_positive_u64("buffer.memory", buffer_memory)?;
+        config.set(
+            "queue.buffering.max.kbytes",
+            bytes.div_ceil(1024).to_string(),
+        );
+        config.remove("buffer.memory");
     }
+    if let Some(send_buffer) = config.get("send.buffer.bytes").map(str::to_owned) {
+        config.set("socket.send.buffer.bytes", send_buffer);
+        config.remove("send.buffer.bytes");
+    }
+
+    config.set("compression.type", &args.compression_type);
+    merge_producer_option(config, "acks", args.acks.as_deref(), "-1");
+    merge_producer_option(
+        config,
+        "batch.size",
+        args.batch_size.map(|value| value.to_string()).as_deref(),
+        "16384",
+    );
     if let Some(value) = args.max_partition_memory_bytes {
         config.set("batch.size", value.to_string());
     }
-    if let Some(value) = args.message_send_max_retries {
-        config.set("message.send.max.retries", value.to_string());
+    merge_producer_option(
+        config,
+        "message.send.max.retries",
+        args.message_send_max_retries
+            .map(|value| value.to_string())
+            .as_deref(),
+        "3",
+    );
+    merge_producer_option(
+        config,
+        "retry.backoff.ms",
+        args.retry_backoff_ms
+            .map(|value| value.to_string())
+            .as_deref(),
+        "100",
+    );
+    merge_producer_option(
+        config,
+        "linger.ms",
+        args.linger_ms.map(|value| value.to_string()).as_deref(),
+        "1000",
+    );
+    merge_producer_option(
+        config,
+        "request.timeout.ms",
+        args.request_timeout_ms
+            .map(|value| value.to_string())
+            .as_deref(),
+        "1500",
+    );
+    merge_producer_option(
+        config,
+        "metadata.max.age.ms",
+        args.metadata_expiry_ms
+            .map(|value| value.to_string())
+            .as_deref(),
+        "300000",
+    );
+    merge_producer_option(
+        config,
+        "queue.buffering.max.kbytes",
+        args.max_memory_bytes
+            .map(|value| value.div_ceil(1024).to_string())
+            .as_deref(),
+        "32768",
+    );
+    merge_producer_option(
+        config,
+        "socket.send.buffer.bytes",
+        args.socket_buffer_size
+            .map(|value| value.to_string())
+            .as_deref(),
+        "102400",
+    );
+    if config.get("client.id").is_none() {
+        config.set("client.id", "console-producer");
     }
-    if let Some(value) = args.retry_backoff_ms {
-        config.set("retry.backoff.ms", value.to_string());
+    Ok(args.max_block_ms.or(property_max_block).unwrap_or(60_000))
+}
+
+fn merge_producer_option(
+    config: &mut rdkafka::ClientConfig,
+    key: &str,
+    explicit: Option<&str>,
+    default: &str,
+) {
+    if let Some(value) = explicit {
+        config.set(key, value);
+    } else if config.get(key).is_none() {
+        config.set(key, default);
     }
-    if let Some(value) = args.linger_ms {
-        config.set("linger.ms", value.to_string());
+}
+
+fn parse_positive_u64(key: &str, value: &str) -> Result<u64> {
+    let value = parse_u64(key, value)?;
+    if value == 0 {
+        Err(Error::Usage(format!("{key} must be a positive integer")))
+    } else {
+        Ok(value)
     }
-    if let Some(value) = args.request_timeout_ms {
-        config.set("request.timeout.ms", value.to_string());
-    }
-    if let Some(value) = args.metadata_expiry_ms {
-        config.set("metadata.max.age.ms", value.to_string());
-    }
-    if let Some(value) = args.max_memory_bytes {
-        config.set(
-            "queue.buffering.max.kbytes",
-            value.div_ceil(1024).to_string(),
-        );
-    }
-    if let Some(value) = args.socket_buffer_size {
-        config.set("socket.send.buffer.bytes", value.to_string());
-    }
+}
+
+fn parse_u64(key: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| Error::Usage(format!("{key} must be a non-negative integer")))
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -6203,7 +6289,7 @@ mod tests {
             key_separator: None,
             parse_key: false,
             compression_type: "none".into(),
-            acks: "all".into(),
+            acks: Some("all".into()),
             sync: false,
             batch_size: None,
             max_partition_memory_bytes: None,
@@ -6212,7 +6298,7 @@ mod tests {
             linger_ms: None,
             request_timeout_ms: None,
             metadata_expiry_ms: None,
-            max_block_ms: 60_000,
+            max_block_ms: Some(60_000),
             max_memory_bytes: None,
             socket_buffer_size: None,
             json: true,
@@ -6252,7 +6338,7 @@ mod tests {
             key_separator: None,
             parse_key: false,
             compression_type: "none".into(),
-            acks: "all".into(),
+            acks: Some("all".into()),
             sync: false,
             batch_size: None,
             max_partition_memory_bytes: None,
@@ -6261,7 +6347,7 @@ mod tests {
             linger_ms: None,
             request_timeout_ms: None,
             metadata_expiry_ms: None,
-            max_block_ms: 60_000,
+            max_block_ms: Some(60_000),
             max_memory_bytes: None,
             socket_buffer_size: None,
             json: true,
@@ -6618,9 +6704,9 @@ mod tests {
             panic!("expected produce command");
         };
         let mut config = rdkafka::ClientConfig::new();
-        apply_producer_options(&mut config, &args);
+        let max_block_ms = configure_producer(&mut config, &args).expect("producer configuration");
         assert_eq!(config.get("batch.size"), Some("8192"));
-        assert_eq!(args.max_block_ms, 1234);
+        assert_eq!(max_block_ms, 1234);
         assert_eq!(config.get("message.send.max.retries"), Some("7"));
         assert_eq!(config.get("retry.backoff.ms"), Some("250"));
         assert_eq!(config.get("linger.ms"), Some("10"));
@@ -6629,6 +6715,90 @@ mod tests {
         assert_eq!(config.get("topic.metadata.refresh.interval.ms"), None);
         assert_eq!(config.get("queue.buffering.max.kbytes"), Some("1025"));
         assert_eq!(config.get("socket.send.buffer.bytes"), Some("32768"));
+    }
+
+    #[test]
+    fn producer_defaults_and_properties_should_follow_kafka_precedence() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--command-property",
+            "acks=0",
+            "--command-property",
+            "linger.ms=25",
+            "--command-property",
+            "max.block.ms=42",
+            "--command-property",
+            "buffer.memory=2048",
+            "--command-property",
+            "send.buffer.bytes=4096",
+            "--command-property",
+            "compression.type=gzip",
+            "--command-property",
+            "client.id=custom-producer",
+        ])
+        .expect("producer properties");
+        let Command::Produce(args) = cli.command else {
+            panic!("expected produce command");
+        };
+        let mut config = rdkafka::ClientConfig::new();
+        apply_client_properties(&mut config, &args.properties).expect("client properties");
+
+        let max_block_ms = configure_producer(&mut config, &args).expect("producer configuration");
+
+        assert_eq!(config.get("acks"), Some("0"));
+        assert_eq!(config.get("linger.ms"), Some("25"));
+        assert_eq!(max_block_ms, 42);
+        assert_eq!(config.get("queue.buffering.max.kbytes"), Some("2"));
+        assert_eq!(config.get("buffer.memory"), None);
+        assert_eq!(config.get("socket.send.buffer.bytes"), Some("4096"));
+        assert_eq!(config.get("send.buffer.bytes"), None);
+        assert_eq!(config.get("compression.type"), Some("none"));
+        assert_eq!(config.get("client.id"), Some("custom-producer"));
+        assert_eq!(config.get("batch.size"), Some("16384"));
+        assert_eq!(config.get("message.send.max.retries"), Some("3"));
+        assert_eq!(config.get("request.timeout.ms"), Some("1500"));
+        assert_eq!(config.get("metadata.max.age.ms"), Some("300000"));
+    }
+
+    #[test]
+    fn explicit_producer_options_should_override_command_properties() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--request-required-acks",
+            "1",
+            "--timeout",
+            "50",
+            "--max-block-ms",
+            "75",
+            "--command-property",
+            "acks=0",
+            "--command-property",
+            "linger.ms=25",
+            "--command-property",
+            "max.block.ms=42",
+        ])
+        .expect("producer options");
+        let Command::Produce(args) = cli.command else {
+            panic!("expected produce command");
+        };
+        let mut config = rdkafka::ClientConfig::new();
+        apply_client_properties(&mut config, &args.properties).expect("client properties");
+
+        let max_block_ms = configure_producer(&mut config, &args).expect("producer configuration");
+
+        assert_eq!(config.get("acks"), Some("1"));
+        assert_eq!(config.get("linger.ms"), Some("50"));
+        assert_eq!(max_block_ms, 75);
     }
 
     #[test]

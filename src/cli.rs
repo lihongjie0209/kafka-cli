@@ -302,8 +302,8 @@ pub struct ProduceArgs {
         value_parser = ["none", "gzip", "snappy", "lz4", "zstd"]
     )]
     pub compression_type: String,
-    #[arg(long, visible_alias = "request-required-acks", default_value = "all")]
-    pub acks: String,
+    #[arg(long, visible_alias = "request-required-acks")]
+    pub acks: Option<String>,
     /// Wait for each delivery before reading and sending the next record.
     #[arg(long)]
     pub sync: bool,
@@ -319,13 +319,13 @@ pub struct ProduceArgs {
     /// Maximum batching delay; maps to librdkafka linger.ms.
     #[arg(long = "timeout")]
     pub linger_ms: Option<u64>,
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub request_timeout_ms: Option<u64>,
     #[arg(long)]
     pub metadata_expiry_ms: Option<u64>,
     /// Maximum time to wait for space in the local producer queue.
-    #[arg(long, default_value_t = 60_000)]
-    pub max_block_ms: u64,
+    #[arg(long)]
+    pub max_block_ms: Option<u64>,
     /// Maximum buffered producer memory in bytes.
     #[arg(long)]
     pub max_memory_bytes: Option<usize>,
