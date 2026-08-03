@@ -576,11 +576,15 @@ fn all_command_families_work_against_kafka_4_3_1() {
                 .expect("formatter fixture path"),
             "--formatter-property",
             "key.separator=|",
+            "--formatter-property",
+            "print.epoch=true",
         ])
         .assert()
         .success()
+        .stdout(predicate::str::contains("Partition:0|Offset:2|Epoch:"))
+        .stdout(predicate::str::contains("Epoch:NOT_PRESENT").not())
         .stdout(predicate::str::contains(
-            "Partition:0|Offset:2|trace:abc;empty:NULL|prop-key|prop-value",
+            "|trace:abc;empty:NULL|prop-key|prop-value",
         ));
     Command::cargo_bin("kafka")
         .expect("kafka binary")

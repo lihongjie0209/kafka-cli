@@ -271,6 +271,15 @@ pub struct ListOffsetEntry {
     pub error: Option<String>,
 }
 
+/// Returns the partition leader epoch carried by a successfully consumed message.
+#[must_use]
+pub fn message_leader_epoch(message: &rdkafka::message::BorrowedMessage<'_>) -> Option<i32> {
+    // SAFETY: BorrowedMessage owns a valid librdkafka message pointer for at least this borrow,
+    // and callers only receive BorrowedMessage values produced by successful consumer polls.
+    let epoch = unsafe { sys::rd_kafka_message_leader_epoch(message.ptr()) };
+    (epoch >= 0).then_some(epoch)
+}
+
 /// Consumer-group states supported by librdkafka list filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerGroupState {

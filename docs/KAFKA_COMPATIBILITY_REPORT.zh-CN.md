@@ -42,7 +42,7 @@
 | 入口功能评级 | 5 已支持 / 8 部分支持 / 31 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
 | 已覆盖入口的一级动作 | 31 / 31 | 仅表示这 13 个入口的 list/create/alter 等一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 160 个通过 | 153 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 162 个通过 | 155 个 library unit tests + 7 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -121,7 +121,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 
 与原版一致，`--max-messages 0` 在 poll 前立即结束，`-1` 表示无限消费；负 `--timeout-ms` 表示不启用空闲超时，未指定该选项时也不会被全局管理请求的 30 秒默认值污染。producer/consumer 的废弃 property 名称仍可单独使用，但与对应的新名称同时出现时会像原版一样报错；废弃 config 文件名与 `--command-config` 也互斥。
 
-原版 `--formatter org.apache.kafka.tools.consumer.DefaultMessageFormatter` 可显式传入。`--key-deserializer`、`--value-deserializer` 以及 formatter property 中的 key/value/headers deserializer 已支持 Kafka `StringDeserializer`，包括 formatter property 覆盖 CLI class、UTF-8/UTF8 encoding 校验和非法 UTF-8 替换字符语义。其他自定义 Java formatter/deserializer class 和 systest events 不支持，并会明确返回 unsupported，而不是静默忽略；delivery/epoch 在 librdkafka 未暴露相应记录字段时输出原版的 `NOT_PRESENT`。其他底层 consumer 配置可通过 `--command-property` 传入。
+原版 `--formatter org.apache.kafka.tools.consumer.DefaultMessageFormatter` 可显式传入。`--key-deserializer`、`--value-deserializer` 以及 formatter property 中的 key/value/headers deserializer 已支持 Kafka `StringDeserializer`，包括 formatter property 覆盖 CLI class、UTF-8/UTF8 encoding 校验和非法 UTF-8 替换字符语义。其他自定义 Java formatter/deserializer class 和 systest events 不支持，并会明确返回 unsupported，而不是静默忽略。`print.epoch` 通过 librdkafka `rd_kafka_message_leader_epoch` 输出真实 leader epoch，未知时按原版输出 `NOT_PRESENT`；普通 consumer 没有 delivery count 时 `print.delivery` 仍输出 `NOT_PRESENT`。其他底层 consumer 配置可通过 `--command-property` 传入。
 
 ### 4.4 Consumer Groups
 
@@ -246,7 +246,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：160 个通过（153 个 library unit tests + 7 个 CLI tests）。
+- Rust 单元测试与普通 CLI 测试：162 个通过（155 个 library unit tests + 7 个 CLI tests）。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族及 broker default、quota、broker logger、client metrics 的设置→查询→删除闭环。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -396,6 +396,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-04 | ConsumerGroup Kafka 4 状态过滤 | `Assigning`/`Reconciling` 通过 ListGroups v5 + ConsumerGroupDescribe 协议 fallback 补齐；旧五状态继续走 librdkafka；确认 `NotReady` 与 Share/Streams 不属于原版 consumer-groups 合法过滤集合 | 149 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 Assigning 实际请求；与 Kafka 4.4 源码差分核对；CI `30848089820` 六项全绿 |
 | 2026-08-04 | ConsumerGroup verbose epoch | state verbose 合并 group/target assignment epoch，members verbose 合并 member/target epoch；librdkafka 继续提供 coordinator、assignment 与成员主体，协议结果只补缺失字段 | 151 个单元测试、7 个 CLI 测试；Kafka 4.3.1 增加 state/members verbose 列断言；CI `30848663059` 六项全绿 |
 | 2026-08-04 | ConsumerGroup migration member | ConsumerGroupDescribe member type 映射为三态 upgraded；仅当同一 group 同时存在 classic 与 consumer protocol 成员时，verbose members 按原版增加 `UPGRADED` 列 | 153 个单元测试、7 个 CLI 测试；迁移组动态列与 unknown 边界由单元测试覆盖；CI `30849285517` 六项全绿 |
+| 2026-08-04 | Console Consumer leader epoch | DefaultMessageFormatter `print.epoch` 从固定 `NOT_PRESENT` 改为调用公开 librdkafka message leader epoch API；负 sentinel 仍映射为原版缺失值 | 155 个单元测试、7 个 CLI 测试；Kafka 4.3.1 formatter 数据闭环新增非 `NOT_PRESENT` epoch 断言 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

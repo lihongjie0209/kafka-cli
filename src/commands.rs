@@ -1583,7 +1583,7 @@ fn write_formatted_message(
         fields.push(b"Delivery:NOT_PRESENT".to_vec());
     }
     if options.print_epoch {
-        fields.push(b"Epoch:NOT_PRESENT".to_vec());
+        fields.push(formatted_leader_epoch(ffi::message_leader_epoch(message)));
     }
     if options.print_headers {
         fields.push(formatted_headers(message.headers(), options));
@@ -1613,6 +1613,13 @@ fn write_formatted_message(
         stdout.write_all(&options.line_separator)?;
     }
     Ok(())
+}
+
+fn formatted_leader_epoch(epoch: Option<i32>) -> Vec<u8> {
+    epoch.map_or_else(
+        || b"Epoch:NOT_PRESENT".to_vec(),
+        |epoch| format!("Epoch:{epoch}").into_bytes(),
+    )
 }
 
 fn formatted_headers(
@@ -7778,6 +7785,16 @@ mod tests {
             native_deserializer(Some("example.CustomDeserializer"), "value"),
             Err(Error::Unsupported(message)) if message.contains("example.CustomDeserializer")
         ));
+    }
+
+    #[test]
+    fn formatted_leader_epoch_should_render_present_epoch() {
+        assert_eq!(formatted_leader_epoch(Some(12)), b"Epoch:12");
+    }
+
+    #[test]
+    fn formatted_leader_epoch_should_render_missing_epoch() {
+        assert_eq!(formatted_leader_epoch(None), b"Epoch:NOT_PRESENT");
     }
 
     #[test]
