@@ -1,6 +1,11 @@
 //! End-to-end command-family coverage against a real Kafka 4.x broker.
 
-use std::{fs, process::Output, thread, time::Duration};
+use std::{
+    fs,
+    process::{Command as ProcessCommand, Output, Stdio},
+    thread,
+    time::Duration,
+};
 
 use assert_cmd::Command;
 use krafka::share_consumer::ShareConsumer;
@@ -655,19 +660,6 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "1",
         ],
     );
-    Command::cargo_bin("kafka")
-        .expect("kafka binary")
-        .args([
-            "--bootstrap-server",
-            &bootstrap,
-            "produce",
-            "--topic",
-            "console-share-events",
-            "--sync",
-        ])
-        .write_stdin("share-value\n")
-        .assert()
-        .success();
     // groups, configs, offsets
     let runtime = tokio::runtime::Runtime::new().expect("Share consumer runtime");
     let share_consumer = runtime
@@ -699,8 +691,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
         )
         .contains("Stable")
     );
-    Command::cargo_bin("kafka")
-        .expect("kafka binary")
+    let binary = Command::cargo_bin("kafka").expect("kafka binary");
+    let share_process = ProcessCommand::new(binary.get_program())
         .args([
             "--bootstrap-server",
             &bootstrap,
@@ -716,11 +708,42 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--formatter-property",
             "print.delivery=true",
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start console Share consumer");
+    eventually_contains(
+        &bootstrap,
+        &["share-groups", "list"],
+        "console-share-integration",
+    );
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
+            "console-share-events",
+            "--sync",
+        ])
+        .write_stdin("live-share-value\n")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Delivery:1"))
-        .stdout(predicate::str::contains("share-value"))
-        .stderr(predicate::str::contains("Processed a total of 1 messages"));
+        .success();
+    let share_output = share_process
+        .wait_with_output()
+        .expect("wait for console Share consumer");
+    assert!(
+        share_output.status.success(),
+        "console Share consumer failed: {}",
+        String::from_utf8_lossy(&share_output.stderr)
+    );
+    let share_stdout = String::from_utf8_lossy(&share_output.stdout);
+    assert!(share_stdout.contains("Delivery:1"), "{share_stdout}");
+    assert!(share_stdout.contains("live-share-value"), "{share_stdout}");
+    assert!(
+        String::from_utf8_lossy(&share_output.stderr).contains("Processed a total of 1 messages")
+    );
     assert!(
         success(
             &bootstrap,
