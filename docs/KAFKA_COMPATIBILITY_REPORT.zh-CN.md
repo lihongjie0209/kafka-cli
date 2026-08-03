@@ -40,7 +40,7 @@
 | Kafka `.sh` 入口 | 13 / 44（29.5%） | 31 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
 | 已覆盖入口的一级动作 | 31 / 31 | 13 个入口中原版主要动作均有对应路径，但不代表动作内选项完整；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 67 个通过 | 64 个 library unit tests + 3 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 69 个通过 | 66 个 library unit tests + 3 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
@@ -107,15 +107,15 @@
 
 ### 4.2 Console Producer
 
-已支持：topic、acks（含原版 `--request-required-acks` 名称）、compression（含 `--compression-codec`）、parse-key、key separator、stdin 行输入、JSON 输入、指定 partition、headers、`--sync` 逐条等待和默认异步排队、`--command-property` 及旧名 `--producer-property`。原版 batch-size、message-send-max-retries、retry-backoff-ms、timeout/linger、request-timeout-ms、metadata-expiry-ms、max-memory-bytes、socket-buffer-size 均映射到对应 librdkafka 配置；command-property 保持最高优先级。
+已支持：topic、acks（含原版 `--request-required-acks` 名称）、compression（含 `--compression-codec`）、stdin 行输入、JSON 输入、指定 partition、headers、`--sync` 逐条等待和默认异步排队、`--command-property` 及旧名 `--producer-property`。默认 `LineMessageReader` 的 `--property` 已支持 parse.key、key.separator、parse.headers、headers.delimiter、headers.separator、headers.key.separator、ignore.error、null.marker，并保留 header 顺序和重复 key。原版 batch-size、message-send-max-retries、retry-backoff-ms、timeout/linger、request-timeout-ms、metadata-expiry-ms、max-memory-bytes、socket-buffer-size 均映射到对应 librdkafka 配置；command-property 保持最高优先级。
 
-缺少：Java 自定义 line reader、reader config/property、已废弃的 max-partition-memory-bytes，以及 Java producer 特有而 librdkafka 没有直接等价项的 max-block-ms 专用语义。其他底层 producer 配置仍可通过 `--command-property key=value` 传入。
+缺少：Java 自定义 line reader class、`--reader-config`、已废弃的 max-partition-memory-bytes，以及 Java producer 特有而 librdkafka 没有直接等价项的 max-block-ms 专用语义。其他底层 producer 配置仍可通过 `--command-property key=value` 传入。
 
 ### 4.3 Console Consumer
 
-已支持：topic 或整串 `--include` 正则、group、partition、offset、from-beginning、max-messages、`--timeout-ms` 空闲退出、read_committed/read_uncommitted isolation level、skip-message-on-error、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`。include 使用 librdkafka 的动态正则订阅（语法以 librdkafka/POSIX 能力为准）；isolation level 映射到 librdkafka，command-property 保持最高优先级。手工 partition 未指定 offset 时现在与原版一致默认为 latest，而不是 beginning。
+已支持：topic 或整串 `--include` 正则、group、partition、offset、from-beginning、max-messages、`--timeout-ms` 空闲退出、read_committed/read_uncommitted isolation level、skip-message-on-error、JSON、print-key、key separator、`--command-property` 及旧名 `--consumer-property`。默认 `DefaultMessageFormatter` 的 `--property`/`--formatter-property` 支持 print.timestamp、print.partition、print.offset、print.delivery、print.epoch、print.headers、print.key、print.value、key.separator、line.separator、headers.separator、null.literal，并直接写出消息原始 bytes。include 使用 librdkafka 的动态正则订阅（语法以 librdkafka/POSIX 能力为准）；isolation level 映射到 librdkafka，command-property 保持最高优先级。手工 partition 未指定 offset 时现在与原版一致默认为 latest，而不是 beginning。
 
-缺少：formatter/formatter-config/formatter-property、key/value deserializer 和 systest events。这些选项依赖 Java 类加载或 Kafka 测试工具协议，不能由 librdkafka直接复用；其他底层 consumer 配置可通过 `--command-property` 传入。
+缺少：自定义 Java formatter class、formatter-config、key/value/headers deserializer 和 systest events。Java deserializer property 会明确返回 unsupported，而不是静默忽略；delivery/epoch 在 librdkafka 未暴露相应记录字段时输出原版的 `NOT_PRESENT`。其他底层 consumer 配置可通过 `--command-property` 传入。
 
 ### 4.4 Consumer Groups
 
@@ -228,7 +228,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：67 个通过。
+- Rust 单元测试与普通 CLI 测试：69 个通过。
 - Kafka 4.3.1 Docker 集成测试：通过，覆盖所有 13 个命令族的代表性路径。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -339,6 +339,7 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、Zig 和 `cargo-zigbuild`。x
 | 2026-08-03 | 非流式输出闭环 | Reassignment execute/cancel、cluster unregister 及 Topics no-op 结果接入统一 mutation table/JSON；生产/消费流和 CSV 保持专用流格式 | Clippy、66 个普通测试、Kafka 4.3.1 reassignment/unregister JSON 集成测试通过 |
 | 2026-08-03 | 参数与 panic 路径复审 | reset-offsets 在任何 broker 请求前校验 reset scenario；移除 consume、group dispatch、user config 枚举路径的生产代码 `expect!/unreachable!` | all-features Clippy、67 个普通测试通过 |
 | 2026-08-03 | Reassignment partial failure | execute/cancel 将 top-level 和 partition error 映射到具体 mutation 行；AlterReplicaLogDirs 错误包含 broker/topic/partition，不再只返回汇总数量 | all-features Clippy、67 个普通测试、Kafka 4.3.1 失败请求 JSON 与非零退出码集成测试通过 |
+| 2026-08-03 | Console 默认 reader/formatter property | 完整实现原版默认 LineMessageReader 的 8 个解析属性，以及 DefaultMessageFormatter 的 12 个输出属性；保留 header 顺序/重复 key 和原始消息 bytes，Java class/deserializer 明确 unsupported | all-features Clippy、69 个普通测试、Kafka 4.3.1 header/key/null/separator 数据闭环通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

@@ -360,6 +360,62 @@ fn all_command_families_work_against_kafka_4_3_1() {
             &bootstrap,
             "produce",
             "--topic",
+            "integration-json",
+            "--sync",
+            "--property",
+            "parse.headers=true",
+            "--property",
+            "headers.delimiter=|",
+            "--property",
+            "parse.key=true",
+            "--property",
+            "key.separator=|",
+            "--property",
+            "null.marker=NULL",
+        ])
+        .write_stdin("trace:abc,empty:NULL|prop-key|prop-value\n")
+        .assert()
+        .success();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "consume",
+            "--topic",
+            "integration-json",
+            "--from-beginning",
+            "--max-messages",
+            "3",
+            "--group",
+            "integration-formatter",
+            "--property",
+            "print.partition=true",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.headers=true",
+            "--property",
+            "print.key=true",
+            "--property",
+            "key.separator=|",
+            "--property",
+            "headers.separator=;",
+            "--property",
+            "null.literal=NULL",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Partition:0|Offset:2|trace:abc;empty:NULL|prop-key|prop-value",
+        ));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
             "integration-events",
             "--json",
         ])

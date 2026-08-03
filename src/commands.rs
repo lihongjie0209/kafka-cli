@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io,
+    io::{self, Write},
     path::Path,
     time::Duration,
 };
@@ -647,17 +647,21 @@ async fn produce(
     config.set("acks", &args.acks);
     apply_producer_options(&mut config, &args);
     apply_client_properties(&mut config, &args.properties)?;
+    let reader = line_reader_options(&args)?;
     let producer: FutureProducer = config.create()?;
     let input = io::read_to_string(io::stdin())?;
     let mut deliveries = Vec::new();
     for (index, line) in input.lines().enumerate() {
-        let input = producer_input(line, &args).map_err(|error| {
+        let input = producer_input(line, args.json, &reader).map_err(|error| {
             Error::Usage(format!(
                 "invalid producer input on line {}: {error}",
                 index + 1
             ))
         })?;
-        let mut record = FutureRecord::to(&args.topic).payload(&input.value);
+        let mut record = FutureRecord::to(&args.topic);
+        if let Some(value) = &input.value {
+            record = record.payload(value);
+        }
         if let Some(key) = &input.key {
             record = record.key(key);
         }
@@ -730,35 +734,210 @@ fn apply_producer_options(config: &mut rdkafka::ClientConfig, args: &crate::cli:
 struct ProducerInput {
     #[serde(default)]
     key: Option<String>,
-    value: String,
+    value: Option<String>,
     #[serde(default)]
     partition: Option<i32>,
     #[serde(default)]
-    headers: BTreeMap<String, Option<String>>,
+    #[serde(deserialize_with = "deserialize_producer_headers")]
+    headers: Vec<(String, Option<String>)>,
 }
 
-fn producer_input(line: &str, args: &crate::cli::ProduceArgs) -> Result<ProducerInput> {
-    if args.json {
+fn deserialize_producer_headers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<(String, Option<String>)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BTreeMap::<String, Option<String>>::deserialize(deserializer)
+        .map(|headers| headers.into_iter().collect())
+}
+
+struct LineReaderOptions {
+    parse_key: bool,
+    key_separator: String,
+    parse_headers: bool,
+    headers_delimiter: String,
+    headers_separator: Regex,
+    headers_key_separator: String,
+    ignore_error: bool,
+    null_marker: Option<String>,
+}
+
+fn line_reader_options(args: &crate::cli::ProduceArgs) -> Result<LineReaderOptions> {
+    let properties = parse_pairs(&args.reader_properties)?;
+    let value = |key: &str| {
+        properties
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    let parse_key = value("parse.key").map_or(args.parse_key, |value| bool_property(value));
+    let key_separator = value("key.separator")
+        .cloned()
+        .or_else(|| args.key_separator.map(|separator| separator.to_string()))
+        .unwrap_or_else(|| "\t".into());
+    let parse_headers = value("parse.headers").is_some_and(|value| bool_property(value));
+    let headers_delimiter = value("headers.delimiter")
+        .cloned()
+        .unwrap_or_else(|| "\t".into());
+    let headers_separator_value = value("headers.separator").map_or(",", String::as_str);
+    let headers_separator = Regex::new(headers_separator_value).map_err(|error| {
+        Error::Usage(format!(
+            "invalid headers.separator regular expression: {error}"
+        ))
+    })?;
+    let headers_key_separator = value("headers.key.separator")
+        .cloned()
+        .unwrap_or_else(|| ":".into());
+    let ignore_error = value("ignore.error").is_some_and(|value| bool_property(value));
+    let null_marker = value("null.marker").cloned();
+    for (left_name, left, right_name, right) in [
+        (
+            "headers.delimiter",
+            headers_delimiter.as_str(),
+            "headers.separator",
+            headers_separator_value,
+        ),
+        (
+            "headers.delimiter",
+            headers_delimiter.as_str(),
+            "headers.key.separator",
+            headers_key_separator.as_str(),
+        ),
+        (
+            "headers.separator",
+            headers_separator_value,
+            "headers.key.separator",
+            headers_key_separator.as_str(),
+        ),
+    ] {
+        if left == right {
+            return Err(Error::Usage(format!(
+                "{left_name} and {right_name} may not be equal"
+            )));
+        }
+    }
+    if let Some(marker) = &null_marker {
+        for (name, separator) in [
+            ("key.separator", key_separator.as_str()),
+            ("headers.delimiter", headers_delimiter.as_str()),
+            ("headers.separator", headers_separator_value),
+            ("headers.key.separator", headers_key_separator.as_str()),
+        ] {
+            if marker == separator {
+                return Err(Error::Usage(format!(
+                    "null.marker and {name} may not be equal"
+                )));
+            }
+        }
+    }
+    Ok(LineReaderOptions {
+        parse_key,
+        key_separator,
+        parse_headers,
+        headers_delimiter,
+        headers_separator,
+        headers_key_separator,
+        ignore_error,
+        null_marker,
+    })
+}
+
+fn bool_property(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case("true")
+}
+
+fn producer_input(line: &str, json: bool, options: &LineReaderOptions) -> Result<ProducerInput> {
+    if json {
         let input: ProducerInput = serde_json::from_str(line)?;
         if input.partition.is_some_and(|partition| partition < 0) {
             return Err(Error::Usage("partition must be non-negative".into()));
         }
         Ok(input)
     } else {
-        let (key, value) = if args.parse_key {
-            let separator = args.key_separator.unwrap_or('\t');
-            line.split_once(separator)
-                .map_or((None, line), |(key, value)| (Some(key.to_owned()), value))
-        } else {
-            (None, line)
-        };
+        let (headers, remaining) = parse_line_field(
+            options.parse_headers,
+            line,
+            &options.headers_delimiter,
+            options.ignore_error,
+            "headers delimiter",
+        )?;
+        let (key, value) = parse_line_field(
+            options.parse_key,
+            remaining,
+            &options.key_separator,
+            options.ignore_error,
+            "key separator",
+        )?;
+        let headers = headers
+            .map(|headers| parse_line_headers(headers, options))
+            .transpose()?
+            .unwrap_or_default();
         Ok(ProducerInput {
-            key,
-            value: value.to_owned(),
+            key: nullable_field(key, options.null_marker.as_deref()),
+            value: nullable_field(Some(value), options.null_marker.as_deref()),
             partition: None,
-            headers: BTreeMap::new(),
+            headers,
         })
     }
+}
+
+fn parse_line_field<'a>(
+    enabled: bool,
+    line: &'a str,
+    separator: &str,
+    ignore_error: bool,
+    name: &str,
+) -> Result<(Option<&'a str>, &'a str)> {
+    if !enabled {
+        return Ok((None, line));
+    }
+    line.find(separator).map_or_else(
+        || {
+            if ignore_error {
+                Ok((None, line))
+            } else {
+                Err(Error::Usage(format!("no {name} found in input line")))
+            }
+        },
+        |index| Ok((Some(&line[..index]), &line[index + separator.len()..])),
+    )
+}
+
+fn parse_line_headers(
+    headers: &str,
+    options: &LineReaderOptions,
+) -> Result<Vec<(String, Option<String>)>> {
+    if options.null_marker.as_deref() == Some(headers) {
+        return Ok(Vec::new());
+    }
+    options
+        .headers_separator
+        .split(headers)
+        .map(|pair| {
+            if let Some(index) = pair.find(&options.headers_key_separator) {
+                let key = &pair[..index];
+                if options.null_marker.as_deref() == Some(key) {
+                    return Err(Error::Usage("header key cannot equal null.marker".into()));
+                }
+                let value = &pair[index + options.headers_key_separator.len()..];
+                Ok((
+                    key.to_owned(),
+                    nullable_field(Some(value), options.null_marker.as_deref()),
+                ))
+            } else if options.ignore_error {
+                Ok((pair.to_owned(), None))
+            } else {
+                Err(Error::Usage(format!(
+                    "no header key separator found in pair '{pair}'"
+                )))
+            }
+        })
+        .collect()
+}
+
+fn nullable_field(value: Option<&str>, marker: Option<&str>) -> Option<String> {
+    value.and_then(|value| (Some(value) != marker).then(|| value.to_owned()))
 }
 
 #[derive(Serialize)]
@@ -789,6 +968,7 @@ async fn consume(
         },
     );
     apply_client_properties(&mut config, &args.properties)?;
+    let formatter = message_formatter_options(&args)?;
     let consumer: StreamConsumer = config.create()?;
     if let Some(partition) = args.partition {
         let topic = args
@@ -851,10 +1031,7 @@ async fn consume(
                     };
                     output::write_json_line(&record)?;
                 } else {
-                    if args.print_key {
-                        print!("{}{}", message.key_view::<str>().and_then(std::result::Result::ok).unwrap_or("null"), args.key_separator);
-                    }
-                    println!("{}", message.payload_view::<str>().and_then(std::result::Result::ok).unwrap_or(""));
+                    write_formatted_message(&message, &formatter)?;
                 }
                 received += 1;
                 if args.max_messages.is_some_and(|max| received >= max) { break; }
@@ -862,6 +1039,146 @@ async fn consume(
         }
     }
     Ok(())
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors Kafka DefaultMessageFormatter's independent print switches"
+)]
+struct MessageFormatterOptions {
+    print_timestamp: bool,
+    print_partition: bool,
+    print_offset: bool,
+    print_delivery: bool,
+    print_epoch: bool,
+    print_headers: bool,
+    print_key: bool,
+    print_value: bool,
+    key_separator: Vec<u8>,
+    line_separator: Vec<u8>,
+    headers_separator: Vec<u8>,
+    null_literal: Vec<u8>,
+}
+
+fn message_formatter_options(args: &crate::cli::ConsumeArgs) -> Result<MessageFormatterOptions> {
+    let properties = parse_pairs(&args.formatter_properties)?;
+    let value = |key: &str| {
+        properties
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    for key in [
+        "key.deserializer",
+        "value.deserializer",
+        "headers.deserializer",
+    ] {
+        if value(key).is_some() {
+            return Err(Error::Unsupported(format!(
+                "Java formatter property {key} cannot be loaded by the native client"
+            )));
+        }
+    }
+    let flag = |key: &str, default: bool| value(key).map_or(default, |value| bool_property(value));
+    Ok(MessageFormatterOptions {
+        print_timestamp: flag("print.timestamp", false),
+        print_partition: flag("print.partition", false),
+        print_offset: flag("print.offset", false),
+        print_delivery: flag("print.delivery", false),
+        print_epoch: flag("print.epoch", false),
+        print_headers: flag("print.headers", false),
+        print_key: flag("print.key", args.print_key),
+        print_value: flag("print.value", true),
+        key_separator: value("key.separator")
+            .map_or_else(|| args.key_separator.as_bytes(), String::as_bytes)
+            .to_vec(),
+        line_separator: value("line.separator")
+            .map_or(b"\n".as_slice(), String::as_bytes)
+            .to_vec(),
+        headers_separator: value("headers.separator")
+            .map_or(b",".as_slice(), String::as_bytes)
+            .to_vec(),
+        null_literal: value("null.literal")
+            .map_or(b"null".as_slice(), String::as_bytes)
+            .to_vec(),
+    })
+}
+
+fn write_formatted_message(
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    options: &MessageFormatterOptions,
+) -> Result<()> {
+    let mut fields = Vec::<Vec<u8>>::new();
+    if options.print_timestamp {
+        fields.push(match message.timestamp() {
+            rdkafka::Timestamp::NotAvailable => b"NO_TIMESTAMP".to_vec(),
+            rdkafka::Timestamp::CreateTime(timestamp) => {
+                format!("CreateTime:{timestamp}").into_bytes()
+            }
+            rdkafka::Timestamp::LogAppendTime(timestamp) => {
+                format!("LogAppendTime:{timestamp}").into_bytes()
+            }
+        });
+    }
+    if options.print_partition {
+        fields.push(format!("Partition:{}", message.partition()).into_bytes());
+    }
+    if options.print_offset {
+        fields.push(format!("Offset:{}", message.offset()).into_bytes());
+    }
+    if options.print_delivery {
+        fields.push(b"Delivery:NOT_PRESENT".to_vec());
+    }
+    if options.print_epoch {
+        fields.push(b"Epoch:NOT_PRESENT".to_vec());
+    }
+    if options.print_headers {
+        fields.push(formatted_headers(message.headers(), options));
+    }
+    if options.print_key {
+        fields.push(
+            message
+                .key()
+                .map_or_else(|| options.null_literal.clone(), <[u8]>::to_vec),
+        );
+    }
+    if options.print_value {
+        fields.push(
+            message
+                .payload()
+                .map_or_else(|| options.null_literal.clone(), <[u8]>::to_vec),
+        );
+    }
+    let mut stdout = io::stdout().lock();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            stdout.write_all(&options.key_separator)?;
+        }
+        stdout.write_all(field)?;
+    }
+    if options.print_value {
+        stdout.write_all(&options.line_separator)?;
+    }
+    Ok(())
+}
+
+fn formatted_headers(
+    headers: Option<&rdkafka::message::BorrowedHeaders>,
+    options: &MessageFormatterOptions,
+) -> Vec<u8> {
+    let Some(headers) = headers.filter(|headers| headers.count() > 0) else {
+        return b"NO_HEADERS".to_vec();
+    };
+    let mut result = Vec::new();
+    for (index, header) in headers.iter().enumerate() {
+        if index > 0 {
+            result.extend_from_slice(&options.headers_separator);
+        }
+        result.extend_from_slice(header.key.as_bytes());
+        result.push(b':');
+        result.extend_from_slice(header.value.unwrap_or(&options.null_literal));
+    }
+    result
 }
 
 async fn next_consumer_message<'a>(
@@ -4349,7 +4666,6 @@ fn csv_numbers(values: &[i32]) -> String {
 mod tests {
     use super::*;
     use clap::Parser as _;
-    use std::io::Write as _;
 
     fn topic_selector() -> TopicSelector {
         TopicSelector {
@@ -4536,18 +4852,31 @@ mod tests {
             max_memory_bytes: None,
             socket_buffer_size: None,
             json: true,
+            reader_properties: Vec::new(),
             properties: Vec::new(),
         };
+        let options = line_reader_options(&args).expect("reader options");
         let input = producer_input(
             r#"{"key":"order-1","value":"created","partition":2,"headers":{"trace":"abc","empty":null}}"#,
-            &args,
+            true,
+            &options,
         )
         .expect("valid JSON record");
         assert_eq!(input.key.as_deref(), Some("order-1"));
-        assert_eq!(input.value, "created");
+        assert_eq!(input.value.as_deref(), Some("created"));
         assert_eq!(input.partition, Some(2));
-        assert_eq!(input.headers["trace"].as_deref(), Some("abc"));
-        assert_eq!(input.headers["empty"], None);
+        assert!(
+            input
+                .headers
+                .iter()
+                .any(|(key, value)| key == "trace" && value.as_deref() == Some("abc"))
+        );
+        assert!(
+            input
+                .headers
+                .iter()
+                .any(|(key, value)| key == "empty" && value.is_none())
+        );
     }
 
     #[test]
@@ -4568,12 +4897,86 @@ mod tests {
             max_memory_bytes: None,
             socket_buffer_size: None,
             json: true,
+            reader_properties: Vec::new(),
             properties: Vec::new(),
         };
+        let options = line_reader_options(&args).expect("reader options");
         assert!(matches!(
-            producer_input(r#"{"value":"bad","partition":-1}"#, &args),
+            producer_input(r#"{"value":"bad","partition":-1}"#, true, &options),
             Err(Error::Usage(_))
         ));
+    }
+
+    #[test]
+    fn producer_properties_should_parse_headers_key_and_null_marker() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--property",
+            "parse.headers=true",
+            "--property",
+            "headers.delimiter=|",
+            "--property",
+            "parse.key=true",
+            "--property",
+            "key.separator=|",
+            "--property",
+            "null.marker=NULL",
+        ])
+        .expect("producer properties");
+        let Command::Produce(args) = cli.command else {
+            panic!("expected produce command");
+        };
+        let options = line_reader_options(&args).expect("reader options");
+
+        let input = producer_input("trace:abc,empty:NULL|order-1|created", false, &options)
+            .expect("line input");
+
+        assert_eq!(
+            input,
+            ProducerInput {
+                key: Some("order-1".into()),
+                value: Some("created".into()),
+                partition: None,
+                headers: vec![("trace".into(), Some("abc".into())), ("empty".into(), None)],
+            }
+        );
+    }
+
+    #[test]
+    fn consumer_properties_should_configure_default_formatter() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "consume",
+            "--topic",
+            "events",
+            "--property",
+            "print.partition=true",
+            "--property",
+            "print.headers=true",
+            "--property",
+            "print.key=true",
+            "--property",
+            "key.separator=|",
+            "--property",
+            "null.literal=NULL",
+        ])
+        .expect("consumer properties");
+        let Command::Consume(args) = cli.command else {
+            panic!("expected consume command");
+        };
+
+        let options = message_formatter_options(&args).expect("formatter options");
+
+        assert!(options.print_partition && options.print_headers && options.print_key);
+        assert_eq!(options.key_separator, b"|");
+        assert_eq!(options.null_literal, b"NULL");
     }
 
     #[test]

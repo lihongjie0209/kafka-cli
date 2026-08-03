@@ -272,6 +272,9 @@ pub struct ProduceArgs {
     /// Parse each input line as {"key":...,"value":...,"partition":...,"headers":{...}}.
     #[arg(long)]
     pub json: bool,
+    /// Default `LineMessageReader` property in key=value form.
+    #[arg(long = "property")]
+    pub reader_properties: Vec<String>,
     /// Producer property in key=value form; overrides --command-config.
     #[arg(long = "command-property", visible_alias = "producer-property")]
     pub properties: Vec<String>,
@@ -312,6 +315,9 @@ pub struct ConsumeArgs {
     pub print_key: bool,
     #[arg(long, default_value = "\t")]
     pub key_separator: String,
+    /// `DefaultMessageFormatter` property in key=value form.
+    #[arg(long = "property", visible_alias = "formatter-property")]
+    pub formatter_properties: Vec<String>,
     /// Consumer property in key=value form; overrides --command-config.
     #[arg(long = "command-property", visible_alias = "consumer-property")]
     pub properties: Vec<String>,
