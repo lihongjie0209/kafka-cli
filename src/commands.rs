@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Write},
     path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -25,8 +25,9 @@ use rdkafka::{
     },
     client::DefaultClientContext,
     consumer::{BaseConsumer, Consumer, StreamConsumer},
-    message::{BorrowedHeaders, Header, Headers, OwnedHeaders},
-    producer::{FutureProducer, FutureRecord},
+    error::{KafkaError, RDKafkaErrorCode},
+    message::{BorrowedHeaders, Header, Headers, OwnedHeaders, ToBytes},
+    producer::{DeliveryFuture, FutureProducer, FutureRecord},
     topic_partition_list::TopicPartitionList,
 };
 use regex::Regex;
@@ -88,7 +89,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Topics(args) => topics(&client_config, timeout, format, args.action).await,
-        Command::Produce(args) => produce(client_config, timeout, args).await,
+        Command::Produce(args) => produce(client_config, args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::Groups(args) => {
             groups(&client_config, timeout, format, args.action, verbose).await
@@ -652,11 +653,7 @@ fn topic_results(
     Ok(failures)
 }
 
-async fn produce(
-    mut config: rdkafka::ClientConfig,
-    timeout: Duration,
-    args: crate::cli::ProduceArgs,
-) -> Result<()> {
+async fn produce(mut config: rdkafka::ClientConfig, args: crate::cli::ProduceArgs) -> Result<()> {
     config.set("compression.type", &args.compression_type);
     config.set("acks", &args.acks);
     apply_producer_options(&mut config, &args);
@@ -694,14 +691,13 @@ async fn produce(
         }
         if args.sync {
             producer
-                .send(record, timeout)
+                .send(record, Duration::from_millis(args.max_block_ms))
                 .await
                 .map_err(|(error, _)| Error::Kafka(error))?;
         } else {
             deliveries.push(
-                producer
-                    .send_result(record)
-                    .map_err(|(error, _)| Error::Kafka(error))?,
+                enqueue_with_timeout(&producer, record, Duration::from_millis(args.max_block_ms))
+                    .await?,
             );
         }
     }
@@ -714,8 +710,40 @@ async fn produce(
     Ok(())
 }
 
+async fn enqueue_with_timeout<K, P>(
+    producer: &FutureProducer,
+    mut record: FutureRecord<'_, K, P>,
+    timeout: Duration,
+) -> Result<DeliveryFuture>
+where
+    K: ToBytes + Sync + ?Sized,
+    P: ToBytes + Sync + ?Sized,
+{
+    let started = Instant::now();
+    loop {
+        match producer.send_result(record) {
+            Ok(delivery) => return Ok(delivery),
+            Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), returned))
+                if started.elapsed() < timeout =>
+            {
+                record = returned;
+                tokio::time::sleep(
+                    timeout
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_millis(100)),
+                )
+                .await;
+            }
+            Err((error, _)) => return Err(Error::Kafka(error)),
+        }
+    }
+}
+
 fn apply_producer_options(config: &mut rdkafka::ClientConfig, args: &crate::cli::ProduceArgs) {
     if let Some(value) = args.batch_size {
+        config.set("batch.size", value.to_string());
+    }
+    if let Some(value) = args.max_partition_memory_bytes {
         config.set("batch.size", value.to_string());
     }
     if let Some(value) = args.message_send_max_retries {
@@ -731,7 +759,7 @@ fn apply_producer_options(config: &mut rdkafka::ClientConfig, args: &crate::cli:
         config.set("request.timeout.ms", value.to_string());
     }
     if let Some(value) = args.metadata_expiry_ms {
-        config.set("topic.metadata.refresh.interval.ms", value.to_string());
+        config.set("metadata.max.age.ms", value.to_string());
     }
     if let Some(value) = args.max_memory_bytes {
         config.set(
@@ -6008,11 +6036,13 @@ mod tests {
             acks: "all".into(),
             sync: false,
             batch_size: None,
+            max_partition_memory_bytes: None,
             message_send_max_retries: None,
             retry_backoff_ms: None,
             linger_ms: None,
             request_timeout_ms: None,
             metadata_expiry_ms: None,
+            max_block_ms: 60_000,
             max_memory_bytes: None,
             socket_buffer_size: None,
             json: true,
@@ -6054,11 +6084,13 @@ mod tests {
             acks: "all".into(),
             sync: false,
             batch_size: None,
+            max_partition_memory_bytes: None,
             message_send_max_retries: None,
             retry_backoff_ms: None,
             linger_ms: None,
             request_timeout_ms: None,
             metadata_expiry_ms: None,
+            max_block_ms: 60_000,
             max_memory_bytes: None,
             socket_buffer_size: None,
             json: true,
@@ -6156,6 +6188,8 @@ mod tests {
             "events",
             "--batch-size",
             "4096",
+            "--max-partition-memory-bytes",
+            "8192",
             "--message-send-max-retries",
             "7",
             "--retry-backoff-ms",
@@ -6166,6 +6200,8 @@ mod tests {
             "5000",
             "--metadata-expiry-ms",
             "60000",
+            "--max-block-ms",
+            "1234",
             "--max-memory-bytes",
             "1048577",
             "--socket-buffer-size",
@@ -6177,15 +6213,14 @@ mod tests {
         };
         let mut config = rdkafka::ClientConfig::new();
         apply_producer_options(&mut config, &args);
-        assert_eq!(config.get("batch.size"), Some("4096"));
+        assert_eq!(config.get("batch.size"), Some("8192"));
+        assert_eq!(args.max_block_ms, 1234);
         assert_eq!(config.get("message.send.max.retries"), Some("7"));
         assert_eq!(config.get("retry.backoff.ms"), Some("250"));
         assert_eq!(config.get("linger.ms"), Some("10"));
         assert_eq!(config.get("request.timeout.ms"), Some("5000"));
-        assert_eq!(
-            config.get("topic.metadata.refresh.interval.ms"),
-            Some("60000")
-        );
+        assert_eq!(config.get("metadata.max.age.ms"), Some("60000"));
+        assert_eq!(config.get("topic.metadata.refresh.interval.ms"), None);
         assert_eq!(config.get("queue.buffering.max.kbytes"), Some("1025"));
         assert_eq!(config.get("socket.send.buffer.bytes"), Some("32768"));
     }

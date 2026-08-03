@@ -316,7 +316,10 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "integration-json",
             "--parse-key",
             "--sync",
+            "--compression-codec",
             "--batch-size",
+            "8192",
+            "--max-partition-memory-bytes",
             "16384",
             "--message-send-max-retries",
             "4",
@@ -328,6 +331,8 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "5000",
             "--metadata-expiry-ms",
             "60000",
+            "--max-block-ms",
+            "5000",
             "--max-memory-bytes",
             "33554432",
             "--socket-buffer-size",
@@ -390,11 +395,11 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "--sync",
             "--reader-config",
             reader_config_file.to_str().expect("reader fixture path"),
-            "--property",
+            "--reader-property",
             "parse.key=true",
-            "--property",
+            "--reader-property",
             "key.separator=|",
-            "--property",
+            "--reader-property",
             "null.marker=NULL",
         ])
         .write_stdin("trace:abc,empty:NULL|prop-key|prop-value\n")
@@ -417,7 +422,7 @@ fn all_command_families_work_against_kafka_4_3_1() {
             formatter_config_file
                 .to_str()
                 .expect("formatter fixture path"),
-            "--property",
+            "--formatter-property",
             "key.separator=|",
         ])
         .assert()

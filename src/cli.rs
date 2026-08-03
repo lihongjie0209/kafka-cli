@@ -80,12 +80,14 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
 }
 
 fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
-    let deprecated_config = match command {
-        "leader-election" => Some("--admin.config"),
-        "cluster" => Some("--config"),
-        _ => None,
+    let deprecated_configs: &[&str] = match command {
+        "produce" => &["--producer.config"],
+        "consume" => &["--consumer.config"],
+        "leader-election" => &["--admin.config"],
+        "cluster" => &["--config"],
+        _ => &[],
     };
-    if let Some(deprecated) = deprecated_config {
+    for &deprecated in deprecated_configs {
         for argument in args.iter_mut() {
             let Some(value) = argument.to_str() else {
                 continue;
@@ -288,7 +290,14 @@ pub struct ProduceArgs {
     pub key_separator: Option<char>,
     #[arg(long)]
     pub parse_key: bool,
-    #[arg(long, visible_alias = "compression-codec", default_value = "none")]
+    #[arg(
+        long,
+        visible_alias = "compression-codec",
+        num_args = 0..=1,
+        default_missing_value = "gzip",
+        default_value = "none",
+        value_parser = ["none", "gzip", "snappy", "lz4", "zstd"]
+    )]
     pub compression_type: String,
     #[arg(long, visible_alias = "request-required-acks", default_value = "all")]
     pub acks: String,
@@ -297,6 +306,9 @@ pub struct ProduceArgs {
     pub sync: bool,
     #[arg(long)]
     pub batch_size: Option<usize>,
+    /// Deprecated Kafka alias for batch-size; takes precedence when both are supplied.
+    #[arg(long)]
+    pub max_partition_memory_bytes: Option<usize>,
     #[arg(long)]
     pub message_send_max_retries: Option<u32>,
     #[arg(long)]
@@ -308,6 +320,9 @@ pub struct ProduceArgs {
     pub request_timeout_ms: Option<u64>,
     #[arg(long)]
     pub metadata_expiry_ms: Option<u64>,
+    /// Maximum time to wait for space in the local producer queue.
+    #[arg(long, default_value_t = 60_000)]
+    pub max_block_ms: u64,
     /// Maximum buffered producer memory in bytes.
     #[arg(long)]
     pub max_memory_bytes: Option<usize>,
@@ -317,7 +332,7 @@ pub struct ProduceArgs {
     #[arg(long)]
     pub json: bool,
     /// Default `LineMessageReader` property in key=value form.
-    #[arg(long = "property")]
+    #[arg(long = "reader-property", visible_alias = "property")]
     pub reader_properties: Vec<String>,
     /// Java properties file used to configure the default `LineMessageReader`.
     #[arg(long)]
@@ -363,7 +378,7 @@ pub struct ConsumeArgs {
     #[arg(long, default_value = "\t")]
     pub key_separator: String,
     /// `DefaultMessageFormatter` property in key=value form.
-    #[arg(long = "property", visible_alias = "formatter-property")]
+    #[arg(long = "formatter-property", visible_alias = "property")]
     pub formatter_properties: Vec<String>,
     /// Java properties file used to configure the default message formatter.
     #[arg(long)]
@@ -866,6 +881,8 @@ mod tests {
     #[test]
     fn deprecated_config_options_should_map_to_command_config() {
         for (command, deprecated, expected) in [
+            ("produce", "--producer.config", "--command-config"),
+            ("consume", "--consumer.config", "--command-config"),
             ("leader-election", "--admin.config", "--command-config"),
             (
                 "cluster",
@@ -883,6 +900,25 @@ mod tests {
             assert!(arguments.iter().any(|argument| argument == expected));
             assert!(!arguments.iter().any(|argument| argument == deprecated));
         }
+    }
+
+    #[test]
+    fn compression_codec_without_value_should_default_to_gzip() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "produce",
+            "--topic",
+            "events",
+            "--compression-codec",
+            "--sync",
+        ])
+        .expect("producer compression codec");
+        let Command::Produce(args) = cli.command else {
+            panic!("expected produce command");
+        };
+        assert_eq!(args.compression_type, "gzip");
     }
 
     parses_command_family!(produce_family_parses, "produce", "--topic", "events");
