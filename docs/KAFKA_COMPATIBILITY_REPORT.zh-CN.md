@@ -7,12 +7,12 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `d207762`。
-- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 20 个兼容名称，入口覆盖率为 20/44（45.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
-- 按本报告的功能口径，20 个兼容入口中 10 个达到核心功能“已支持”，10 个为“部分支持”；另有 24 个原版入口未支持。因此不能把 45.5% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
+- 本项目审计实现基准：`master`，提交 `97e67a5`。
+- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 21 个兼容名称，入口覆盖率为 21/44（47.7%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 按本报告的功能口径，21 个兼容入口中 11 个达到核心功能“已支持”，10 个为“部分支持”；另有 23 个原版入口未支持。因此不能把 47.7% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
-- Connect、Share Consumer、Streams Group、metadata shell、storage、性能测试、验证工具等原版工具尚未实现；Share Group 管理、Metadata Quorum 和 Delegation Tokens 已新增，但后两者的专用多 controller/SASL 集成矩阵仍待补充。
+- Connect、Share Consumer、Streams Application Reset、metadata shell、storage、性能测试、验证工具等原版工具尚未实现；Share/Streams Group 管理、Metadata Quorum 和 Delegation Tokens 已新增，但后两者的专用多 controller/SASL 集成矩阵仍待补充。
 - 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API。ACL create/describe/delete 已迁移到 librdkafka；少数其他管理路径仍使用 `krafka`，尚未完全统一。
 
 ## 2. 状态定义
@@ -38,15 +38,15 @@
 
 | 维度 | 结果 | 解读 |
 |---|---:|---|
-| Kafka `.sh` 入口 | 20 / 44（45.5%） | 24 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
-| 入口功能评级 | 10 已支持 / 10 部分支持 / 24 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
-| 已覆盖入口的一级动作 | 60 / 60 | 仅表示这 20 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
+| Kafka `.sh` 入口 | 21 / 44（47.7%） | 23 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
+| 入口功能评级 | 11 已支持 / 10 部分支持 / 23 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
+| 已覆盖入口的一级动作 | 65 / 65 | 仅表示这 21 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 216 个通过 | 202 个 library unit tests + 14 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 225 个通过 | 210 个 library unit tests + 15 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 当前是交叉编译验证 |
 
-原版动作数 60 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 8 个入口各 1。Console producer/consumer 与通用 Groups list 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
+原版动作数 65 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 8 个入口各 1。Console producer/consumer 与通用 Groups list 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
 
 ## 3. 顶层脚本覆盖
 
@@ -60,6 +60,7 @@
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
 | `kafka-groups.sh` | `kafka all-groups` | 已支持 | list；group-type、protocol、consumer、share、streams 过滤，覆盖全部 Kafka group 类型 |
 | `kafka-share-groups.sh` | `kafka share-groups` | 已支持 | list、describe、delete、reset-offsets、delete-offsets，覆盖 Share Group 状态、成员、assignment 与 offset 管理 |
+| `kafka-streams-groups.sh` | `kafka streams-groups` | 已支持 | list、describe、delete、reset-offsets、delete-offsets，覆盖 Streams task assignment、offset lag、内部 topic 与 Kafka 4.4 topology description |
 | `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；缺 bootstrap-controller |
 | `kafka-client-metrics.sh` | `kafka client-metrics` | 已支持 | list、describe、alter、delete、自动生成 Kafka UUID 名称及全部 subscription 配置参数 |
 | `kafka-features.sh` | `kafka features` | 部分支持 | describe、upgrade、downgrade、disable、version-mapping、feature-dependencies；缺 bootstrap-controller |
@@ -83,7 +84,7 @@
 |---|---|
 | Kafka Connect | `connect-distributed.sh`、`connect-internal-topics.sh`、`connect-mirror-maker.sh`、`connect-plugin-path.sh`、`connect-standalone.sh` |
 | 新消费组模型 | `kafka-console-share-consumer.sh`、`kafka-share-consumer-perf-test.sh`、`kafka-verifiable-share-consumer.sh` |
-| Streams | `kafka-streams-application-reset.sh`、`kafka-streams-groups.sh` |
+| Streams | `kafka-streams-application-reset.sh` |
 | 集群与元数据高级工具 | `kafka-metadata-shell.sh`、`kafka-storage.sh` |
 | 性能、校验与诊断 | `kafka-consumer-perf-test.sh`、`kafka-producer-perf-test.sh`、`kafka-e2e-latency.sh`、`kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-verifiable-producer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
 | 服务进程与基础启动器 | `kafka-run-class.sh`、`kafka-server-start.sh`、`kafka-server-stop.sh`、`kafka-jmx.sh` |
@@ -276,6 +277,20 @@ Share Group Admin API 尚未由 librdkafka 2.12 的公开 C API 暴露，因此 
 
 Kafka 4.3.1 集成测试会创建真实 ShareConsumer 和 Share Group，验证 list、state/members/offsets describe，成员退出后的 Empty 状态，以及 reset、delete-offsets、delete 的执行闭环。Kafka 3.6.2 回归验证旧 broker 上空 Share Group 列表路径；Share Consumer 本身属于独立的 `kafka-console-share-consumer.sh`，不计入本入口。
 
+### 4.21 Streams Groups
+
+已支持原版全部五个动作：list、describe、delete、reset-offsets 和 delete-offsets。兼容入口 `kafka-streams-groups.sh` 会将原版 action flag 改写为原生子命令；原版 mutation 保持立即执行，原生入口为 delete/delete-offsets 增加 `--execute` 保护，reset-offsets 保留原版明确的 dry-run/execute 选择。
+
+- list 只返回 Streams 类型 group，支持 Empty、NotReady、Stable、Assigning、Reconciling、Dead 状态过滤。
+- describe 支持重复 group 或 all-groups，以及 members、state、offsets、topology 四种视图；成员视图解码 active/standby/warmup task assignment，offsets 视图结合 committed offset 与 watermark 计算 lag，topology 在 Kafka 4.4 API v1 上输出 subtopology、source、repartition source、state changelog topic 和 copartition group。
+- delete 支持重复 group/all-groups，并可删除单组或全部组的内部 topic；执行前验证目标是 Streams Group 且处于可删除状态。
+- reset-offsets 支持重复 group/all-groups、input-topic/all-input-topics、CSV 导入导出，以及 earliest/latest/absolute/shift/current/datetime/duration 目标；可在执行 reset 时删除指定或全部内部 topic。
+- delete-offsets 支持单 group、重复 input topic 或 all-input-topics，并按 topic 返回结构化结果。
+
+StreamsGroupDescribe 是 Kafka 4.4 新增的 API 89，librdkafka 2.12 还没有公开对应接口。本项目因此为该 API 实现 v0/v1 协议编解码：v0 读取状态、成员和 task assignment，v1 增加完整 topology description；通用的 group 删除、offset 查询/修改/删除、topic metadata、水位和内部 topic 删除仍复用 rdkafka/librdkafka Admin API。所有非流式结果通过 `comfy-table` 或 JSON envelope 输出。
+
+验证边界需要明确：Kafka 4.3.1 真机集成已实际发送 API 89 请求，并验证 broker 对不存在 group 返回可解析的 `GROUP_ID_NOT_FOUND`，因此覆盖了真实请求 header、group ID 数组、nullable topology 和响应 header；Kafka 3.6.2 覆盖旧 broker 上的空列表兼容路径。由于当前测试集群是 Kafka 4.3.1，Kafka 4.4 才提供的 v1 topology 由对齐 Kafka 4.4 schema 的 codec 单元测试覆盖；目前也没有在集成测试中启动真实 Kafka Streams 应用。因此五个动作都有执行路径，但真实成员/task/topology 及 mutation 闭环仍是该入口最重要的集成测试缺口。
+
 ## 5. 全局行为差异
 
 | 项目 | Apache Kafka 原版 | kafka-cli |
@@ -297,7 +312,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现。
 2. `rdkafka-sys`：只包装 `rdkafka` 尚未暴露的 librdkafka Admin API，例如 leader election、部分 group offset/config API。
-3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、全类型 Groups 列表、Share Group Admin API、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
+3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、全类型 Groups 列表、Share Group Admin API、StreamsGroupDescribe API 89、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
 
 认证审计发现，`krafka 0.14.0` 的内部 transport 具备 SCRAM-over-TLS，但公开 `AuthConfig` API 不能从 Kafka properties 构造“SCRAM + 自定义 TLS 配置”；本项目因此不会通过访问私有字段伪装支持。当前独立协议路径明确支持 PLAINTEXT、SSL、SASL_PLAINTEXT 的 PLAIN/SCRAM 和 SASL_SSL 的 PLAIN；SASL_SSL + SCRAM 仍是已知缺口。librdkafka 路径不受此限制。
 
@@ -309,8 +324,8 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：216 个通过（202 个 library unit tests + 14 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 20 个命令族，包括真实 ShareConsumer 创建与 Share Group offset mutation 闭环、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
+- Rust 单元测试与普通 CLI 测试：225 个通过（210 个 library unit tests + 15 个 CLI tests）。
+- Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 21 个命令族，包括真实 ShareConsumer 创建与 Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -321,6 +336,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 - 未覆盖真实 ARM64 机器运行；ARM64 当前只由 CI 交叉编译。
 - 没有逐个原版选项的 golden test，也没有与 Java CLI 输出做逐命令差分测试。
 - ACL 快捷角色和复杂 deny/host/prefix 组合仍需更完整矩阵。
+- 尚未用真实 Kafka Streams 应用验证 Streams Group 成员/task/topology 和五动作闭环；Kafka 4.4 topology v1 当前只做协议 codec 单元测试。
 
 ## 8. CI 与发布目标
 
@@ -339,6 +355,8 @@ Metadata Quorum 实现 `1c482f0` 及报告提交 `0262300` 已由 GitHub Actions
 Kafka Groups 实现 `00b229f` 由 GitHub Actions [`30855676975`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30855676975) 完整验证通过：fmt/Clippy/209 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 Classic group 枚举、consumer 包含和 share 排除过滤；Kafka 3.6.2 验证旧 broker ListGroups 兼容路径。
 
 Kafka Share Groups 实现 `109765a` 与 flexible protocol 修复 `d207762` 由 GitHub Actions [`30857219313`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30857219313) 完整验证通过：fmt/Clippy/216 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 创建真实 ShareConsumer，验证 list、state/members/offsets describe、reset-offsets、delete-offsets 与 delete 闭环；Kafka 3.6.2 验证旧 broker 空列表兼容路径。
+
+Kafka Streams Groups 实现 `1ae5e53` 及协议修复 `e425098`、`97e67a5` 由 GitHub Actions [`30859766154`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30859766154) 完整验证通过：fmt/Clippy/225 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 API 89 请求及缺失 group 的结构化错误响应，Kafka 3.6.2 验证空列表兼容路径；Kafka 4.4 v1 topology 当前由 schema 对齐 codec 测试验证，尚无真实 Streams 应用 fixture。
 
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
@@ -359,13 +377,13 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 ### P2：扩大原版工具覆盖面
 
-Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。Share Group 管理已完成，后续新增入口优先考虑 Streams Group 与 Share Consumer。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
+Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。Share Group 与 Streams Group 管理入口均已完成；后续新增入口优先考虑 `kafka-streams-application-reset.sh` 与 Share Consumer。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
 
 ## 10. 最终评估
 
 当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、Transactions、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
 
-在对外发布时，建议使用“兼容 20 个常用 Kafka CLI 入口的 Rust 工具”表述，不应使用“100% 兼容 Apache Kafka CLI”。
+在对外发布时，建议使用“兼容 21 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 11 个已支持、10 个部分支持和 23 个未支持入口；不应使用“100% 兼容 Apache Kafka CLI”。
 
 ### 10.1 二次代码审计发现的待修正项
 
@@ -387,6 +405,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | consumer-groups | 完整 | 高 | 高/中 | reset、Kafka 4.4 state filter 及 verbose consumer protocol epoch 列已对齐；协议 fallback 鉴权矩阵仍需扩充 |
 | groups | 单动作 | 高 | 高/中 | 全类型 list 与五类过滤语义完整；结构化输出格式不同，协议 fallback 鉴权矩阵仍需扩充 |
 | share-groups | 完整 | 高 | 高/中 | 五个动作、成员/状态/offset 与 mutation 闭环已实测；结构化输出不同，协议 fallback 鉴权矩阵仍需扩充 |
+| streams-groups | 完整 | 高 | 中 | 五个动作及 API 89 v0/v1 已实现；Kafka 4.3 真机覆盖版本边界，但真实 Streams 应用与 Kafka 4.4 topology v1 闭环仍待集成验证 |
 | configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 bootstrap-controller |
 | client-metrics | 完整 | 高 | 高/中 | 四个动作和全部参数语义已实现；结构化输出格式不同 |
 | features | 完整 | 高 | 高/中 | 六个动作、指定 node、dry-run 与 Kafka 4.4 离线映射已实现；缺 controller bootstrap |
@@ -478,6 +497,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | 2026-08-04 | Kafka Delegation Tokens 入口 | 新增 `kafka delegation-tokens` 和 `kafka-delegation-tokens.sh`；实现 create/renew/expire/describe、v3 owner/requester、renewer、标准 Base64 HMAC 和 `-1` period sentinel | 189 个单元测试、12 个 CLI 测试；CI `30854931372` 六个 job 全绿，Kafka 4.3.1 验证 PLAINTEXT 安全拒绝边界 |
 | 2026-08-04 | Kafka Groups 入口 | 新增 `kafka all-groups` 和 `kafka-groups.sh`；实现全类型 list、group-type/protocol 组合过滤及 consumer/share/streams 快捷过滤，使用 ListGroups v5 保留 Share/Streams | 196 个单元测试、13 个 CLI 测试；CI `30855676975` 六个 job 全绿，Kafka 3.6.2/4.3.1 实际请求通过 |
 | 2026-08-04 | Kafka Share Groups 入口 | 新增 `kafka share-groups` 和 `kafka-share-groups.sh`；实现 list/describe/delete/reset-offsets/delete-offsets，使用 API 77/90/91/92 对齐 Kafka 4.4，并修正未知 flexible API header 边界 | 202 个单元测试、14 个 CLI 测试；CI `30857219313` 六个 job 全绿，Kafka 4.3.1 真实 ShareConsumer 与五动作闭环、Kafka 3.6.2 回归通过 |
+| 2026-08-04 | Kafka Streams Groups 入口 | 新增 `kafka streams-groups` 和 `kafka-streams-groups.sh`；实现 list/describe/delete/reset-offsets/delete-offsets，补齐 API 89 v0/v1、task assignment、offset lag、内部 topic 与 topology description | 210 个单元测试、15 个 CLI 测试；CI `30859766154` 六个 job 全绿，Kafka 4.3.1 实际验证 API 89 版本边界、Kafka 3.6.2 回归通过；真实 Streams 应用闭环待补 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
@@ -503,7 +523,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 
 非 Admin 客户端能力也已接入 console producer/consumer：异步与同步 delivery、主要 producer tuning 配置、正则订阅、空闲 timeout、isolation level、手工 partition/offset、headers 和结构化消息。其他 librdkafka 配置可通过 `--command-property` 传入。
 
-以下 Kafka 原版能力在 librdkafka 2.12 中没有对应 C API，因此不属于本轮可实现集合：partition reassignment、describe/alter log dirs、API version 明细、unregister broker、client quota、broker logger/client metrics config resource、metadata quorum、feature update、transaction listing/abort、delegation token、share/streams group Admin API。项目现有少数同名功能仍由 `krafka` 实现，报告不会把它们误记为 librdkafka 路径。
+以下 Kafka 原版能力在 librdkafka 2.12 中没有对应 C API，因此不属于本轮可直接通过公开 C API 实现的集合：partition reassignment、describe/alter log dirs、API version 明细、unregister broker、client quota、broker logger/client metrics config resource、metadata quorum、feature update、transaction listing/abort、delegation token、Share Group 专用 Admin API，以及 StreamsGroupDescribe。Streams Group 的通用删除与 offset 操作仍复用 librdkafka；其专用 describe 使用独立协议客户端。报告不会把这些 fallback 误记为 librdkafka 路径。
 
 此外，已通过实际 Kafka 4.3.1 测试确认 broker default config 无法用 librdkafka 表达：Kafka 要求空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在空 name 时返回 NULL。Get Offsets 的 `-4/-5/-6`、consumer group epoch、Kafka 4.4 consumer-groups 的 Assigning/Reconciling state、fenced broker inclusion、Kafka 4.4 user-principal ACL resource 和 Delegation Token ACL resource 也未由当前版本暴露；其中 tiered OffsetSpec 已通过 ListOffsets v11 补齐，consumer protocol epoch 和 Assigning/Reconciling 已通过 ConsumerGroupDescribe/ListGroups v5 补齐，fenced broker inclusion 已通过独立 DescribeCluster v2 协议路径补齐。
 
