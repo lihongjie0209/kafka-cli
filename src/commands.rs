@@ -2961,6 +2961,22 @@ fn decode_streams_group_description(
     ))
 }
 
+fn encode_streams_describe_request(
+    group_id: &str,
+    version: i16,
+    include_topology_description: bool,
+    buffer: &mut BytesMut,
+) {
+    buffer.put_u8(0); // flexible request-header tagged fields
+    encode_unsigned_varint(2, buffer);
+    encode_compact_string(group_id, buffer);
+    buffer.put_u8(0); // include authorized operations
+    if version >= 1 {
+        buffer.put_u8(u8::from(include_topology_description));
+    }
+    buffer.put_u8(0); // request tagged fields
+}
+
 async fn describe_streams_groups(
     client: &krafka::admin::AdminClient,
     group_ids: &[String],
@@ -2979,15 +2995,12 @@ async fn describe_streams_groups(
             })?;
         let mut response = connection
             .send_request(api_key, version, |buffer| {
-                buffer.put_u8(0); // flexible request-header tagged fields
-                encode_unsigned_varint(2, buffer);
-                encode_compact_string(group_id, buffer);
-                buffer.put_u8(0); // group ID array tagged fields
-                buffer.put_u8(0); // include authorized operations
-                if version >= 1 {
-                    buffer.put_u8(u8::from(include_topology_description));
-                }
-                buffer.put_u8(0); // request tagged fields
+                encode_streams_describe_request(
+                    group_id,
+                    version,
+                    include_topology_description,
+                    buffer,
+                );
                 Ok(())
             })
             .await?;
@@ -14557,6 +14570,15 @@ mod tests {
         let error = parse_streams_group_states("PreparingRebalance").expect_err("invalid state");
 
         assert!(error.to_string().contains("NotReady"));
+    }
+
+    #[test]
+    fn streams_group_describe_request_should_not_tag_primitive_group_ids() {
+        let mut buffer = BytesMut::new();
+
+        encode_streams_describe_request("g", 0, false, &mut buffer);
+
+        assert_eq!(buffer.as_ref(), [0, 2, 2, b'g', 0, 0]);
     }
 
     fn encode_empty_streams_assignment(buffer: &mut BytesMut) {
