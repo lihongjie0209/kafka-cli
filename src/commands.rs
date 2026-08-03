@@ -3005,17 +3005,38 @@ async fn describe_streams_groups(
             })
             .await?;
         drop(connection);
-        skip_tagged_fields(&mut response)?; // flexible response-header tagged fields
-        let _throttle_time_ms = i32::decode(&mut response)?;
-        let count = decode_compact_len(&mut response)?;
+        let response_wire = STANDARD.encode(response.as_ref());
+        skip_tagged_fields(&mut response).map_err(|error| {
+            Error::Config(format!(
+                "StreamsGroupDescribe response header failed: {error}; payload={response_wire}"
+            ))
+        })?;
+        let _throttle_time_ms = i32::decode(&mut response).map_err(|error| {
+            Error::Config(format!(
+                "StreamsGroupDescribe throttle failed: {error}; payload={response_wire}"
+            ))
+        })?;
+        let count = decode_compact_len(&mut response).map_err(|error| {
+            Error::Config(format!(
+                "StreamsGroupDescribe group array failed: {error}; payload={response_wire}"
+            ))
+        })?;
         if count != 1 {
             return Err(Error::Config(format!(
                 "StreamsGroupDescribe returned {count} groups for one requested group"
             )));
         }
         let (error_code, error_message, description) =
-            decode_streams_group_description(&mut response, version)?;
-        skip_tagged_fields(&mut response)?;
+            decode_streams_group_description(&mut response, version).map_err(|error| {
+                Error::Config(format!(
+                    "StreamsGroupDescribe group decode failed: {error}; payload={response_wire}"
+                ))
+            })?;
+        skip_tagged_fields(&mut response).map_err(|error| {
+            Error::Config(format!(
+                "StreamsGroupDescribe response tags failed: {error}; payload={response_wire}"
+            ))
+        })?;
         if error_code != 0 {
             return Err(Error::Config(format!(
                 "StreamsGroupDescribe failed for {group_id}: {}",
