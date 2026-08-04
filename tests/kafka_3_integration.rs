@@ -249,7 +249,7 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OFFSET"))
-        .stdout(predicate::str::contains("kafka-36-events").not());
+        .stdout(predicate::str::contains("kafka-36-events"));
     Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args(["--bootstrap-server", &bootstrap, "cluster", "id"])
