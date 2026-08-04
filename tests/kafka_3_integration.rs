@@ -158,6 +158,38 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .assert()
         .success()
         .stdout(predicate::str::contains("kafka-36-events"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
+            "kafka-36-events",
+            "--sync",
+        ])
+        .write_stdin("kafka-36-performance\n")
+        .assert()
+        .success();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "consumer-perf-test",
+            "--topic",
+            "kafka-36-events",
+            "--group",
+            "kafka-36-performance",
+            "--num-records",
+            "1",
+            "--timeout",
+            "30000",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("data.consumed.in.nMsg"))
+        .stdout(predicate::str::contains(", 1,"));
     let described_topic = Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

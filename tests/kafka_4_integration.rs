@@ -648,6 +648,36 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .success()
         .stdout(predicate::str::contains("json-value"))
         .stdout(predicate::str::contains("trace"));
+    let consumer_performance = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "consumer-perf-test",
+            "--include",
+            "integration-events",
+            "--group",
+            "consumer-perf-integration",
+            "--num-records",
+            "1",
+            "--timeout",
+            "30000",
+            "--print-metrics",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rebalance.time.ms"))
+        .stdout(predicate::str::contains("records-consumed:client-id="))
+        .get_output()
+        .stdout
+        .clone();
+    let consumer_performance =
+        String::from_utf8(consumer_performance).expect("UTF-8 consumer performance output");
+    let summary = consumer_performance
+        .lines()
+        .find(|line| line.split(',').count() == 10 && !line.starts_with("start.time"))
+        .expect("consumer performance summary");
+    assert_eq!(summary.split(',').nth(4).map(str::trim), Some("1"));
 
     success(
         &bootstrap,

@@ -40,7 +40,7 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `consume`, `share-consume`,
+The binary exposes `topics`, `produce`, `consume`, `consumer-perf-test`, `share-consume`,
 `share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
@@ -81,6 +81,10 @@ shutdown, including cyclic accept/release/reject/renew patterns.
 original seven-column CSV throughput summary, optional interval/per-consumer
 statistics, timeout warning, and native connection metrics. Its compatibility
 alias is `kafka-share-consumer-perf-test.sh`.
+`consumer-perf-test` provides the corresponding classic consumer benchmark,
+including topic/regex subscription, earliest/latest reset behavior, rebalance
+and fetch-time accounting, the original ten-column CSV contract, and
+librdkafka-backed fetch/socket tuning.
 
 ## Authentication
 

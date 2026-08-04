@@ -75,6 +75,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-topics" => Some("topics"),
         "kafka-console-producer" => Some("produce"),
         "kafka-console-consumer" => Some("consume"),
+        "kafka-consumer-perf-test" => Some("consumer-perf-test"),
         "kafka-console-share-consumer" => Some("share-consume"),
         "kafka-share-consumer-perf-test" => Some("share-consumer-perf-test"),
         "kafka-verifiable-share-consumer" => Some("verifiable-share-consumer"),
@@ -298,6 +299,8 @@ pub enum Command {
     Produce(ProduceArgs),
     /// Consume records to stdout.
     Consume(ConsumeArgs),
+    /// Measure classic Kafka consumer throughput.
+    ConsumerPerfTest(ConsumerPerfTestArgs),
     /// Consume records through a Kafka Share group.
     ShareConsume(ShareConsumeArgs),
     /// Measure Kafka Share consumer throughput.
@@ -873,6 +876,63 @@ impl ConsumeArgs {
         } else {
             &self.properties
         }
+    }
+}
+
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka ConsumerPerformance exposes independent reset and reporting switches"
+)]
+pub struct ConsumerPerfTestArgs {
+    #[arg(long, required_unless_present = "include", conflicts_with = "include")]
+    pub topic: Option<String>,
+    #[arg(long, required_unless_present = "topic", conflicts_with = "topic")]
+    pub include: Option<String>,
+    #[arg(long)]
+    pub group: Option<String>,
+    #[arg(
+        long = "num-records",
+        required_unless_present = "messages",
+        conflicts_with = "messages"
+    )]
+    pub num_records: Option<u64>,
+    /// Deprecated alias for --num-records.
+    #[arg(
+        long,
+        required_unless_present = "num_records",
+        conflicts_with = "num_records"
+    )]
+    pub messages: Option<u64>,
+    #[arg(long, default_value_t = 1024 * 1024)]
+    pub fetch_size: i32,
+    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    pub socket_buffer_size: i32,
+    #[arg(long = "command-property")]
+    pub properties: Vec<String>,
+    #[arg(long)]
+    pub from_latest: bool,
+    /// Deprecated alias for --command-config.
+    #[arg(long = "consumer.config")]
+    pub consumer_config: Option<PathBuf>,
+    #[arg(long)]
+    pub print_metrics: bool,
+    #[arg(long)]
+    pub show_detailed_stats: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "10000", default_value_t = 10_000)]
+    pub timeout: u64,
+    #[arg(long, default_value_t = 5_000)]
+    pub reporting_interval: u64,
+    #[arg(long, default_value = "yyyy-MM-dd HH:mm:ss:SSS")]
+    pub date_format: String,
+    #[arg(long)]
+    pub hide_header: bool,
+}
+
+impl ConsumerPerfTestArgs {
+    #[must_use]
+    pub fn num_records(&self) -> u64 {
+        self.num_records.or(self.messages).unwrap_or_default()
     }
 }
 
@@ -2136,6 +2196,61 @@ mod tests {
         assert_eq!(args.timeout, 10_000);
         assert!(args.show_detailed_stats);
         assert!(args.show_consumer_stats);
+    }
+
+    #[test]
+    fn consumer_perf_should_parse_topic_and_include_modes() {
+        let topic = Cli::try_parse_from([
+            "kafka",
+            "consumer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "10",
+            "--from-latest",
+            "--print-metrics",
+        ])
+        .expect("consumer performance topic mode");
+        let Command::ConsumerPerfTest(topic) = topic.command else {
+            panic!("expected consumer-perf-test command");
+        };
+        assert_eq!(topic.topic.as_deref(), Some("events"));
+        assert!(topic.from_latest && topic.print_metrics);
+
+        let include = Cli::try_parse_from([
+            "kafka",
+            "consumer-perf-test",
+            "--include",
+            "events.*",
+            "--messages",
+            "20",
+        ])
+        .expect("consumer performance include mode");
+        let Command::ConsumerPerfTest(include) = include.command else {
+            panic!("expected consumer-perf-test command");
+        };
+        assert_eq!(include.include.as_deref(), Some("events.*"));
+        assert_eq!(include.num_records(), 20);
+    }
+
+    #[test]
+    fn consumer_perf_should_require_exclusive_source_and_count() {
+        assert!(
+            Cli::try_parse_from([
+                "kafka",
+                "consumer-perf-test",
+                "--topic",
+                "events",
+                "--include",
+                "events.*",
+                "--num-records",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["kafka", "consumer-perf-test", "--topic", "events",]).is_err()
+        );
     }
 
     #[test]

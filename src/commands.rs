@@ -53,12 +53,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
-        ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
-        ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
-        ReassignAction, ResetOffsetsArgs, ShareConsumeArgs, ShareConsumerPerfTestArgs,
-        ShareGroupAction, ShareGroupResetOffsetsArgs, StreamsApplicationResetArgs,
-        StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
-        VerifiableAcknowledgementMode, VerifiableShareConsumerArgs,
+        ConfigAction, ConfigEntityArgs, ConfigEntityType, ConsumerPerfTestArgs,
+        DelegationTokenAction, DescribeTopicArgs, ElectionType, FeatureAction, GroupAction,
+        ListTopicArgs, MetadataQuorumAction, OffsetTime, ReassignAction, ResetOffsetsArgs,
+        ShareConsumeArgs, ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
+        StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
+        TransactionAction, VerifiableAcknowledgementMode, VerifiableShareConsumerArgs,
     },
     config,
     error::{Error, Result},
@@ -155,6 +155,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Topics(args) => topics(&client_config, timeout, format, args.action).await,
         Command::Produce(args) => produce(client_config, args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
+        Command::ConsumerPerfTest(args) => {
+            consumer_perf_test(bootstrap, command_config.as_deref(), args).await
+        }
         Command::ShareConsume(args) => {
             Box::pin(share_consume(
                 bootstrap,
@@ -1586,6 +1589,253 @@ async fn share_consume(
         println!("shutdown_complete");
     }
     run_result.map(|_| ()).and(close_result)
+}
+
+async fn consumer_perf_test(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    args: ConsumerPerfTestArgs,
+) -> Result<()> {
+    let bootstrap = bootstrap.to_owned();
+    let command_config = command_config.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        run_consumer_perf_test(&bootstrap, command_config.as_deref(), &args)
+    })
+    .await
+    .map_err(|error| Error::Config(format!("consumer performance task failed: {error}")))?
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Kafka benchmark lifecycle keeps configuration, rebalance accounting, polling, reporting, and cleanup ordering explicit"
+)]
+fn run_consumer_perf_test(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    args: &ConsumerPerfTestArgs,
+) -> Result<()> {
+    if args.reporting_interval == 0 {
+        return Err(Error::Usage(
+            "reporting interval must be greater than 0".into(),
+        ));
+    }
+    if args.fetch_size <= 0 {
+        return Err(Error::Usage("--fetch-size must be greater than 0".into()));
+    }
+    if args.socket_buffer_size <= 0 {
+        return Err(Error::Usage(
+            "--socket-buffer-size must be greater than 0".into(),
+        ));
+    }
+    validate_share_date_pattern(&args.date_format)?;
+    let config_path = share_perf_config_path(command_config, args.consumer_config.as_deref())?;
+    if args.messages.is_some() {
+        println!("Warning: --messages is deprecated. Use --num-records instead.");
+    }
+    if args.consumer_config.is_some() {
+        println!("Warning: --consumer.config is deprecated. Use --command-config instead.");
+    }
+    if !args.hide_header {
+        print_consumer_perf_header(args.show_detailed_stats);
+    }
+
+    let mut config = config::client_config(bootstrap, config_path)?;
+    apply_client_properties(&mut config, &args.properties)?;
+    let generated_group = format!(
+        "perf-consumer-{}",
+        Utc::now().timestamp_millis().unsigned_abs() % 100_000
+    );
+    config
+        .set(
+            "group.id",
+            args.group.as_deref().unwrap_or(&generated_group),
+        )
+        .set("max.partition.fetch.bytes", args.fetch_size.to_string())
+        .set(
+            "socket.receive.buffer.bytes",
+            args.socket_buffer_size.to_string(),
+        )
+        .set(
+            "auto.offset.reset",
+            if args.from_latest {
+                "latest"
+            } else {
+                "earliest"
+            },
+        )
+        .set("check.crcs", "false");
+    if config.get("client.id").is_none() {
+        config.set("client.id", "perf-consumer-client");
+    }
+    let consumer: BaseConsumer = config.create()?;
+    if let Some(topic) = args.topic.as_deref() {
+        consumer.subscribe(&[topic])?;
+    } else if let Some(include) = args.include.as_deref() {
+        consumer.subscribe(&[&consumer_include_pattern(include)])?;
+    }
+
+    let start = Instant::now();
+    let start_ms = Utc::now().timestamp_millis();
+    let mut last_record = start;
+    let mut last_report = start;
+    let mut previous = SharePerfStats::default();
+    let mut stats = SharePerfStats::default();
+    let mut join_started = start;
+    let mut assigned = false;
+    let mut total_join = Duration::ZERO;
+    let mut round_join = Duration::ZERO;
+    while stats.records < args.num_records()
+        && last_record.elapsed() <= Duration::from_millis(args.timeout)
+    {
+        let message = consumer.poll(Duration::from_millis(100));
+        let now = Instant::now();
+        let currently_assigned = consumer.assignment()?.count() > 0;
+        if !assigned && currently_assigned {
+            let elapsed = join_started.elapsed();
+            total_join = total_join.saturating_add(elapsed);
+            round_join = round_join.saturating_add(elapsed);
+        } else if assigned && !currently_assigned {
+            join_started = now;
+        }
+        assigned = currently_assigned;
+        let Some(message) = message else { continue };
+        let message = message?;
+        last_record = now;
+        stats.records = stats.records.saturating_add(1);
+        stats.bytes = stats.bytes.saturating_add(
+            message
+                .key()
+                .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX))
+                .saturating_add(
+                    message
+                        .payload()
+                        .map_or(0, |value| u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                ),
+        );
+        if last_report.elapsed() >= Duration::from_millis(args.reporting_interval) {
+            if args.show_detailed_stats {
+                print_consumer_perf_progress(
+                    stats,
+                    previous,
+                    last_report.elapsed(),
+                    round_join,
+                    &args.date_format,
+                );
+            }
+            round_join = Duration::ZERO;
+            previous = stats;
+            last_report = now;
+        }
+    }
+    if stats.records < args.num_records() {
+        println!(
+            "WARNING: Exiting before consuming the expected number of records: timeout ({} ms) exceeded. You can use the --timeout option to increase the timeout.",
+            args.timeout
+        );
+    }
+    let end_ms = Utc::now().timestamp_millis();
+    let elapsed = start.elapsed();
+    if !args.show_detailed_stats {
+        print_consumer_perf_summary(
+            stats,
+            elapsed,
+            total_join,
+            start_ms,
+            end_ms,
+            &args.date_format,
+        );
+    }
+    if args.print_metrics {
+        println!(
+            "records-consumed:client-id={}: {}",
+            config.get("client.id").unwrap_or("perf-consumer-client"),
+            stats.records
+        );
+        println!(
+            "bytes-consumed:client-id={}: {}",
+            config.get("client.id").unwrap_or("perf-consumer-client"),
+            stats.bytes
+        );
+        println!("assigned-partitions: {}", consumer.assignment()?.count());
+    }
+    consumer.unsubscribe();
+    Ok(())
+}
+
+fn print_consumer_perf_header(detailed: bool) {
+    if detailed {
+        println!(
+            "time, threadId, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec"
+        );
+    } else {
+        println!(
+            "start.time, end.time, data.consumed.in.MB, MB.sec, data.consumed.in.nMsg, nMsg.sec, rebalance.time.ms, fetch.time.ms, fetch.MB.sec, fetch.nMsg.sec"
+        );
+    }
+}
+
+fn consumer_fetch_values(
+    stats: SharePerfStats,
+    elapsed: Duration,
+    join: Duration,
+) -> (f64, f64, u128) {
+    let fetch = elapsed.saturating_sub(join);
+    let (_, mb_per_sec, records_per_sec, _) = share_perf_values(stats, fetch);
+    (mb_per_sec, records_per_sec, fetch.as_millis())
+}
+
+fn print_consumer_perf_progress(
+    stats: SharePerfStats,
+    previous: SharePerfStats,
+    interval: Duration,
+    join: Duration,
+    date_format: &str,
+) {
+    let delta = SharePerfStats {
+        records: stats.records.saturating_sub(previous.records),
+        bytes: stats.bytes.saturating_sub(previous.bytes),
+    };
+    let (total_mb, mb_per_sec, records_per_sec, _) = share_perf_values(stats, interval);
+    let (fetch_mb_per_sec, fetch_records_per_sec, fetch_ms) =
+        consumer_fetch_values(delta, interval, join);
+    println!(
+        "{}, 0, {:.4}, {:.4}, {}, {:.4}, {}, {}, {:.4}, {:.4}",
+        format_share_perf_time(Utc::now().timestamp_millis(), date_format),
+        total_mb,
+        mb_per_sec,
+        stats.records,
+        records_per_sec,
+        join.as_millis(),
+        fetch_ms,
+        fetch_mb_per_sec,
+        fetch_records_per_sec
+    );
+}
+
+fn print_consumer_perf_summary(
+    stats: SharePerfStats,
+    elapsed: Duration,
+    join: Duration,
+    start_ms: i64,
+    end_ms: i64,
+    date_format: &str,
+) {
+    let (total_mb, mb_per_sec, records_per_sec, _) = share_perf_values(stats, elapsed);
+    let (fetch_mb_per_sec, fetch_records_per_sec, fetch_ms) =
+        consumer_fetch_values(stats, elapsed, join);
+    println!(
+        "{}, {}, {:.4}, {:.4}, {}, {:.4}, {}, {}, {:.4}, {:.4}",
+        format_share_perf_time(start_ms, date_format),
+        format_share_perf_time(end_ms, date_format),
+        total_mb,
+        mb_per_sec,
+        stats.records,
+        records_per_sec,
+        join.as_millis(),
+        fetch_ms,
+        fetch_mb_per_sec,
+        fetch_records_per_sec
+    );
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -14937,6 +15187,21 @@ mod tests {
         ));
         assert!(validate_share_date_pattern("yyyy-MM-dd HH:mm:ss:SSS").is_ok());
         assert!(validate_share_date_pattern("%Q").is_err());
+    }
+
+    #[test]
+    fn consumer_perf_should_exclude_rebalance_time_from_fetch_rates() {
+        let (mb_per_sec, records_per_sec, fetch_ms) = consumer_fetch_values(
+            SharePerfStats {
+                records: 100,
+                bytes: 1024 * 1024,
+            },
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
+        assert!((mb_per_sec - 0.5).abs() < f64::EPSILON);
+        assert!((records_per_sec - 50.0).abs() < f64::EPSILON);
+        assert_eq!(fetch_ms, 2_000);
     }
 
     #[test]
