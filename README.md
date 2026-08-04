@@ -40,7 +40,7 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `producer-perf-test`, `consume`, `consumer-perf-test`, `share-consume`,
+The binary exposes `topics`, `produce`, `producer-perf-test`, `e2e-latency`, `consume`, `consumer-perf-test`, `share-consume`,
 `share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
@@ -90,6 +90,11 @@ regex payload delimiters, fractional throughput throttling, deterministic key
 distributions, warmup and steady-state summaries, transactions, delivery
 latency percentiles, and native measured metrics. Its compatibility alias is
 `kafka-producer-perf-test.sh`.
+`e2e-latency` synchronously produces and consumes each generated record,
+validates its key, value, ordered headers and null header values, and prints the
+original average and percentile latency summary. It auto-creates a missing
+single-partition topic and accepts both Kafka 4.2 named arguments and the
+deprecated five/six positional argument form through `kafka-e2e-latency.sh`.
 
 ## Authentication
 

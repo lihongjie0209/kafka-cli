@@ -195,6 +195,25 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "e2e-latency",
+            "--topic",
+            "kafka-36-events",
+            "--num-records",
+            "2",
+            "--producer-acks",
+            "1",
+            "--record-size",
+            "16",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Avg latency:"))
+        .stdout(predicate::str::contains("Percentiles: 50th"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "consumer-perf-test",
             "--topic",
             "kafka-36-events",

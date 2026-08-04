@@ -675,6 +675,36 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .stdout(predicate::str::contains("3 records sent"))
         .stdout(predicate::str::contains("records-sent:client-id="))
         .stdout(predicate::str::contains("record-errors: 0"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "e2e-latency",
+            "--topic",
+            "integration-e2e-events",
+            "--num-records",
+            "2",
+            "--producer-acks",
+            "all",
+            "--record-size",
+            "32",
+            "--record-key-size",
+            "8",
+            "--num-headers",
+            "2",
+            "--record-header-key-size",
+            "4",
+            "--record-header-size",
+            "-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Topic \"integration-e2e-events\" does not exist",
+        ))
+        .stdout(predicate::str::contains("Avg latency:"))
+        .stdout(predicate::str::contains("Percentiles: 50th"));
     let consumer_performance = Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

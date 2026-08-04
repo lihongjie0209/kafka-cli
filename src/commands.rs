@@ -42,7 +42,7 @@ use rdkafka::{
         ResourceSpecifier, TopicReplication,
     },
     client::{ClientContext, DefaultClientContext},
-    consumer::{BaseConsumer, Consumer, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::{BorrowedHeaders, Header, Headers, OwnedHeaders, ToBytes},
     producer::{
@@ -58,8 +58,8 @@ use crate::{
     cli::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
         ConfigAction, ConfigEntityArgs, ConfigEntityType, ConsumerPerfTestArgs,
-        DelegationTokenAction, DescribeTopicArgs, ElectionType, FeatureAction, GroupAction,
-        ListTopicArgs, MetadataQuorumAction, OffsetTime, ProducerKeyDistribution,
+        DelegationTokenAction, DescribeTopicArgs, E2eLatencyArgs, ElectionType, FeatureAction,
+        GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime, ProducerKeyDistribution,
         ProducerPerfTestArgs, ReassignAction, ResetOffsetsArgs, ShareConsumeArgs,
         ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
         StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
@@ -169,6 +169,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Command::E2eLatency(args) => e2e_latency(bootstrap, command_config.as_deref(), args).await,
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::ConsumerPerfTest(args) => {
             consumer_perf_test(bootstrap, command_config.as_deref(), args).await
@@ -1087,6 +1088,255 @@ async fn producer_perf_test(
     })
     .await
     .map_err(|error| Error::Config(format!("producer performance task failed: {error}")))?
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct E2eHeader {
+    key: String,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JavaRandom(u64);
+
+impl JavaRandom {
+    const MULTIPLIER: u64 = 0x0005_deec_e66d;
+    const MASK: u64 = (1_u64 << 48) - 1;
+
+    const fn new(seed: i64) -> Self {
+        Self((seed.cast_unsigned() ^ Self::MULTIPLIER) & Self::MASK)
+    }
+
+    fn next_bits(&mut self, bits: u32) -> u32 {
+        self.0 = self.0.wrapping_mul(Self::MULTIPLIER).wrapping_add(0xb) & Self::MASK;
+        u32::try_from(self.0 >> (48 - bits)).unwrap_or_default()
+    }
+
+    fn next_index(&mut self, bound: u32) -> u32 {
+        let mask = bound - 1;
+        if bound & mask == 0 {
+            return u32::try_from((u64::from(bound) * u64::from(self.next_bits(31))) >> 31)
+                .unwrap_or_default();
+        }
+        loop {
+            let bits = self.next_bits(31);
+            let value = bits % bound;
+            let check = bits.wrapping_sub(value).wrapping_add(mask);
+            if i32::from_ne_bytes(check.to_ne_bytes()) >= 0 {
+                return value;
+            }
+        }
+    }
+}
+
+fn e2e_random_bytes(random: &mut JavaRandom, length: i32) -> Vec<u8> {
+    let byte = b'A'.saturating_add(u8::try_from(random.next_index(26)).unwrap_or_default());
+    vec![byte; usize::try_from(length).unwrap_or_default()]
+}
+
+fn e2e_headers(
+    random: &mut JavaRandom,
+    count: i32,
+    key_size: i32,
+    value_size: i32,
+) -> Vec<E2eHeader> {
+    (0..count)
+        .map(|_| E2eHeader {
+            key: String::from_utf8_lossy(&e2e_random_bytes(random, key_size)).into_owned(),
+            value: (value_size != -1).then(|| e2e_random_bytes(random, value_size)),
+        })
+        .collect()
+}
+
+fn e2e_percentile(latencies: &[u64], numerator: usize, denominator: usize) -> u64 {
+    let index = latencies
+        .len()
+        .saturating_mul(numerator)
+        .checked_div(denominator)
+        .unwrap_or_default()
+        .min(latencies.len().saturating_sub(1));
+    latencies.get(index).copied().unwrap_or_default()
+}
+
+fn validate_e2e_record(
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    key: &[u8],
+    value: &[u8],
+    expected_headers: &[E2eHeader],
+) -> Result<()> {
+    if message.payload().unwrap_or_default() != value {
+        return Err(Error::Config(
+            "the message value read did not match the message value sent".into(),
+        ));
+    }
+    if message.key().unwrap_or_default() != key || message.key().is_none() {
+        return Err(Error::Config(
+            "the message key read did not match the message key sent".into(),
+        ));
+    }
+    let received_headers = message.headers();
+    if expected_headers.is_empty() {
+        if received_headers.is_some_and(|headers| headers.count() > 0) {
+            return Err(Error::Config(
+                "expected no message headers but received at least one".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let Some(received_headers) = received_headers else {
+        return Err(Error::Config(
+            "expected message headers but received none".into(),
+        ));
+    };
+    if received_headers.count() != expected_headers.len() {
+        return Err(Error::Config(
+            "header count mismatch between sent and received messages".into(),
+        ));
+    }
+    for (index, expected) in expected_headers.iter().enumerate() {
+        let received = received_headers.get(index);
+        if received.key != expected.key || received.value != expected.value.as_deref() {
+            return Err(Error::Config(format!(
+                "message header {index} did not match the sent header"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_e2e_topic(
+    config: &rdkafka::ClientConfig,
+    producer: &FutureProducer,
+    topic: &str,
+) -> Result<()> {
+    let metadata = producer
+        .client()
+        .fetch_metadata(Some(topic), Duration::from_secs(10))?;
+    let exists = metadata.topics().iter().any(|metadata_topic| {
+        metadata_topic.name() == topic && !metadata_topic.partitions().is_empty()
+    });
+    if exists {
+        return Ok(());
+    }
+    println!(
+        "Topic \"{topic}\" does not exist. Will create topic with 1 partition(s) and replication factor = 1"
+    );
+    let admin: Admin = config.create()?;
+    let results = admin
+        .create_topics(
+            &[NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
+            &AdminOptions::new().operation_timeout(Some(Duration::from_secs(30))),
+        )
+        .await?;
+    for result in results {
+        if let Err((name, error)) = result
+            && error != RDKafkaErrorCode::TopicAlreadyExists
+        {
+            return Err(Error::Config(format!(
+                "creation of topic {name} failed: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the original latency loop keeps setup, synchronous round trips, validation, and floating-point reporting in one lifecycle"
+)]
+async fn e2e_latency(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    args: E2eLatencyArgs,
+) -> Result<()> {
+    let mut producer_config = config::client_config(bootstrap, command_config)?;
+    producer_config
+        .set("linger.ms", "0")
+        .set("acks", &args.producer_acks);
+    producer_config.remove("max.block.ms");
+    let producer: FutureProducer = producer_config.create()?;
+    ensure_e2e_topic(&producer_config, &producer, &args.topic).await?;
+
+    let mut consumer_config = config::client_config(bootstrap, command_config)?;
+    consumer_config
+        .set(
+            "group.id",
+            format!("test-group-{}", Utc::now().timestamp_millis()),
+        )
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "latest")
+        .set("fetch.wait.max.ms", "0");
+    let consumer: StreamConsumer = consumer_config.create()?;
+    let metadata = consumer.fetch_metadata(Some(&args.topic), Duration::from_secs(30))?;
+    let topic = metadata
+        .topics()
+        .iter()
+        .find(|topic| topic.name() == args.topic)
+        .ok_or_else(|| Error::Config(format!("topic {} was not found", args.topic)))?;
+    let mut assignment = TopicPartitionList::new();
+    for partition in topic.partitions() {
+        let (_, high) =
+            consumer.fetch_watermarks(&args.topic, partition.id(), Duration::from_secs(30))?;
+        assignment.add_partition_offset(&args.topic, partition.id(), Offset::Offset(high))?;
+    }
+    consumer.assign(&assignment)?;
+
+    let mut random = JavaRandom::new(0);
+    let mut latencies = Vec::with_capacity(usize::try_from(args.num_records).unwrap_or_default());
+    let mut total_nanos = 0_u128;
+    for index in 0..args.num_records {
+        let key = e2e_random_bytes(&mut random, args.record_key_size);
+        let value = e2e_random_bytes(&mut random, args.record_size);
+        let headers = e2e_headers(
+            &mut random,
+            args.num_headers,
+            args.record_header_key_size,
+            args.record_header_size,
+        );
+        let mut owned_headers = OwnedHeaders::new_with_capacity(headers.len());
+        for header in &headers {
+            owned_headers = owned_headers.insert(Header {
+                key: &header.key,
+                value: header.value.as_deref(),
+            });
+        }
+        let started = Instant::now();
+        producer
+            .send(
+                FutureRecord::to(&args.topic)
+                    .key(&key)
+                    .payload(&value)
+                    .headers(owned_headers),
+                Duration::MAX,
+            )
+            .await
+            .map_err(|(error, _)| Error::Kafka(error))?;
+        let message = tokio::time::timeout(Duration::from_secs(60), consumer.recv())
+            .await
+            .map_err(|_| {
+                Error::Config("poll() timed out before finding a result (timeout:[60000ms])".into())
+            })??;
+        let elapsed = started.elapsed();
+        validate_e2e_record(&message, &key, &value, &headers)?;
+        if index % 1_000 == 0 {
+            println!("{index}\t{:.4}", elapsed.as_secs_f64() * 1_000.0);
+        }
+        total_nanos = total_nanos.saturating_add(elapsed.as_nanos());
+        latencies.push(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+    }
+    println!(
+        "Avg latency: {:.4} ms",
+        total_nanos as f64 / f64::from(args.num_records) / 1_000_000.0
+    );
+    latencies.sort_unstable();
+    println!(
+        "Percentiles: 50th = {}, 99th = {}, 99.9th = {}",
+        e2e_percentile(&latencies, 1, 2),
+        e2e_percentile(&latencies, 99, 100),
+        e2e_percentile(&latencies, 999, 1_000)
+    );
+    consumer.commit_consumer_state(CommitMode::Sync)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -17301,6 +17551,42 @@ mod tests {
             result,
             Err(Error::Usage(message)) if message.contains("invalid producer property")
         ));
+    }
+
+    #[test]
+    fn e2e_random_should_match_java_random_seed_zero() {
+        let mut random = JavaRandom::new(0);
+        let values = (0..8).map(|_| random.next_index(26)).collect::<Vec<_>>();
+
+        assert_eq!(values, [18, 18, 23, 21, 13, 9, 7, 15]);
+    }
+
+    #[test]
+    fn e2e_headers_should_preserve_null_values_and_random_sequence() {
+        let mut random = JavaRandom::new(0);
+
+        let headers = e2e_headers(&mut random, 2, 3, -1);
+
+        assert_eq!(
+            headers,
+            [
+                E2eHeader {
+                    key: "SSS".into(),
+                    value: None,
+                },
+                E2eHeader {
+                    key: "SSS".into(),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn e2e_percentile_should_use_kafka_floor_index() {
+        let values = [1, 2, 3, 4];
+
+        assert_eq!(e2e_percentile(&values, 1, 2), 3);
     }
 
     #[test]

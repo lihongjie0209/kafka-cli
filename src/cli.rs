@@ -75,6 +75,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-topics" => Some("topics"),
         "kafka-console-producer" => Some("produce"),
         "kafka-producer-perf-test" => Some("producer-perf-test"),
+        "kafka-e2e-latency" => Some("e2e-latency"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-consumer-perf-test" => Some("consumer-perf-test"),
         "kafka-console-share-consumer" => Some("share-consume"),
@@ -133,6 +134,9 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
     }
     if command == "configs" {
         rewrite_legacy_config_entities(args);
+    }
+    if command == "e2e-latency" {
+        rewrite_e2e_latency_legacy_args(args);
     }
     let candidates: &[(&str, &str, bool)] = match command {
         "topics" => &[
@@ -212,6 +216,42 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
         }
         _ => {}
     }
+}
+
+fn rewrite_e2e_latency_legacy_args(args: &mut Vec<OsString>) {
+    let has_named = args.iter().skip(2).any(|argument| {
+        matches!(
+            argument.to_str(),
+            Some(
+                "--bootstrap-server"
+                    | "--topic"
+                    | "--num-records"
+                    | "--producer-acks"
+                    | "--record-size"
+            )
+        )
+    });
+    if has_named || !matches!(args.len().saturating_sub(2), 5 | 6) {
+        return;
+    }
+    let positional = args.drain(2..).collect::<Vec<_>>();
+    for (name, value) in [
+        ("--bootstrap-server", &positional[0]),
+        ("--topic", &positional[1]),
+        ("--num-records", &positional[2]),
+        ("--producer-acks", &positional[3]),
+        ("--record-size", &positional[4]),
+    ] {
+        args.push(OsString::from(name));
+        args.push(value.clone());
+    }
+    if let Some(config) = positional.get(5) {
+        args.push(OsString::from("--command-config"));
+        args.push(config.clone());
+    }
+    println!(
+        "WARNING: Positional argument usage is deprecated and will be removed in Apache Kafka 5.0. Please use named arguments instead: --bootstrap-server, --topic, --num-records, --producer-acks, --record-size, --command-config"
+    );
 }
 
 fn rewrite_legacy_config_entities(args: &mut Vec<OsString>) {
@@ -300,6 +340,8 @@ pub enum Command {
     Produce(ProduceArgs),
     /// Measure Kafka producer throughput and delivery latency.
     ProducerPerfTest(ProducerPerfTestArgs),
+    /// Measure synchronous record round-trip latency through Kafka.
+    E2eLatency(E2eLatencyArgs),
     /// Consume records to stdout.
     Consume(ConsumeArgs),
     /// Measure classic Kafka consumer throughput.
@@ -866,6 +908,26 @@ impl ProducerPerfTestArgs {
             &self.properties
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct E2eLatencyArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
+    pub num_records: i32,
+    #[arg(long = "producer-acks", value_parser = ["1", "all"])]
+    pub producer_acks: String,
+    #[arg(long, value_parser = clap::value_parser!(i32).range(0..))]
+    pub record_size: i32,
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]
+    pub record_key_size: i32,
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]
+    pub record_header_key_size: i32,
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", default_value_t = 0, allow_negative_numbers = true, value_parser = clap::value_parser!(i32).range(-1..))]
+    pub record_header_size: i32,
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]
+    pub num_headers: i32,
 }
 
 #[derive(Debug, Args)]
@@ -2266,6 +2328,77 @@ mod tests {
             "--payload-monotonic",
         ]);
         assert!(conflicting.is_err());
+    }
+
+    #[test]
+    fn e2e_latency_should_parse_key_and_header_sizes() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "e2e-latency",
+            "--topic",
+            "events",
+            "--num-records",
+            "10",
+            "--producer-acks",
+            "all",
+            "--record-size",
+            "100",
+            "--record-key-size",
+            "8",
+            "--num-headers",
+            "2",
+            "--record-header-key-size",
+            "4",
+            "--record-header-size",
+            "-1",
+        ])
+        .expect("Kafka end-to-end latency options");
+        let Command::E2eLatency(args) = cli.command else {
+            panic!("expected e2e-latency command");
+        };
+
+        assert_eq!(args.record_key_size, 8);
+        assert_eq!(args.num_headers, 2);
+        assert_eq!(args.record_header_key_size, 4);
+        assert_eq!(args.record_header_size, -1);
+    }
+
+    #[test]
+    fn e2e_latency_legacy_rewrite_should_convert_five_positionals() {
+        let mut arguments = [
+            "kafka-e2e-latency.sh",
+            "e2e-latency",
+            "localhost:9092",
+            "events",
+            "10",
+            "1",
+            "100",
+        ]
+        .map(OsString::from)
+        .to_vec();
+
+        rewrite_e2e_latency_legacy_args(&mut arguments);
+
+        assert_eq!(
+            arguments,
+            [
+                "kafka-e2e-latency.sh",
+                "e2e-latency",
+                "--bootstrap-server",
+                "localhost:9092",
+                "--topic",
+                "events",
+                "--num-records",
+                "10",
+                "--producer-acks",
+                "1",
+                "--record-size",
+                "100",
+            ]
+            .map(OsString::from)
+        );
     }
 
     #[test]

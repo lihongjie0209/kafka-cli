@@ -324,6 +324,35 @@ fn kafka_producer_perf_alias_should_accept_original_options() {
 
 #[cfg(unix)]
 #[test]
+fn kafka_e2e_latency_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-e2e-latency.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create end-to-end latency alias");
+
+    Command::new(alias)
+        .args([
+            "--bootstrap-server",
+            "localhost:9092",
+            "--topic",
+            "events",
+            "--num-records",
+            "10",
+            "--producer-acks",
+            "all",
+            "--record-size",
+            "100",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--record-key-size"))
+        .stdout(predicate::str::contains("--record-header-size"));
+}
+
+#[cfg(unix)]
+#[test]
 fn kafka_share_consumer_perf_alias_should_accept_original_options() {
     let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
     let binary = std::path::PathBuf::from(binary_command.get_program());
