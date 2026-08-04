@@ -63,7 +63,8 @@ use crate::{
         ProducerPerfTestArgs, ReassignAction, ResetOffsetsArgs, ShareConsumeArgs,
         ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
         StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
-        TransactionAction, VerifiableAcknowledgementMode, VerifiableShareConsumerArgs,
+        TransactionAction, VerifiableAcknowledgementMode, VerifiableProducerArgs,
+        VerifiableShareConsumerArgs,
     },
     config,
     error::{Error, Result},
@@ -170,6 +171,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
             .await
         }
         Command::E2eLatency(args) => e2e_latency(bootstrap, command_config.as_deref(), args).await,
+        Command::VerifiableProducer(args) => {
+            verifiable_producer(bootstrap, command_config.as_deref(), args).await
+        }
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::ConsumerPerfTest(args) => {
             consumer_perf_test(bootstrap, command_config.as_deref(), args).await
@@ -1337,6 +1341,221 @@ async fn e2e_latency(
     );
     consumer.commit_consumer_state(CommitMode::Sync)?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct VerifiableLifecycleEvent {
+    timestamp: i64,
+    name: &'static str,
+}
+
+#[derive(Serialize)]
+struct VerifiableSendSuccess {
+    timestamp: i64,
+    name: &'static str,
+    key: Option<String>,
+    value: String,
+    topic: String,
+    partition: i32,
+    offset: i64,
+}
+
+#[derive(Serialize)]
+struct VerifiableSendError {
+    timestamp: i64,
+    name: &'static str,
+    key: Option<String>,
+    value: String,
+    topic: String,
+    exception: &'static str,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct VerifiableToolData {
+    timestamp: i64,
+    name: &'static str,
+    sent: u64,
+    acked: u64,
+    target_throughput: i32,
+    avg_throughput: f64,
+}
+
+fn verifiable_value(prefix: Option<i32>, index: u64) -> String {
+    prefix.map_or_else(|| index.to_string(), |prefix| format!("{prefix}.{index}"))
+}
+
+fn verifiable_key(repeating_keys: Option<i32>, counter: &mut i32) -> Option<String> {
+    let limit = repeating_keys?;
+    let key = counter.to_string();
+    *counter = counter.saturating_add(1);
+    if *counter == limit {
+        *counter = 0;
+    }
+    Some(key)
+}
+
+fn verifiable_config(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    deprecated_config: Option<&Path>,
+    acks: i32,
+) -> Result<rdkafka::ClientConfig> {
+    let config_path = share_perf_config_path(command_config, deprecated_config)?;
+    let mut client = config::client_config(bootstrap, None)?;
+    client
+        .set("acks", acks.to_string())
+        .set("message.send.max.retries", "0");
+    if let Some(path) = config_path {
+        for (key, value) in config::load_properties(path)? {
+            client.set(config::normalize_key(&key), value);
+        }
+    }
+    Ok(client)
+}
+
+async fn print_verifiable_delivery(
+    producer: FutureProducer,
+    topic: String,
+    key: Option<String>,
+    value: String,
+    timestamp: Option<i64>,
+) -> Result<bool> {
+    let mut record = FutureRecord::to(&topic).payload(&value);
+    if let Some(key) = key.as_deref() {
+        record = record.key(key);
+    }
+    if let Some(timestamp) = timestamp {
+        record = record.timestamp(timestamp);
+    }
+    match producer.send(record, Duration::MAX).await {
+        Ok(delivery) => {
+            output::write_json_line(&VerifiableSendSuccess {
+                timestamp: Utc::now().timestamp_millis(),
+                name: "producer_send_success",
+                key,
+                value,
+                topic,
+                partition: delivery.partition,
+                offset: delivery.offset,
+            })?;
+            Ok(true)
+        }
+        Err((error, _)) => {
+            output::write_json_line(&VerifiableSendError {
+                timestamp: Utc::now().timestamp_millis(),
+                name: "producer_send_error",
+                key,
+                value,
+                topic,
+                exception: "rdkafka::KafkaError",
+                message: error.to_string(),
+            })?;
+            Ok(false)
+        }
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Kafka's tool_data event defines average throughput as a floating-point field"
+)]
+async fn verifiable_producer(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    args: VerifiableProducerArgs,
+) -> Result<()> {
+    if args.producer_config.is_some() {
+        println!(
+            "Option --producer.config has been deprecated and will be removed in a future version. Use --command-config instead."
+        );
+    }
+    let config = verifiable_config(
+        bootstrap,
+        command_config,
+        args.producer_config.as_deref(),
+        args.acks,
+    )?;
+    let producer: FutureProducer = config.create()?;
+    let started = Instant::now();
+    let started_ms = Utc::now().timestamp_millis();
+    output::write_json_line(&VerifiableLifecycleEvent {
+        timestamp: started_ms,
+        name: "startup_complete",
+    })?;
+
+    let max_messages = if args.max_messages < 0 {
+        u64::MAX
+    } else {
+        u64::try_from(args.max_messages).unwrap_or_default()
+    };
+    let mut key_counter = 0_i32;
+    let mut create_time = (args.message_create_time != -1).then_some(args.message_create_time);
+    let mut deliveries = tokio::task::JoinSet::new();
+    let mut signal = Box::pin(tokio::signal::ctrl_c());
+    let mut sent = 0_u64;
+    let mut acked = 0_u64;
+    for index in 0..max_messages {
+        while let Some(delivery) = deliveries.try_join_next() {
+            if delivery.map_err(|error| {
+                Error::Config(format!("verifiable producer task failed: {error}"))
+            })?? {
+                acked = acked.saturating_add(1);
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = &mut signal => break,
+            () = tokio::task::yield_now() => {}
+        }
+        let key = verifiable_key(args.repeating_keys, &mut key_counter);
+        let value = verifiable_value(args.value_prefix, index);
+        let producer = producer.clone();
+        let topic = args.topic.clone();
+        let record_timestamp = create_time;
+        deliveries.spawn(async move {
+            print_verifiable_delivery(producer, topic, key, value, record_timestamp).await
+        });
+        sent = sent.saturating_add(1);
+        if let Some(timestamp) = create_time.as_mut() {
+            *timestamp =
+                timestamp.saturating_add(Utc::now().timestamp_millis().saturating_sub(started_ms));
+        }
+        if args.throughput == 0 && index > 0 {
+            let _ = (&mut signal).await;
+            break;
+        }
+        if args.throughput > 0 {
+            let expected = Duration::from_secs_f64(index as f64 / f64::from(args.throughput));
+            if let Some(remaining) = expected.checked_sub(started.elapsed()) {
+                tokio::select! {
+                    _ = &mut signal => break,
+                    () = tokio::time::sleep(remaining) => {}
+                }
+            }
+        }
+    }
+
+    while let Some(delivery) = deliveries.join_next().await {
+        if delivery
+            .map_err(|error| Error::Config(format!("verifiable producer task failed: {error}")))??
+        {
+            acked = acked.saturating_add(1);
+        }
+    }
+    output::write_json_line(&VerifiableLifecycleEvent {
+        timestamp: Utc::now().timestamp_millis(),
+        name: "shutdown_complete",
+    })?;
+    let elapsed_ms = millis_at_least_one(started.elapsed());
+    output::write_json_line(&VerifiableToolData {
+        timestamp: Utc::now().timestamp_millis(),
+        name: "tool_data",
+        sent,
+        acked,
+        target_throughput: args.throughput,
+        avg_throughput: 1_000.0 * acked as f64 / elapsed_ms as f64,
+    })
 }
 
 #[derive(Debug)]
@@ -17587,6 +17806,61 @@ mod tests {
         let values = [1, 2, 3, 4];
 
         assert_eq!(e2e_percentile(&values, 1, 2), 3);
+    }
+
+    #[test]
+    fn verifiable_producer_values_and_keys_should_match_kafka_sequences() {
+        assert_eq!(verifiable_value(None, 2), "2");
+        assert_eq!(verifiable_value(Some(7), 2), "7.2");
+        let mut counter = 0;
+        let keys = (0..5)
+            .map(|_| verifiable_key(Some(3), &mut counter).expect("generated key"))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["0", "1", "2", "0", "1"]);
+        assert_eq!(verifiable_key(None, &mut counter), None);
+    }
+
+    #[test]
+    fn verifiable_producer_config_file_should_override_cli_defaults_like_kafka() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary properties file");
+        write!(
+            file,
+            "bootstrap.servers=file-broker:9092\nacks=0\nretries=9\n"
+        )
+        .expect("write properties");
+
+        let config = verifiable_config("cli-broker:9092", None, Some(file.path()), -1)
+            .expect("verifiable producer configuration");
+        assert_eq!(config.get("bootstrap.servers"), Some("file-broker:9092"));
+        assert_eq!(config.get("acks"), Some("0"));
+        assert_eq!(config.get("message.send.max.retries"), Some("0"));
+        assert_eq!(config.get("retries"), Some("9"));
+    }
+
+    #[test]
+    fn verifiable_producer_success_event_should_use_kafka_json_contract() {
+        let event = serde_json::to_value(VerifiableSendSuccess {
+            timestamp: 1,
+            name: "producer_send_success",
+            key: Some("0".into()),
+            value: "7.0".into(),
+            topic: "events".into(),
+            partition: 2,
+            offset: 3,
+        })
+        .expect("serialize event");
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "timestamp": 1,
+                "name": "producer_send_success",
+                "key": "0",
+                "value": "7.0",
+                "topic": "events",
+                "partition": 2,
+                "offset": 3
+            })
+        );
     }
 
     #[test]

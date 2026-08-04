@@ -705,6 +705,36 @@ fn all_command_families_work_against_kafka_4_3_1() {
         ))
         .stdout(predicate::str::contains("Avg latency:"))
         .stdout(predicate::str::contains("Percentiles: 50th"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "verifiable-producer",
+            "--topic",
+            "integration-events",
+            "--max-messages",
+            "3",
+            "--throughput",
+            "-1",
+            "--acks",
+            "-1",
+            "--message-create-time",
+            "1700000000000",
+            "--value-prefix",
+            "44",
+            "--repeating-keys",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"startup_complete\""))
+        .stdout(predicate::str::contains("\"key\":\"0\""))
+        .stdout(predicate::str::contains("\"key\":\"1\""))
+        .stdout(predicate::str::contains("\"value\":\"44.2\""))
+        .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""))
+        .stdout(predicate::str::contains("\"sent\":3"))
+        .stdout(predicate::str::contains("\"acked\":3"));
     let consumer_performance = Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

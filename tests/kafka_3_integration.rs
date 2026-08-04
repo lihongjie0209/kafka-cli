@@ -214,6 +214,31 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "verifiable-producer",
+            "--topic",
+            "kafka-36-events",
+            "--max-messages",
+            "2",
+            "--throughput",
+            "-1",
+            "--value-prefix",
+            "36",
+            "--repeating-keys",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"startup_complete\""))
+        .stdout(predicate::str::contains("\"value\":\"36.0\""))
+        .stdout(predicate::str::contains("\"value\":\"36.1\""))
+        .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""))
+        .stdout(predicate::str::contains("\"sent\":2"))
+        .stdout(predicate::str::contains("\"acked\":2"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "consumer-perf-test",
             "--topic",
             "kafka-36-events",

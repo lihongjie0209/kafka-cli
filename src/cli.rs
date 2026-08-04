@@ -76,6 +76,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-console-producer" => Some("produce"),
         "kafka-producer-perf-test" => Some("producer-perf-test"),
         "kafka-e2e-latency" => Some("e2e-latency"),
+        "kafka-verifiable-producer" => Some("verifiable-producer"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-consumer-perf-test" => Some("consumer-perf-test"),
         "kafka-console-share-consumer" => Some("share-consume"),
@@ -342,6 +343,8 @@ pub enum Command {
     ProducerPerfTest(ProducerPerfTestArgs),
     /// Measure synchronous record round-trip latency through Kafka.
     E2eLatency(E2eLatencyArgs),
+    /// Produce deterministic records and emit Kafka system-test JSON events.
+    VerifiableProducer(VerifiableProducerArgs),
     /// Consume records to stdout.
     Consume(ConsumeArgs),
     /// Measure classic Kafka consumer throughput.
@@ -928,6 +931,27 @@ pub struct E2eLatencyArgs {
     pub record_header_size: i32,
     #[arg(long, num_args = 0..=1, default_missing_value = "0", default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]
     pub num_headers: i32,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifiableProducerArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    pub max_messages: i32,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    pub throughput: i32,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true, value_parser = clap::value_parser!(i32).range(-1..=1))]
+    pub acks: i32,
+    /// Deprecated alias for the global --command-config.
+    #[arg(long = "producer.config")]
+    pub producer_config: Option<PathBuf>,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    pub message_create_time: i64,
+    #[arg(long)]
+    pub value_prefix: Option<i32>,
+    #[arg(long)]
+    pub repeating_keys: Option<i32>,
 }
 
 #[derive(Debug, Args)]
@@ -2363,6 +2387,39 @@ mod tests {
         assert_eq!(args.num_headers, 2);
         assert_eq!(args.record_header_key_size, 4);
         assert_eq!(args.record_header_size, -1);
+    }
+
+    #[test]
+    fn verifiable_producer_should_parse_original_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "verifiable-producer",
+            "--topic",
+            "events",
+            "--max-messages",
+            "12",
+            "--throughput",
+            "4",
+            "--acks",
+            "1",
+            "--message-create-time",
+            "1700000000000",
+            "--value-prefix",
+            "7",
+            "--repeating-keys",
+            "3",
+        ])
+        .expect("Kafka verifiable producer options");
+        let Command::VerifiableProducer(args) = cli.command else {
+            panic!("expected verifiable-producer command");
+        };
+
+        assert_eq!(args.topic, "events");
+        assert_eq!((args.max_messages, args.throughput, args.acks), (12, 4, 1));
+        assert_eq!(args.message_create_time, 1_700_000_000_000);
+        assert_eq!((args.value_prefix, args.repeating_keys), (Some(7), Some(3)));
     }
 
     #[test]

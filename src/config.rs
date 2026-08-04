@@ -123,7 +123,7 @@ pub(crate) fn protocol_auth(values: &HashMap<String, String>) -> Result<Option<A
     Ok(auth)
 }
 
-fn normalize_key(key: &str) -> &str {
+pub(crate) fn normalize_key(key: &str) -> &str {
     match key {
         "ssl.truststore.location" => "ssl.ca.location",
         "ssl.keystore.location" => "ssl.certificate.location",

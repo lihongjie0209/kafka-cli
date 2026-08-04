@@ -40,7 +40,7 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `producer-perf-test`, `e2e-latency`, `consume`, `consumer-perf-test`, `share-consume`,
+The binary exposes `topics`, `produce`, `producer-perf-test`, `e2e-latency`, `verifiable-producer`, `consume`, `consumer-perf-test`, `share-consume`,
 `share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
@@ -95,6 +95,12 @@ validates its key, value, ordered headers and null header values, and prints the
 original average and percentile latency summary. It auto-creates a missing
 single-partition topic and accepts both Kafka 4.2 named arguments and the
 deprecated five/six positional argument form through `kafka-e2e-latency.sh`.
+`verifiable-producer` emits Kafka system-test compatible JSON Lines for
+startup, asynchronous delivery success or failure, shutdown, and final tool
+statistics. It preserves finite or unbounded production, throughput limiting,
+acknowledgement selection, repeating keys, value prefixes, record create-time
+progression, and the deprecated producer properties file through
+`kafka-verifiable-producer.sh`.
 
 ## Authentication
 
