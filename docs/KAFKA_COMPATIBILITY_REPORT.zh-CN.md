@@ -7,12 +7,12 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `43c185c`。
-- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 24 个兼容名称，入口覆盖率为 24/44（54.5%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
-- 按本报告的功能口径，24 个兼容入口中 12 个达到核心功能“已支持”，12 个为“部分支持”；另有 20 个原版入口未支持。因此不能把 54.5% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
+- 本项目审计实现基准：`master`，提交 `13e7d7d`。
+- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 25 个兼容名称，入口覆盖率为 25/44（56.8%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 按本报告的功能口径，25 个兼容入口中 12 个达到核心功能“已支持”，13 个为“部分支持”；另有 19 个原版入口未支持。因此不能把 56.8% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
-- Connect、Share Consumer 性能工具、metadata shell、storage、其他性能测试与验证工具等原版工具尚未实现；Console/Verifiable Share Consumer、Share/Streams Group 管理、Streams Application Reset、Metadata Quorum 和 Delegation Tokens 已新增，但后两者的专用多 controller/SASL 集成矩阵仍待补充。
+- Connect、metadata shell、storage、普通 Consumer/Producer 性能与其他验证工具等原版工具尚未实现；Console/Verifiable/Performance Share Consumer、Share/Streams Group 管理、Streams Application Reset、Metadata Quorum 和 Delegation Tokens 已新增，但后两者的专用多 controller/SASL 集成矩阵仍待补充。
 - 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API。ACL create/describe/delete 已迁移到 librdkafka；少数其他管理路径仍使用 `krafka`，尚未完全统一。
 
 ## 2. 状态定义
@@ -38,15 +38,15 @@
 
 | 维度 | 结果 | 解读 |
 |---|---:|---|
-| Kafka `.sh` 入口 | 24 / 44（54.5%） | 20 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
-| 入口功能评级 | 12 已支持 / 12 部分支持 / 20 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
-| 已覆盖入口的一级动作 | 68 / 68 | 仅表示这 24 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
+| Kafka `.sh` 入口 | 25 / 44（56.8%） | 19 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
+| 入口功能评级 | 12 已支持 / 13 部分支持 / 19 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
+| 已覆盖入口的一级动作 | 69 / 69 | 仅表示这 25 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 240 个通过 | 222 个 library unit tests + 18 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 244 个通过 | 225 个 library unit tests + 19 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 交叉编译后经 QEMU 启动验证 |
 
-原版动作数 68 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 11 个入口各 1。Console producer/consumer/share-consumer、Verifiable Share Consumer、通用 Groups list 与 Streams Application Reset 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
+原版动作数 69 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 12 个入口各 1。Console producer/consumer/share-consumer、Share Consumer Performance、Verifiable Share Consumer、通用 Groups list 与 Streams Application Reset 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
 
 ## 3. 顶层脚本覆盖
 
@@ -58,6 +58,7 @@
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 行输入、sync/async、key、JSON、headers、partition、reader config 及主要 producer 调优参数；未复刻可插拔 reader class |
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config 和 StringDeserializer；未复刻任意 Java formatter/deserializer class 加载 |
 | `kafka-console-share-consumer.sh` | `kafka share-consume` | 部分支持 | KIP-932 ShareFetch/ShareAcknowledge、accept/release/reject、超时、formatter、delivery count 与配置优先级；未复刻任意 Java formatter/deserializer class 和全部 Java consumer property |
+| `kafka-share-consumer-perf-test.sh` | `kafka share-consumer-perf-test` | 部分支持 | 多 Share Consumer、记录/字节吞吐、超时、周期/逐 consumer/汇总 CSV 和 native metrics；fetch/socket 旋钮与 Java metrics 集合未完全等价 |
 | `kafka-verifiable-share-consumer.sh` | `kafka verifiable-share-consumer` | 部分支持 | JSON Lines systest 事件、verbose record、max-messages、offset reset、sync/async/auto 及循环 accept/release/reject/renew pattern；async completion 当前由同步提交实现 |
 | `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
 | `kafka-groups.sh` | `kafka all-groups` | 已支持 | list；group-type、protocol、consumer、share、streams 过滤，覆盖全部 Kafka group 类型 |
@@ -86,7 +87,6 @@
 | 类别 | 未支持脚本 |
 |---|---|
 | Kafka Connect | `connect-distributed.sh`、`connect-internal-topics.sh`、`connect-mirror-maker.sh`、`connect-plugin-path.sh`、`connect-standalone.sh` |
-| 新消费组模型 | `kafka-share-consumer-perf-test.sh` |
 | 集群与元数据高级工具 | `kafka-metadata-shell.sh`、`kafka-storage.sh` |
 | 性能、校验与诊断 | `kafka-consumer-perf-test.sh`、`kafka-producer-perf-test.sh`、`kafka-e2e-latency.sh`、`kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-verifiable-producer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
 | 服务进程与基础启动器 | `kafka-run-class.sh`、`kafka-server-start.sh`、`kafka-server-stop.sh`、`kafka-jmx.sh` |
@@ -317,6 +317,14 @@ ack pattern 按 record offset 循环选择 `accept`、`release`、`reject`、`re
 
 该入口评级为部分支持：`krafka 0.14` 目前只公开同步 acknowledgement completion，因此 CLI 接受原版 async 模式并保持事件契约，但底层完成等待仍同步执行；auto 模式在退出前也会同步完成当前批次，以避免 max-messages 到达时丢失 acknowledgement。原版 Java client 的全部 consumer property 仍未全部映射。Kafka 4.3.1 CI 会创建真实 Share Group、设置 earliest、消费预置消息，并断言 verbose data、partition summary、ACCEPT 计数及完整 shutdown 事件链。
 
+### 4.25 Share Consumer Performance
+
+已对齐 Kafka 4.4 `ShareConsumerPerformance` 的主要执行与输出契约：必需 topic 和 `--num-records`，兼容废弃的 `--messages`；默认 group/client ID；`--threads` 创建多个 Share Consumer 并为 client ID 追加序号；按 key+value 原始字节累计吞吐；`--timeout` 按每个 consumer 最后一次收到记录的时间退出；支持 reporting interval、detailed stats、per-consumer stats、hide header、command properties/config、废弃 consumer.config 和 print metrics。停止后先取得 metrics snapshot、同步提交 acknowledgement，再输出 group 汇总并关闭所有 consumer，与 Java 工具的生命周期顺序一致。
+
+默认输出保留原版性能服务依赖的七列 CSV：start/end time、总 MB、MB/s、records/s、总 records 和 fetch time；周期输出追加 `for share consumer N`，逐 consumer 汇总保留原版文本前缀。该输出是性能测试机读协议，不属于管理结果表，因此没有改成 `comfy-table`。日期格式原生覆盖默认 `yyyy-MM-dd HH:mm:ss:SSS` 及相同 token 集合；Java `SimpleDateFormat` 的全部 quoting/locale/timezone 语法不宣称等价。
+
+该入口评级为部分支持：`krafka 0.14` 的公开 Share Consumer builder 尚未暴露 `fetch.max.bytes` 和 socket receive buffer，因此 `--fetch-size`/`--socket-buffer-size` 当前完成输入校验但不能下推到 transport；`--print-metrics` 输出连接创建/关闭/错误、活跃连接和请求数，而不是 Java client 的完整 `MetricName` 集合。Kafka 4.3.1 CI 使用两个 Share Consumer 共同消费四条真实消息，断言总记录数精确为 4、逐 consumer 输出、连接 metrics、commit/close 和最终 CSV 汇总。
+
 ## 5. 全局行为差异
 
 | 项目 | Apache Kafka 原版 | kafka-cli |
@@ -338,7 +346,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现。
 2. `rdkafka-sys`：只包装 `rdkafka` 尚未暴露的 librdkafka Admin API，例如 leader election、部分 group offset/config API。
-3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、全类型 Groups 列表、Share Group Admin API、Console/Verifiable Share Consumer 数据面、StreamsGroupDescribe API 89、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
+3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、全类型 Groups 列表、Share Group Admin API、Console/Verifiable/Performance Share Consumer 数据面、StreamsGroupDescribe API 89、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
 
 认证审计发现，`krafka 0.14.0` 的内部 transport 具备 SCRAM-over-TLS，但公开 `AuthConfig` API 不能从 Kafka properties 构造“SCRAM + 自定义 TLS 配置”；本项目因此不会通过访问私有字段伪装支持。当前独立协议路径明确支持 PLAINTEXT、SSL、SASL_PLAINTEXT 的 PLAIN/SCRAM 和 SASL_SSL 的 PLAIN；SASL_SSL + SCRAM 仍是已知缺口。librdkafka 路径不受此限制。
 
@@ -350,8 +358,8 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：240 个通过（222 个 library unit tests + 18 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 24 个命令族，包括 Console Share Consumer 实时 ShareFetch/ShareAcknowledge、Verifiable Share Consumer JSON 事件与循环 acknowledgement、Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、Streams Application Reset 内部 topic 删除及 force LeaveGroup、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
+- Rust 单元测试与普通 CLI 测试：244 个通过（225 个 library unit tests + 19 个 CLI tests）。
+- Kafka 4.3.1 Docker 集成测试：通过，覆盖全部 25 个命令族，包括 Console Share Consumer 实时 ShareFetch/ShareAcknowledge、Verifiable Share Consumer JSON 事件与循环 acknowledgement、双线程 Share Consumer Performance、Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、Streams Application Reset 内部 topic 删除及 force LeaveGroup、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -393,6 +401,8 @@ Console Share Consumer 实现 `d455ee6`、空闲 timeout 修正 `fff9310` 及集
 
 Verifiable Share Consumer 实现 `43c185c` 由 GitHub Actions [`30863964909`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30863964909) 完整验证通过：240 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际验证 offset reset、verbose record、records consumed、ACCEPT acknowledgement 计数和 shutdown 完整事件链；两种 musl 均只在 CI 构建，x86_64 原生、aarch64 经 QEMU 实际启动并上传 artifact。
 
+Share Consumer Performance 实现 `13e7d7d` 由 GitHub Actions [`30865007900`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30865007900) 完整验证通过：244 个普通测试、bundled glibc、Kafka 3.6.2、Kafka 4.3.1、x86_64 musl 和 aarch64 musl 六个 job 全绿。Kafka 4.3.1 实际创建两个 Share Consumer 共享两分区负载，验证四条消息的精确总数、逐 consumer 统计、连接 metrics、最终 CSV 与 acknowledgement/close；musl 仍只在 CI 构建和启动验证。
+
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
 ## 9. 建议的后续优先级
@@ -412,13 +422,13 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 ### P2：扩大原版工具覆盖面
 
-Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。Console/Verifiable Share Consumer、Share Group、Streams Group 管理与 Streams Application Reset 入口均已完成；后续客户端入口优先考虑 `kafka-share-consumer-perf-test.sh`。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
+Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。Console/Verifiable/Performance Share Consumer、Share Group、Streams Group 管理与 Streams Application Reset 入口均已完成；后续客户端入口优先考虑普通 `kafka-consumer-perf-test.sh` 与 `kafka-producer-perf-test.sh`。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
 
 ## 10. 最终评估
 
 当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、Transactions、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
 
-在对外发布时，建议使用“兼容 24 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 12 个已支持、12 个部分支持和 20 个未支持入口；不应使用“100% 兼容 Apache Kafka CLI”。
+在对外发布时，建议使用“兼容 25 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 12 个已支持、13 个部分支持和 19 个未支持入口；不应使用“100% 兼容 Apache Kafka CLI”。
 
 ### 10.1 二次代码审计发现的待修正项
 
@@ -438,6 +448,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | console-producer | 单动作 | 中 | 中 | 可做常规生产，不替代 Java reader 插件体系 |
 | console-consumer | 单动作 | 中 | 中/高 | group、commit、offset 与配置优先级已对齐；不替代 formatter/deserializer 插件体系 |
 | console-share-consumer | 单动作 | 中/高 | 中/高 | KIP-932 消费、三类 acknowledgement、formatter 与 timeout 已实测；不替代 Java 插件体系，部分 Java consumer property 尚未映射 |
+| share-consumer-perf-test | 单动作 | 高 | 中/高 | 多 consumer、超时和 CSV/metrics 统计已实测；fetch/socket 旋钮、Java 全量 metrics 与完整 SimpleDateFormat 仍有边界 |
 | verifiable-share-consumer | 单动作 | 高 | 中/高 | JSON 事件、offset reset、verbose、pattern 与 acknowledgement 已实测；async 当前同步等待完成，部分 Java consumer property 尚未映射 |
 | consumer-groups | 完整 | 高 | 高/中 | reset、Kafka 4.4 state filter 及 verbose consumer protocol epoch 列已对齐；协议 fallback 鉴权矩阵仍需扩充 |
 | groups | 单动作 | 高 | 高/中 | 全类型 list 与五类过滤语义完整；结构化输出格式不同，协议 fallback 鉴权矩阵仍需扩充 |
@@ -540,6 +551,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | 2026-08-04 | Streams Application Reset 入口 | 新增 `kafka streams-application-reset` 和兼容脚本；实现全部 reset 策略、offset 边界调整、active member/force LeaveGroup、内部 topic 精确推断与删除 | 215 个单元测试、16 个 CLI 测试；CI `30861552986` 六个 job 全绿，Kafka 3.6.2/4.3.1 实际请求及双 musl smoke test 通过 |
 | 2026-08-04 | Console Share Consumer 入口 | 新增 `kafka share-consume` 和 `kafka-console-share-consumer.sh`；基于 KIP-932 实现 ShareFetch、显式 ACCEPT/RELEASE/REJECT、累计空闲 timeout、共享 formatter 与 delivery count | 219 个单元测试、17 个 CLI 测试；CI `30863139169` 六个 job 全绿，Kafka 4.3.1 实时消息与 ShareAcknowledge 闭环通过 |
 | 2026-08-04 | Verifiable Share Consumer 入口 | 新增 `kafka verifiable-share-consumer` 和 `kafka-verifiable-share-consumer.sh`；对齐 JSON Lines systest 事件、verbose record、offset reset、三种模式与循环 accept/release/reject/renew pattern | 222 个单元测试、18 个 CLI 测试；CI `30863964909` 六个 job 全绿，Kafka 4.3.1 实际事件与 acknowledgement 闭环及双 musl smoke test 通过 |
+| 2026-08-04 | Share Consumer Performance 入口 | 新增 `kafka share-consumer-perf-test` 和兼容脚本；实现多 consumer 并发、record/byte 计数、idle timeout、周期/逐 consumer/七列 CSV 汇总和 native connection metrics | 225 个单元测试、19 个 CLI 测试；CI `30865007900` 六个 job 全绿，Kafka 4.3.1 双 consumer 精确消费四条消息及双 musl smoke test 通过 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
