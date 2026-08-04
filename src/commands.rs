@@ -2,12 +2,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    fs,
     io::{self, Write},
     net::ToSocketAddrs,
     path::Path,
     process,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -40,11 +41,14 @@ use rdkafka::{
         AdminClient, AdminOptions, ConfigSource, NewPartitions, NewTopic, OwnedResourceSpecifier,
         ResourceSpecifier, TopicReplication,
     },
-    client::DefaultClientContext,
+    client::{ClientContext, DefaultClientContext},
     consumer::{BaseConsumer, Consumer, StreamConsumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::{BorrowedHeaders, Header, Headers, OwnedHeaders, ToBytes},
-    producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer},
+    producer::{
+        BaseProducer, BaseRecord, DeliveryFuture, DeliveryResult, FutureProducer, FutureRecord,
+        Producer, ProducerContext,
+    },
     topic_partition_list::TopicPartitionList,
 };
 use regex::Regex;
@@ -55,8 +59,9 @@ use crate::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
         ConfigAction, ConfigEntityArgs, ConfigEntityType, ConsumerPerfTestArgs,
         DelegationTokenAction, DescribeTopicArgs, ElectionType, FeatureAction, GroupAction,
-        ListTopicArgs, MetadataQuorumAction, OffsetTime, ReassignAction, ResetOffsetsArgs,
-        ShareConsumeArgs, ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
+        ListTopicArgs, MetadataQuorumAction, OffsetTime, ProducerKeyDistribution,
+        ProducerPerfTestArgs, ReassignAction, ResetOffsetsArgs, ShareConsumeArgs,
+        ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
         StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
         TransactionAction, VerifiableAcknowledgementMode, VerifiableShareConsumerArgs,
     },
@@ -130,10 +135,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
         ));
     }
     let is_streams_application_reset = matches!(&cli.command, Command::StreamsApplicationReset(_));
+    let allows_property_bootstrap = matches!(&cli.command, Command::ProducerPerfTest(_));
     let bootstrap = cli
         .bootstrap_server
         .as_deref()
         .or_else(|| is_streams_application_reset.then_some("localhost:9092"))
+        .or_else(|| allows_property_bootstrap.then_some(""))
         .ok_or_else(|| {
             Error::Usage(
                 "--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into(),
@@ -154,6 +161,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Topics(args) => topics(&client_config, timeout, format, args.action).await,
         Command::Produce(args) => produce(client_config, args).await,
+        Command::ProducerPerfTest(args) => {
+            producer_perf_test(
+                (!bootstrap.is_empty()).then_some(bootstrap),
+                command_config.as_deref(),
+                args,
+            )
+            .await
+        }
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::ConsumerPerfTest(args) => {
             consumer_perf_test(bootstrap, command_config.as_deref(), args).await
@@ -1058,6 +1073,583 @@ async fn produce(mut config: rdkafka::ClientConfig, args: crate::cli::ProduceArg
             .map_err(|(error, _)| Error::Kafka(error))?;
     }
     Ok(())
+}
+
+async fn producer_perf_test(
+    bootstrap: Option<&str>,
+    command_config: Option<&Path>,
+    args: ProducerPerfTestArgs,
+) -> Result<()> {
+    let bootstrap = bootstrap.map(str::to_owned);
+    let command_config = command_config.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        run_producer_perf_test(bootstrap.as_deref(), command_config.as_deref(), &args)
+    })
+    .await
+    .map_err(|error| Error::Config(format!("producer performance task failed: {error}")))?
+}
+
+#[derive(Debug)]
+struct ProducerPerfOpaque {
+    started: Instant,
+    bytes: usize,
+    steady_state: bool,
+}
+
+#[derive(Debug)]
+struct ProducerPerfStats {
+    started: Instant,
+    window_started: Instant,
+    reporting_interval: Duration,
+    sampling: u64,
+    latencies: Vec<u64>,
+    count: u64,
+    bytes: u64,
+    total_latency_ms: u64,
+    max_latency_ms: u64,
+    window_count: u64,
+    window_bytes: u64,
+    window_total_latency_ms: u64,
+    window_max_latency_ms: u64,
+    suppress_printing: bool,
+    steady_state: bool,
+}
+
+impl ProducerPerfStats {
+    fn new(num_records: u64, reporting_interval: Duration, steady_state: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            window_started: now,
+            reporting_interval,
+            sampling: num_records / num_records.min(500_000),
+            latencies: Vec::with_capacity(
+                usize::try_from(num_records.min(500_000)).unwrap_or(500_000),
+            ),
+            count: 0,
+            bytes: 0,
+            total_latency_ms: 0,
+            max_latency_ms: 0,
+            window_count: 0,
+            window_bytes: 0,
+            window_total_latency_ms: 0,
+            window_max_latency_ms: 0,
+            suppress_printing: false,
+            steady_state,
+        }
+    }
+
+    fn record(&mut self, latency_ms: u64, bytes: usize, now: Instant) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if self.count.is_multiple_of(self.sampling) {
+            self.latencies.push(latency_ms);
+        }
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.total_latency_ms = self.total_latency_ms.saturating_add(latency_ms);
+        self.max_latency_ms = self.max_latency_ms.max(latency_ms);
+        self.window_count = self.window_count.saturating_add(1);
+        self.window_bytes = self.window_bytes.saturating_add(bytes);
+        self.window_total_latency_ms = self.window_total_latency_ms.saturating_add(latency_ms);
+        self.window_max_latency_ms = self.window_max_latency_ms.max(latency_ms);
+        if now.duration_since(self.window_started) >= self.reporting_interval {
+            if self.steady_state && self.count == self.window_count {
+                println!("In steady state.");
+            }
+            if !self.suppress_printing {
+                self.print_window(now);
+            }
+            self.window_started = now;
+            self.window_count = 0;
+            self.window_bytes = 0;
+            self.window_total_latency_ms = 0;
+            self.window_max_latency_ms = 0;
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Kafka's rate and latency output contract uses floating-point values"
+    )]
+    fn print_window(&self, now: Instant) {
+        let elapsed_ms = millis_at_least_one(now.duration_since(self.window_started));
+        let records_per_second = 1_000.0 * self.window_count as f64 / elapsed_ms as f64;
+        let mb_per_second =
+            1_000.0 * self.window_bytes as f64 / elapsed_ms as f64 / (1024.0 * 1024.0);
+        let average_latency = self.window_total_latency_ms as f64 / self.window_count as f64;
+        println!(
+            "{} records sent, {:.1} records/sec ({:.2} MB/sec), {:.1} ms avg latency, {:.1} ms max latency.",
+            self.window_count,
+            records_per_second,
+            mb_per_second,
+            average_latency,
+            self.window_max_latency_ms as f64
+        );
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Kafka's rate and latency output contract uses floating-point values"
+    )]
+    fn total_line(&self) -> String {
+        let elapsed_ms = millis_at_least_one(self.started.elapsed());
+        let records_per_second = 1_000.0 * self.count as f64 / elapsed_ms as f64;
+        let mb_per_second = 1_000.0 * self.bytes as f64 / elapsed_ms as f64 / (1024.0 * 1024.0);
+        let average_latency = self.total_latency_ms as f64 / self.count.max(1) as f64;
+        let mut samples = self.latencies.clone();
+        samples.sort_unstable();
+        let percentiles = [(1, 2), (95, 100), (99, 100), (999, 1_000)]
+            .map(|(numerator, denominator)| sampled_percentile(&samples, numerator, denominator));
+        format!(
+            "{}{} records sent, {:.6} records/sec ({:.2} MB/sec), {:.2} ms avg latency, {:.2} ms max latency, {} ms 50th, {} ms 95th, {} ms 99th, {} ms 99.9th.",
+            self.count,
+            if self.steady_state {
+                " steady state"
+            } else {
+                ""
+            },
+            records_per_second,
+            mb_per_second,
+            average_latency,
+            self.max_latency_ms as f64,
+            percentiles[0],
+            percentiles[1],
+            percentiles[2],
+            percentiles[3]
+        )
+    }
+}
+
+fn millis_at_least_one(duration: Duration) -> u128 {
+    duration.as_millis().max(1)
+}
+
+fn sampled_percentile(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let index = samples
+        .len()
+        .saturating_mul(numerator)
+        .checked_div(denominator)
+        .unwrap_or_default()
+        .min(samples.len() - 1);
+    samples[index]
+}
+
+#[derive(Debug)]
+struct ProducerPerfShared {
+    total: ProducerPerfStats,
+    steady: Option<ProducerPerfStats>,
+    failures: u64,
+    first_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProducerPerfContext {
+    shared: Arc<Mutex<ProducerPerfShared>>,
+}
+
+impl ClientContext for ProducerPerfContext {}
+
+impl ProducerContext for ProducerPerfContext {
+    type DeliveryOpaque = Box<ProducerPerfOpaque>;
+
+    fn delivery(&self, result: &DeliveryResult<'_>, opaque: Self::DeliveryOpaque) {
+        let mut shared = lock_unpoisoned(&self.shared);
+        match result {
+            Ok(_) => {
+                let now = Instant::now();
+                let latency = u64::try_from(now.duration_since(opaque.started).as_millis())
+                    .unwrap_or(u64::MAX);
+                shared.total.record(latency, opaque.bytes, now);
+                if opaque.steady_state
+                    && let Some(steady) = shared.steady.as_mut()
+                {
+                    steady.record(latency, opaque.bytes, now);
+                }
+            }
+            Err((error, _)) => {
+                shared.failures = shared.failures.saturating_add(1);
+                if shared.first_error.is_none() {
+                    shared.first_error = Some(error.to_string());
+                }
+                drop(shared);
+                eprintln!("{error}");
+            }
+        }
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PerfRandom(u64);
+
+impl PerfRandom {
+    const fn new(seed: i64) -> Self {
+        Self(seed.cast_unsigned())
+    }
+
+    const fn next_u32(&mut self) -> u32 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.0;
+        value = (value ^ (value >> 33)).wrapping_mul(0x62a9_d9ed_7997_05f5);
+        value = (value ^ (value >> 28)).wrapping_mul(0xcb24_d0a5_c88c_35b3);
+        (value >> 32) as u32
+    }
+
+    fn index(&mut self, upper: usize) -> usize {
+        let bound = u32::try_from(upper).unwrap_or(u32::MAX);
+        let mask = bound - 1;
+        let mut random = self.next_u32();
+        if bound & mask == 0 {
+            return usize::try_from(random & mask).unwrap_or_default();
+        }
+        let mut candidate = random >> 1;
+        loop {
+            let value = candidate % bound;
+            let check = candidate.wrapping_add(mask).wrapping_sub(value);
+            if i32::from_ne_bytes(check.to_ne_bytes()) >= 0 {
+                return usize::try_from(value).unwrap_or_default();
+            }
+            random = self.next_u32();
+            candidate = random >> 1;
+        }
+    }
+}
+
+fn read_producer_payloads(path: &Path, delimiter: &str) -> Result<Vec<Vec<u8>>> {
+    let contents = fs::read_to_string(path)?;
+    if contents.is_empty() {
+        return Err(Error::Usage(
+            "payload file does not exist or is empty".into(),
+        ));
+    }
+    let delimiter = if delimiter == "\\n" { "\n" } else { delimiter };
+    let delimiter = Regex::new(delimiter)
+        .map_err(|error| Error::Usage(format!("invalid payload delimiter: {error}")))?;
+    let payloads = delimiter
+        .split(&contents)
+        .map(str::as_bytes)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let trailing_empty = delimiter
+        .find_iter(&contents)
+        .last()
+        .is_some_and(|match_| match_.end() == contents.len());
+    let end = payloads.len().saturating_sub(usize::from(trailing_empty));
+    Ok(payloads[..end].to_vec())
+}
+
+fn producer_perf_payload(
+    args: &ProducerPerfTestArgs,
+    payloads: &[Vec<u8>],
+    random: &mut PerfRandom,
+    index: u64,
+) -> Vec<u8> {
+    if !payloads.is_empty() {
+        return payloads[random.index(payloads.len())].clone();
+    }
+    if let Some(size) = args.record_size {
+        return (0..size)
+            .map(|_| b'A'.saturating_add(u8::try_from(random.index(26)).unwrap_or_default()))
+            .collect();
+    }
+    index.to_string().into_bytes()
+}
+
+fn producer_perf_key(
+    distribution: ProducerKeyDistribution,
+    range: Option<i32>,
+    index: u64,
+    random: &mut PerfRandom,
+) -> Option<String> {
+    let range = range.and_then(|value| u64::try_from(value).ok())?;
+    match distribution {
+        ProducerKeyDistribution::None => None,
+        ProducerKeyDistribution::Range => Some((index % range).to_string()),
+        ProducerKeyDistribution::Random => Some(
+            random
+                .index(usize::try_from(range).unwrap_or(usize::MAX))
+                .to_string(),
+        ),
+    }
+}
+
+fn validate_producer_perf_args(args: &ProducerPerfTestArgs) -> Result<(u64, u64, Duration)> {
+    let num_records = u64::try_from(args.num_records)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::Usage("--num-records should be greater than zero".into()))?;
+    if args.record_size.is_some_and(|value| value <= 0) {
+        return Err(Error::Usage(
+            "--record-size should be greater than zero".into(),
+        ));
+    }
+    if args.transaction_duration_ms.is_some_and(|value| value <= 0) {
+        return Err(Error::Usage(
+            "--transaction-duration-ms should be greater than zero".into(),
+        ));
+    }
+    let reporting_interval = u64::try_from(args.reporting_interval)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::Usage("--reporting-interval should be greater than zero".into()))?;
+    if args.record_key_range.is_some_and(|value| value <= 0) {
+        return Err(Error::Usage(
+            "--record-key-range should be greater than zero".into(),
+        ));
+    }
+    match (args.key_distribution, args.record_key_range) {
+        (ProducerKeyDistribution::None, Some(_)) => {
+            return Err(Error::Usage(
+                "--key-distribution must be 'range' or 'random' when --record-key-range is specified"
+                    .into(),
+            ));
+        }
+        (ProducerKeyDistribution::Range | ProducerKeyDistribution::Random, None) => {
+            return Err(Error::Usage(
+                "--record-key-range is required when --key-distribution is 'range' or 'random'"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+    let warmup_records = u64::try_from(args.warmup_records.max(0)).unwrap_or_default();
+    if warmup_records >= num_records {
+        return Err(Error::Usage(
+            "--warmup-records must be strictly fewer than --num-records".into(),
+        ));
+    }
+    Ok((
+        num_records,
+        warmup_records,
+        Duration::from_millis(reporting_interval),
+    ))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Kafka benchmark lifecycle keeps payload generation, transactions, throttling, delivery callbacks, and reporting explicit"
+)]
+fn run_producer_perf_test(
+    bootstrap: Option<&str>,
+    command_config: Option<&Path>,
+    args: &ProducerPerfTestArgs,
+) -> Result<()> {
+    let (num_records, warmup_records, reporting_interval) = validate_producer_perf_args(args)?;
+    let config_path = share_perf_config_path(command_config, args.producer_config.as_deref())?;
+    if !args.producer_props.is_empty() {
+        println!("Option --producer-props is deprecated. Use --command-property instead.");
+    }
+    if args.producer_config.is_some() {
+        println!("Option --producer.config is deprecated. Use --command-config instead.");
+    }
+    let properties = parse_producer_perf_properties(args.properties())?;
+    let file_properties = config_path.map(config::load_properties).transpose()?;
+    let configured_bootstrap = properties
+        .iter()
+        .find_map(|(key, value)| (key == "bootstrap.servers").then(|| value.clone()))
+        .or_else(|| {
+            file_properties
+                .as_ref()
+                .and_then(|values| values.get("bootstrap.servers").cloned())
+        });
+    let resolved_bootstrap = bootstrap
+        .map(str::to_owned)
+        .or(configured_bootstrap)
+        .ok_or_else(|| {
+        Error::Usage(
+            "at least one of --bootstrap-server, --command-property, --producer-props, --producer.config or --command-config must provide bootstrap.servers"
+                .into(),
+        )
+    })?;
+    let mut config = config::client_config(&resolved_bootstrap, config_path)?;
+    for (key, value) in properties {
+        config.set(key, value);
+    }
+    if let Some(bootstrap) = bootstrap {
+        config.set("bootstrap.servers", bootstrap);
+    }
+    if config.get("client.id").is_none() {
+        config.set("client.id", "perf-producer-client");
+    }
+
+    let transactions_enabled = args.transaction_duration_ms.is_some()
+        || args.transactional_id.is_some()
+        || config.get("transactional.id").is_some();
+    let transaction_duration = if transactions_enabled {
+        let transaction_id = args.transactional_id.clone().unwrap_or_else(|| {
+            config.get("transactional.id").map_or_else(
+                || {
+                    format!(
+                        "performance-producer-{}",
+                        URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes())
+                    )
+                },
+                str::to_owned,
+            )
+        });
+        config.set("transactional.id", transaction_id);
+        Some(Duration::from_millis(
+            u64::try_from(args.transaction_duration_ms.unwrap_or(3_000)).unwrap_or(3_000),
+        ))
+    } else {
+        None
+    };
+
+    let payloads = if let Some(path) = args.payload_file.as_deref() {
+        println!("Reading payloads from: {}", path.canonicalize()?.display());
+        let payloads = read_producer_payloads(path, &args.payload_delimiter)?;
+        println!("Number of records read: {}", payloads.len());
+        payloads
+    } else {
+        Vec::new()
+    };
+    if args.payload_file.is_some() && payloads.is_empty() {
+        return Err(Error::Usage("payload file produced no records".into()));
+    }
+    if warmup_records > 0 {
+        println!(
+            "Warmup first {warmup_records} records. Steady state results will print after the complete test summary."
+        );
+    }
+
+    let shared = Arc::new(Mutex::new(ProducerPerfShared {
+        total: ProducerPerfStats::new(num_records, reporting_interval, false),
+        steady: None,
+        failures: 0,
+        first_error: None,
+    }));
+    let context = ProducerPerfContext {
+        shared: Arc::clone(&shared),
+    };
+    let producer: BaseProducer<ProducerPerfContext> = config.create_with_context(context)?;
+    let operation_timeout = Duration::from_secs(60);
+    if transactions_enabled {
+        producer.init_transactions(operation_timeout)?;
+    }
+    let mut random = PerfRandom::new(args.random_seed);
+    let throttle_started = Instant::now();
+    let mut transaction_records = 0_u64;
+    let mut transaction_started = Instant::now();
+
+    for index in 0..num_records {
+        if transactions_enabled && transaction_records == 0 {
+            producer.begin_transaction()?;
+            transaction_started = Instant::now();
+        }
+        if warmup_records > 0 && index == warmup_records {
+            let mut state = lock_unpoisoned(&shared);
+            state.total.suppress_printing = true;
+            state.steady = Some(ProducerPerfStats::new(
+                num_records - warmup_records,
+                reporting_interval,
+                true,
+            ));
+        }
+        let payload = producer_perf_payload(args, &payloads, &mut random, index);
+        let key = producer_perf_key(
+            args.key_distribution,
+            args.record_key_range,
+            index,
+            &mut random,
+        );
+        let opaque = Box::new(ProducerPerfOpaque {
+            started: Instant::now(),
+            bytes: payload.len(),
+            steady_state: index >= warmup_records && warmup_records > 0,
+        });
+        let mut record = BaseRecord::with_opaque_to(&args.topic, opaque).payload(&payload);
+        if let Some(key) = key.as_deref() {
+            record = record.key(key);
+        }
+        loop {
+            match producer.send(record) {
+                Ok(()) => break,
+                Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), returned)) => {
+                    record = returned;
+                    producer.poll(Duration::from_millis(100));
+                }
+                Err((error, _)) => return Err(Error::Kafka(error)),
+            }
+        }
+        producer.poll(Duration::ZERO);
+        transaction_records = transaction_records.saturating_add(1);
+        if let Some(duration) = transaction_duration
+            && transaction_started.elapsed() >= duration
+        {
+            producer.commit_transaction(operation_timeout)?;
+            transaction_records = 0;
+        }
+        throttle_producer(args.throughput, index, throttle_started);
+    }
+    if transactions_enabled && transaction_records > 0 {
+        producer.commit_transaction(operation_timeout)?;
+    }
+    producer.flush(operation_timeout)?;
+    let (total_line, steady_line, count, bytes, failures, first_error) = {
+        let state = lock_unpoisoned(&shared);
+        (
+            state.total.total_line(),
+            state.steady.as_ref().map(ProducerPerfStats::total_line),
+            state.total.count,
+            state.total.bytes,
+            state.failures,
+            state.first_error.clone(),
+        )
+    };
+    println!("{total_line}");
+    if let Some(steady_line) = steady_line {
+        println!("{steady_line}");
+    }
+    if args.print_metrics {
+        println!(
+            "records-sent:client-id={}: {}",
+            config.get("client.id").unwrap_or("perf-producer-client"),
+            count
+        );
+        println!(
+            "bytes-sent:client-id={}: {}",
+            config.get("client.id").unwrap_or("perf-producer-client"),
+            bytes
+        );
+        println!("record-errors: {failures}");
+    }
+    if failures > 0 {
+        return Err(Error::Config(format!(
+            "{} record deliveries failed: {}",
+            failures,
+            first_error.as_deref().unwrap_or("unknown error")
+        )));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "fractional records-per-second throttling requires a floating-point elapsed target"
+)]
+fn throttle_producer(throughput: f64, amount_so_far: u64, started: Instant) {
+    if throughput < 0.0 || !throughput.is_finite() {
+        return;
+    }
+    if throughput == 0.0 {
+        if amount_so_far == 0 {
+            return;
+        }
+        std::thread::park();
+        return;
+    }
+    let expected = Duration::from_secs_f64(amount_so_far as f64 / throughput);
+    if let Some(remaining) = expected.checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining);
+    }
 }
 
 async fn enqueue_with_timeout<K, P>(
@@ -14037,6 +14629,21 @@ fn parse_pairs(values: &[String]) -> Result<Vec<(String, String)>> {
         .collect()
 }
 
+fn parse_producer_perf_properties(values: &[String]) -> Result<Vec<(String, String)>> {
+    values
+        .iter()
+        .map(|property| {
+            let mut pieces = property.split('=');
+            match (pieces.next(), pieces.next(), pieces.next()) {
+                (Some(key), Some(value), None) => Ok((key.to_owned(), value.to_owned())),
+                _ => Err(Error::Usage(format!(
+                    "invalid producer property: {property}"
+                ))),
+            }
+        })
+        .collect()
+}
+
 fn parse_config_additions(values: &[String]) -> Result<Vec<(String, String)>> {
     let mut configs = BTreeMap::new();
     for value in values {
@@ -16647,5 +17254,95 @@ mod tests {
                 .name,
             "source"
         );
+    }
+
+    #[test]
+    fn producer_perf_payload_file_should_follow_regex_delimiter_semantics() {
+        let mut file = tempfile::NamedTempFile::new().expect("payload fixture");
+        writeln!(file, "Hello\t\tKafka").expect("write payload fixture");
+
+        let payloads =
+            read_producer_payloads(file.path(), "\\t").expect("read producer performance payloads");
+
+        assert_eq!(
+            payloads,
+            [b"Hello".to_vec(), Vec::new(), b"Kafka\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn producer_perf_range_keys_should_repeat_within_requested_range() {
+        let mut random = PerfRandom::new(0);
+        let keys = (0..6)
+            .map(|index| {
+                producer_perf_key(ProducerKeyDistribution::Range, Some(3), index, &mut random)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            keys,
+            ["0", "1", "2", "0", "1", "2"].map(|value| Some(value.to_owned()))
+        );
+    }
+
+    #[test]
+    fn producer_perf_random_should_match_java_splittable_random_seed_zero() {
+        let mut random = PerfRandom::new(0);
+        let values = (0..8).map(|_| random.index(26)).collect::<Vec<_>>();
+
+        assert_eq!(values, [24, 16, 7, 7, 13, 4, 1, 18]);
+    }
+
+    #[test]
+    fn producer_perf_properties_should_reject_multiple_equals_like_kafka() {
+        let result = parse_producer_perf_properties(&["password=a=b".into()]);
+
+        assert!(matches!(
+            result,
+            Err(Error::Usage(message)) if message.contains("invalid producer property")
+        ));
+    }
+
+    #[test]
+    fn producer_perf_stats_should_report_kafka_latency_percentiles() {
+        let mut stats = ProducerPerfStats::new(4, Duration::from_secs(60), false);
+        let now = Instant::now();
+        for latency in [1, 2, 10, 100] {
+            stats.record(latency, 10, now);
+        }
+
+        let line = stats.total_line();
+
+        assert!(line.contains("10 ms 50th"));
+        assert!(line.contains("100 ms 95th"));
+    }
+
+    #[test]
+    fn producer_perf_validation_should_require_range_for_non_null_keys() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "producer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "1",
+            "--throughput",
+            "-1",
+            "--record-size",
+            "10",
+            "--key-distribution",
+            "random",
+            "--command-property",
+            "bootstrap.servers=localhost:9092",
+        ])
+        .expect("producer performance arguments");
+        let Command::ProducerPerfTest(args) = cli.command else {
+            panic!("expected producer performance command");
+        };
+
+        assert!(matches!(
+            validate_producer_perf_args(&args),
+            Err(Error::Usage(message)) if message.contains("--record-key-range is required")
+        ));
     }
 }

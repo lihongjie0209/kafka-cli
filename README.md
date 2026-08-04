@@ -40,7 +40,7 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `consume`, `consumer-perf-test`, `share-consume`,
+The binary exposes `topics`, `produce`, `producer-perf-test`, `consume`, `consumer-perf-test`, `share-consume`,
 `share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
@@ -85,6 +85,11 @@ alias is `kafka-share-consumer-perf-test.sh`.
 including topic/regex subscription, earliest/latest reset behavior, rebalance
 and fetch-time accounting, the original ten-column CSV contract, and
 librdkafka-backed fetch/socket tuning.
+`producer-perf-test` preserves Kafka's payload-size/file/monotonic modes,
+regex payload delimiters, fractional throughput throttling, deterministic key
+distributions, warmup and steady-state summaries, transactions, delivery
+latency percentiles, and native measured metrics. Its compatibility alias is
+`kafka-producer-perf-test.sh`.
 
 ## Authentication
 

@@ -74,6 +74,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
     match name {
         "kafka-topics" => Some("topics"),
         "kafka-console-producer" => Some("produce"),
+        "kafka-producer-perf-test" => Some("producer-perf-test"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-consumer-perf-test" => Some("consumer-perf-test"),
         "kafka-console-share-consumer" => Some("share-consume"),
@@ -297,6 +298,8 @@ pub enum Command {
     Topics(TopicsArgs),
     /// Produce records from stdin.
     Produce(ProduceArgs),
+    /// Measure Kafka producer throughput and delivery latency.
+    ProducerPerfTest(ProducerPerfTestArgs),
     /// Consume records to stdout.
     Consume(ConsumeArgs),
     /// Measure classic Kafka consumer throughput.
@@ -783,6 +786,82 @@ impl ProduceArgs {
     pub(crate) fn properties(&self) -> &[String] {
         if self.properties.is_empty() {
             &self.deprecated_properties
+        } else {
+            &self.properties
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ProducerKeyDistribution {
+    #[default]
+    None,
+    Range,
+    Random,
+}
+
+#[derive(Debug, Args)]
+pub struct ProducerPerfTestArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long)]
+    pub num_records: i64,
+    #[arg(
+        long,
+        required_unless_present_any = ["payload_file", "payload_monotonic"],
+        conflicts_with_all = ["payload_file", "payload_monotonic"]
+    )]
+    pub record_size: Option<i32>,
+    #[arg(
+        long,
+        required_unless_present_any = ["record_size", "payload_monotonic"],
+        conflicts_with_all = ["record_size", "payload_monotonic"]
+    )]
+    pub payload_file: Option<PathBuf>,
+    #[arg(
+        long,
+        required_unless_present_any = ["record_size", "payload_file"],
+        conflicts_with_all = ["record_size", "payload_file"]
+    )]
+    pub payload_monotonic: bool,
+    #[arg(long, default_value = "\\n")]
+    pub payload_delimiter: String,
+    #[arg(long, allow_negative_numbers = true)]
+    pub throughput: f64,
+    #[arg(
+        long = "command-property",
+        num_args = 1..,
+        conflicts_with = "producer_props"
+    )]
+    pub properties: Vec<String>,
+    /// Deprecated alias for --command-property.
+    #[arg(long, num_args = 1.., conflicts_with = "properties")]
+    pub producer_props: Vec<String>,
+    /// Deprecated alias for the global --command-config.
+    #[arg(long = "producer.config")]
+    pub producer_config: Option<PathBuf>,
+    #[arg(long)]
+    pub print_metrics: bool,
+    #[arg(long)]
+    pub transactional_id: Option<String>,
+    #[arg(long)]
+    pub transaction_duration_ms: Option<i64>,
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    pub warmup_records: i64,
+    #[arg(long, default_value_t = 5_000)]
+    pub reporting_interval: i64,
+    #[arg(long)]
+    pub record_key_range: Option<i32>,
+    #[arg(long, value_enum, default_value_t)]
+    pub key_distribution: ProducerKeyDistribution,
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    pub random_seed: i64,
+}
+
+impl ProducerPerfTestArgs {
+    pub(crate) fn properties(&self) -> &[String] {
+        if self.properties.is_empty() {
+            &self.producer_props
         } else {
             &self.properties
         }
@@ -2119,6 +2198,74 @@ mod tests {
             (consumer.max_messages, consumer.timeout_ms),
             (Some(-1), Some(u64::MAX))
         );
+    }
+
+    #[test]
+    fn producer_perf_should_parse_payload_transaction_and_key_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "producer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "100",
+            "--throughput",
+            "1.25",
+            "--payload-monotonic",
+            "--transaction-duration-ms",
+            "3000",
+            "--warmup-records",
+            "10",
+            "--key-distribution",
+            "range",
+            "--record-key-range",
+            "5",
+            "--command-property",
+            "bootstrap.servers=localhost:9092",
+            "linger.ms=10",
+        ])
+        .expect("Kafka producer performance options");
+        let Command::ProducerPerfTest(args) = cli.command else {
+            panic!("expected producer-perf-test command");
+        };
+
+        assert_eq!(args.num_records, 100);
+        assert!((args.throughput - 1.25).abs() < f64::EPSILON);
+        assert!(args.payload_monotonic);
+        assert_eq!(args.warmup_records, 10);
+        assert_eq!(args.key_distribution, ProducerKeyDistribution::Range);
+        assert_eq!(args.record_key_range, Some(5));
+        assert_eq!(args.properties.len(), 2);
+    }
+
+    #[test]
+    fn producer_perf_should_require_exactly_one_payload_source() {
+        let missing = Cli::try_parse_from([
+            "kafka",
+            "producer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "1",
+            "--throughput",
+            "-1",
+        ]);
+        assert!(missing.is_err());
+
+        let conflicting = Cli::try_parse_from([
+            "kafka",
+            "producer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "1",
+            "--throughput",
+            "-1",
+            "--record-size",
+            "10",
+            "--payload-monotonic",
+        ]);
+        assert!(conflicting.is_err());
     }
 
     #[test]

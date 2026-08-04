@@ -648,6 +648,33 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .success()
         .stdout(predicate::str::contains("json-value"))
         .stdout(predicate::str::contains("trace"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "producer-perf-test",
+            "--topic",
+            "integration-events",
+            "--num-records",
+            "3",
+            "--throughput",
+            "-1",
+            "--record-size",
+            "32",
+            "--transactional-id",
+            "producer-perf-integration",
+            "--key-distribution",
+            "range",
+            "--record-key-range",
+            "2",
+            "--print-metrics",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("3 records sent"))
+        .stdout(predicate::str::contains("records-sent:client-id="))
+        .stdout(predicate::str::contains("record-errors: 0"));
     let consumer_performance = Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

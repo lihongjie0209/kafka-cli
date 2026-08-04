@@ -176,6 +176,25 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "producer-perf-test",
+            "--topic",
+            "kafka-36-events",
+            "--num-records",
+            "2",
+            "--throughput",
+            "-1",
+            "--payload-monotonic",
+            "--print-metrics",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 records sent"))
+        .stdout(predicate::str::contains("record-errors: 0"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "consumer-perf-test",
             "--topic",
             "kafka-36-events",
