@@ -7,12 +7,12 @@
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
 - Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `fc39cca`。
-- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 27 个兼容名称，入口覆盖率为 27/44（61.4%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
-- 按本报告的功能口径，27 个兼容入口中 12 个达到核心功能“已支持”，15 个为“部分支持”；另有 17 个原版入口未支持。因此不能把 61.4% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
+- 本项目审计实现基准：`master`，提交 `1ab2cfc`。
+- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 28 个兼容名称，入口覆盖率为 28/44（63.6%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 按本报告的功能口径，28 个兼容入口中 12 个达到核心功能“已支持”，16 个为“部分支持”；另有 16 个原版入口未支持。因此不能把 63.6% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
 - 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
 - Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
-- Connect、metadata shell、storage 与其他验证工具等原版工具尚未实现；Producer Performance、普通/Share Consumer Performance、Console/Verifiable Share Consumer、Share/Streams Group 管理、Streams Application Reset、Metadata Quorum 和 Delegation Tokens 已新增，但部分专用多 controller/SASL 集成矩阵仍待补充。
+- Connect、metadata shell、storage 与其他验证工具等原版工具尚未实现；E2E Latency、Producer Performance、普通/Share Consumer Performance、Console/Verifiable Share Consumer、Share/Streams Group 管理、Streams Application Reset、Metadata Quorum 和 Delegation Tokens 已新增，但部分专用多 controller/SASL 集成矩阵仍待补充。
 - 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API。ACL create/describe/delete 已迁移到 librdkafka；少数其他管理路径仍使用 `krafka`，尚未完全统一。
 
 ## 2. 状态定义
@@ -38,15 +38,15 @@
 
 | 维度 | 结果 | 解读 |
 |---|---:|---|
-| Kafka `.sh` 入口 | 27 / 44（61.4%） | 17 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
-| 入口功能评级 | 12 已支持 / 15 部分支持 / 17 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
-| 已覆盖入口的一级动作 | 71 / 71 | 仅表示这 27 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
+| Kafka `.sh` 入口 | 28 / 44（63.6%） | 16 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
+| 入口功能评级 | 12 已支持 / 16 部分支持 / 16 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
+| 已覆盖入口的一级动作 | 72 / 72 | 仅表示这 28 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 257 个通过 | 236 个 library unit tests + 21 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 263 个通过 | 241 个 library unit tests + 22 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 交叉编译后经 QEMU 启动验证 |
 
-原版动作数 71 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 14 个入口各 1。Console producer/consumer/share-consumer、Producer Performance、普通/Share Consumer Performance、Verifiable Share Consumer、通用 Groups list 与 Streams Application Reset 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
+原版动作数 72 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 15 个入口各 1。Console producer/consumer/share-consumer、E2E Latency、Producer Performance、普通/Share Consumer Performance、Verifiable Share Consumer、通用 Groups list 与 Streams Application Reset 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
 
 ## 3. 顶层脚本覆盖
 
@@ -57,6 +57,7 @@
 | `kafka-topics.sh` | `kafka topics` | 已支持 | list、describe、create、alter、delete |
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 行输入、sync/async、key、JSON、headers、partition、reader config 及主要 producer 调优参数；未复刻可插拔 reader class |
 | `kafka-producer-perf-test.sh` | `kafka producer-perf-test` | 部分支持 | 三种 payload、限速、key 分布、warmup、事务、延迟分位数及 metrics；完整 Java metrics 和 Java regex 全方言仍有边界 |
+| `kafka-e2e-latency.sh` | `kafka e2e-latency` | 部分支持 | 同步生产/消费、自动建 topic、key/value/header 校验、平均与分位延迟、named/legacy 参数；错误堆栈和个别空 optional arg 行为不同 |
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config 和 StringDeserializer；未复刻任意 Java formatter/deserializer class 加载 |
 | `kafka-console-share-consumer.sh` | `kafka share-consume` | 部分支持 | KIP-932 ShareFetch/ShareAcknowledge、accept/release/reject、超时、formatter、delivery count 与配置优先级；未复刻任意 Java formatter/deserializer class 和全部 Java consumer property |
 | `kafka-share-consumer-perf-test.sh` | `kafka share-consumer-perf-test` | 部分支持 | 多 Share Consumer、记录/字节吞吐、超时、周期/逐 consumer/汇总 CSV 和 native metrics；fetch/socket 旋钮与 Java metrics 集合未完全等价 |
@@ -90,7 +91,7 @@
 |---|---|
 | Kafka Connect | `connect-distributed.sh`、`connect-internal-topics.sh`、`connect-mirror-maker.sh`、`connect-plugin-path.sh`、`connect-standalone.sh` |
 | 集群与元数据高级工具 | `kafka-metadata-shell.sh`、`kafka-storage.sh` |
-| 性能、校验与诊断 | `kafka-e2e-latency.sh`、`kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-verifiable-producer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
+| 性能、校验与诊断 | `kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-verifiable-producer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
 | 服务进程与基础启动器 | `kafka-run-class.sh`、`kafka-server-start.sh`、`kafka-server-stop.sh`、`kafka-jmx.sh` |
 
 服务启动、JVM class runner、JMX 和 Trogdor 一类脚本不适合由客户端 CLI 等价替代；如果项目目标仅是 Kafka 客户端管理工具，可以明确将它们排除在范围之外。
@@ -345,6 +346,14 @@ ack pattern 按 record offset 循环选择 `accept`、`release`、`reject`、`re
 
 该入口评级为部分支持：`--print-metrics` 当前输出本次运行测得的 records、bytes 和 delivery errors，不等价于 Java producer 的完整 `MetricName` 集合；payload delimiter 由 Rust regex 执行，与 Java `Pattern` 的 look-around、反向引用等完整方言不等价；错误堆栈和浮点格式只保持信息/字段兼容，不做 JVM 逐字符复制。性能输出属于 Kafka 原版服务消费的文本契约，因此不改为 `comfy-table`；管理命令的结果集继续统一使用表格类库。
 
+### 4.28 End-to-End Latency
+
+已按 Kafka 4.4 `EndToEndLatency` 实现单记录往返延迟入口：必需 bootstrap-server、topic、正数 num-records、producer-acks `1|all` 和非负 record-size；支持非负 record-key-size、num-headers、record-header-key-size，以及允许 `-1` 表示 null header value 的 record-header-size。兼容脚本同时接受 Kafka 4.2 起的 named 参数和已废弃的五/六个 positional 参数，并为后者输出弃用警告。
+
+执行时首先用 librdkafka metadata 检查 topic；缺失时创建单分区、复制因子 1 的 topic。consumer 使用临时 group、关闭自动提交、latest reset、零 fetch wait，并在发送前把所有分区显式定位到当前 high watermark，消除首次 position 解析晚于发送导致漏读的竞态。每轮由 Java `Random(0)` 对齐实现生成 ASCII key/value/ordered headers，FutureProducer 等待 delivery acknowledgement 后立即消费一条消息，逐 byte 校验 key/value/header key/header value/null value，再记录包含生产确认与消费的总 elapsed latency。结束时同步提交 consumer state，输出原版进度行、平均延迟和 50/99/99.9 percentile 文本。
+
+该入口评级为部分支持：Kafka 源码的默认 key size 0 实际发送 non-null empty key，本实现按代码而非帮助文案对齐；Java 比较生成数据的 UTF-8 字符串，本实现对 ASCII fixture 做更严格的 byte 比较，不改变合法路径；原版 `--command-config` 使用 optional arg，本项目共享全局参数要求提供路径；异常使用 Rust error chain，不复制 JVM stack trace。该性能输出同样是原版文本契约，不属于管理表格结果集。
+
 ## 5. 全局行为差异
 
 | 项目 | Apache Kafka 原版 | kafka-cli |
@@ -378,8 +387,8 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：257 个通过（236 个 library unit tests + 21 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试覆盖全部 27 个命令族；Producer Performance 新增事务、range key、record-size 和 metrics 路径，原有覆盖包括普通 Consumer Performance 的 include/统计/metrics、Console Share Consumer 实时 ShareFetch/ShareAcknowledge、Verifiable Share Consumer JSON 事件与循环 acknowledgement、双线程 Share Consumer Performance、Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、Streams Application Reset 内部 topic 删除及 force LeaveGroup、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
+- Rust 单元测试与普通 CLI 测试：263 个通过（241 个 library unit tests + 22 个 CLI tests）。
+- Kafka 4.3.1 Docker 集成测试覆盖全部 28 个命令族；E2E Latency 新增自动建 topic、key、ordered headers 与 null header value 往返路径，Producer Performance 覆盖事务、range key、record-size 和 metrics，原有覆盖包括普通 Consumer Performance 的 include/统计/metrics、Console Share Consumer 实时 ShareFetch/ShareAcknowledge、Verifiable Share Consumer JSON 事件与循环 acknowledgement、双线程 Share Consumer Performance、Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、Streams Application Reset 内部 topic 删除及 force LeaveGroup、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
 - Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
@@ -427,6 +436,8 @@ Consumer Performance 实现 `a92cb50` 及 Kafka 3 `max-timestamp` 兼容断言�
 
 Producer Performance 实现 `fc39cca` 已提交 GitHub Actions [`30868691184`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30868691184)：workflow 包含 257 个普通测试、bundled glibc、Kafka 3.6.2 monotonic producer、Kafka 4.3.1 transactional producer，以及 x86_64/aarch64 musl 构建和启动 smoke test。按当前开发策略，功能提交不阻塞等待单轮 CI；各轮 CI 状态和失败项将在后续集中审计与修复，不能仅凭 workflow 已触发宣称本轮六项全绿。
 
+End-to-End Latency 实现 `1ab2cfc` 已提交 GitHub Actions [`30869292636`](https://github.com/lihongjie0209/kafka-cli/actions/runs/30869292636)：workflow 新增 Kafka 3.6.2 基础往返，以及 Kafka 4.3.1 自动建 topic、key、两个 null-value header 往返验证；普通测试增至 263。该轮同样不阻塞功能开发等待结果，后续集中处理 CI 状态。
+
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
 ## 9. 建议的后续优先级
@@ -446,13 +457,13 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 ### P2：扩大原版工具覆盖面
 
-Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。Producer Performance、普通/Share Consumer Performance、Console/Verifiable Share Consumer、Share Group、Streams Group 管理与 Streams Application Reset 入口均已完成；后续客户端入口优先考虑 `kafka-e2e-latency.sh`、`kafka-verifiable-producer.sh` 和 `kafka-verifiable-consumer.sh`。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
+Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。E2E Latency、Producer Performance、普通/Share Consumer Performance、Console/Verifiable Share Consumer、Share Group、Streams Group 管理与 Streams Application Reset 入口均已完成；后续客户端入口优先考虑 `kafka-verifiable-producer.sh` 和 `kafka-verifiable-consumer.sh`。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
 
 ## 10. 最终评估
 
 当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、Transactions、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
 
-在对外发布时，建议使用“兼容 27 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 12 个已支持、15 个部分支持和 17 个未支持入口；不应使用“100% 兼容 Apache Kafka CLI”。
+在对外发布时，建议使用“兼容 28 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 12 个已支持、16 个部分支持和 16 个未支持入口；不应使用“100% 兼容 Apache Kafka CLI”。
 
 ### 10.1 二次代码审计发现的待修正项
 
@@ -471,6 +482,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | topics | 完整 | 高 | 高/中 | 常用功能可替代，缺单次响应 partition 限制 |
 | console-producer | 单动作 | 中 | 中 | 可做常规生产，不替代 Java reader 插件体系 |
 | producer-perf-test | 单动作 | 高 | 中/高 | payload/key/限速/warmup/事务/延迟分位数已实现；Java 全量 metrics 与完整 Java regex 方言仍有边界 |
+| e2e-latency | 单动作 | 高 | 中/高 | 自动建 topic、同步往返、key/value/header/null header 校验及 named/legacy 参数已实现；异常格式和空 optional config 参数不同 |
 | console-consumer | 单动作 | 中 | 中/高 | group、commit、offset 与配置优先级已对齐；不替代 formatter/deserializer 插件体系 |
 | console-share-consumer | 单动作 | 中/高 | 中/高 | KIP-932 消费、三类 acknowledgement、formatter 与 timeout 已实测；不替代 Java 插件体系，部分 Java consumer property 尚未映射 |
 | share-consumer-perf-test | 单动作 | 高 | 中/高 | 多 consumer、超时和 CSV/metrics 统计已实测；fetch/socket 旋钮、Java 全量 metrics 与完整 SimpleDateFormat 仍有边界 |
@@ -580,6 +592,7 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | 2026-08-04 | Share Consumer Performance 入口 | 新增 `kafka share-consumer-perf-test` 和兼容脚本；实现多 consumer 并发、record/byte 计数、idle timeout、周期/逐 consumer/七列 CSV 汇总和 native connection metrics | 225 个单元测试、19 个 CLI 测试；CI `30865007900` 六个 job 全绿，Kafka 4.3.1 双 consumer 精确消费四条消息及双 musl smoke test 通过 |
 | 2026-08-04 | Consumer Performance 入口 | 新增 `kafka consumer-perf-test` 和兼容脚本；基于 rdkafka/librdkafka 实现 topic/include、配置优先级、fetch/socket 参数、rebalance/fetch 时间及原版十列 CSV | 228 个单元测试、20 个 CLI 测试；CI `30867465950` 覆盖 Kafka 3.6.2 topic、Kafka 4.3.1 include/metrics、bundled glibc 与双 musl smoke test |
 | 2026-08-04 | Producer Performance 入口 | 新增 `kafka producer-perf-test` 和兼容脚本；基于 rdkafka/librdkafka callback 实现三种 payload、Java 顺序随机源、key 分布、fractional throttle、warmup/steady-state、事务与延迟分位数 | 236 个单元测试、21 个 CLI 测试通过；Kafka 3.6.2 monotonic 与 Kafka 4.3.1 transactional 集成路径已加入 CI `30868691184`，CI 状态后续批量审计 |
+| 2026-08-04 | End-to-End Latency 入口 | 新增 `kafka e2e-latency` 和兼容脚本；实现 named/legacy 参数、Java Random、自动建 topic、显式 high watermark、逐条同步 delivery→consume 及 key/value/ordered/null header 校验 | 241 个单元测试、22 个 CLI 测试通过；Kafka 3.6.2/4.3.1 往返路径已加入 CI `30869292636`，CI 状态后续批量审计 |
 
 ## 12. librdkafka 2.12 能力闭环审计
 
