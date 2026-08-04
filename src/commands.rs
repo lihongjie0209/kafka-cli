@@ -7,7 +7,7 @@ use std::{
     path::Path,
     process,
     sync::{
-        LazyLock,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -18,7 +18,10 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use bytes::{Buf, BufMut, BytesMut};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{
+    DateTime, Local, NaiveDateTime, Utc,
+    format::{Item, StrftimeItems},
+};
 use futures::StreamExt;
 use krafka::protocol::{
     AlterConfigOp, AlterableConfig, ApiKey, ApiVersionsRequest,
@@ -52,9 +55,9 @@ use crate::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
         ConfigAction, ConfigEntityArgs, ConfigEntityType, DelegationTokenAction, DescribeTopicArgs,
         ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
-        ReassignAction, ResetOffsetsArgs, ShareConsumeArgs, ShareGroupAction,
-        ShareGroupResetOffsetsArgs, StreamsApplicationResetArgs, StreamsGroupAction,
-        StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
+        ReassignAction, ResetOffsetsArgs, ShareConsumeArgs, ShareConsumerPerfTestArgs,
+        ShareGroupAction, ShareGroupResetOffsetsArgs, StreamsApplicationResetArgs,
+        StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
         VerifiableAcknowledgementMode, VerifiableShareConsumerArgs,
     },
     config,
@@ -154,6 +157,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::ShareConsume(args) => {
             Box::pin(share_consume(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
+                args,
+            ))
+            .await
+        }
+        Command::ShareConsumerPerfTest(args) => {
+            Box::pin(share_consumer_perf_test(
                 bootstrap,
                 command_config.as_deref(),
                 timeout,
@@ -1574,6 +1586,417 @@ async fn share_consume(
         println!("shutdown_complete");
     }
     run_result.map(|_| ()).and(close_result)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SharePerfStats {
+    records: u64,
+    bytes: u64,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Kafka performance lifecycle keeps setup, concurrent collection, reporting, commit, and close ordering explicit"
+)]
+async fn share_consumer_perf_test(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    request_timeout: Duration,
+    args: ShareConsumerPerfTestArgs,
+) -> Result<()> {
+    if args.threads == 0 {
+        return Err(Error::Usage("--threads must be greater than 0".into()));
+    }
+    if args.reporting_interval == 0 {
+        return Err(Error::Usage(
+            "reporting interval must be greater than 0".into(),
+        ));
+    }
+    if args.fetch_size <= 0 {
+        return Err(Error::Usage("--fetch-size must be greater than 0".into()));
+    }
+    if args.socket_buffer_size <= 0 {
+        return Err(Error::Usage(
+            "--socket-buffer-size must be greater than 0".into(),
+        ));
+    }
+    validate_share_date_pattern(&args.date_format)?;
+    if args.messages.is_some() {
+        println!("Warning: --messages is deprecated. Use --num-records instead.");
+    }
+    if args.consumer_config.is_some() {
+        println!("Warning: --consumer.config is deprecated. Use --command-config instead.");
+    }
+    if !args.hide_header {
+        print_share_perf_header();
+    }
+
+    let config_path = share_perf_config_path(command_config, args.consumer_config.as_deref())?;
+    let mut properties = match config_path {
+        Some(path) => config::load_properties(path)?,
+        None => std::collections::HashMap::new(),
+    };
+    for (key, value) in parse_pairs(&args.properties)? {
+        properties.insert(key, value);
+    }
+    let base_client_id = properties
+        .get("client.id")
+        .cloned()
+        .unwrap_or_else(|| "perf-share-consumer-client".into());
+    let mut consumers = Vec::with_capacity(args.threads);
+    let mut client_ids = Vec::with_capacity(args.threads);
+    for index in 0..args.threads {
+        let client_id = if args.threads == 1 {
+            base_client_id.clone()
+        } else {
+            format!("{}-{}", base_client_id, index + 1)
+        };
+        let consumer = build_share_perf_consumer(
+            bootstrap,
+            &args.group,
+            &client_id,
+            &properties,
+            request_timeout,
+            args.num_records(),
+        )
+        .await?;
+        consumer.subscribe(&[&args.topic]).await?;
+        client_ids.push(client_id);
+        consumers.push(consumer);
+    }
+
+    let start = Instant::now();
+    let start_ms = Utc::now().timestamp_millis();
+    let total_records = Arc::new(AtomicU64::new(0));
+    let worker_options = SharePerfWorkerOptions {
+        target: args.num_records(),
+        timeout_ms: args.timeout,
+        reporting_interval_ms: args.reporting_interval,
+        detailed: args.show_detailed_stats,
+        date_format: &args.date_format,
+    };
+    let stats =
+        futures::future::try_join_all(consumers.iter().enumerate().map(|(index, consumer)| {
+            consume_share_perf_records(
+                consumer,
+                index + 1,
+                &worker_options,
+                Arc::clone(&total_records),
+            )
+        }))
+        .await?;
+    let end_ms = Utc::now().timestamp_millis();
+    let elapsed = start.elapsed();
+    let total = stats
+        .iter()
+        .fold(SharePerfStats::default(), |mut total, item| {
+            total.records = total.records.saturating_add(item.records);
+            total.bytes = total.bytes.saturating_add(item.bytes);
+            total
+        });
+
+    if args.show_consumer_stats {
+        for (index, (client_id, item)) in client_ids.iter().zip(&stats).enumerate() {
+            print_share_consumer_stats(
+                index + 1,
+                client_id,
+                *item,
+                elapsed,
+                start_ms,
+                end_ms,
+                &args.date_format,
+            );
+        }
+    }
+    if total.records < args.num_records() {
+        println!(
+            "WARNING: Exiting before consuming the expected number of records: timeout ({} ms) exceeded. You can use the --timeout option to increase the timeout.",
+            args.timeout
+        );
+    }
+
+    let metric_snapshots = args.print_metrics.then(|| {
+        consumers
+            .iter()
+            .map(|consumer| consumer.connection_metrics().snapshot())
+            .collect::<Vec<_>>()
+    });
+    for consumer in &consumers {
+        consumer.commit_sync().await?;
+    }
+    print_share_group_stats(total, elapsed, start_ms, end_ms, &args.date_format);
+    if let Some(snapshots) = metric_snapshots {
+        for (client_id, metrics) in client_ids.iter().zip(snapshots) {
+            println!(
+                "connections-created:client-id={client_id}: {}",
+                metrics.connections_created
+            );
+            println!(
+                "connections-closed:client-id={client_id}: {}",
+                metrics.connections_closed
+            );
+            println!(
+                "connection-errors:client-id={client_id}: {}",
+                metrics.connection_errors
+            );
+            println!(
+                "active-connections:client-id={client_id}: {}",
+                metrics.active_connections
+            );
+            println!(
+                "requests-sent:client-id={client_id}: {}",
+                metrics.normal_priority_requests
+            );
+        }
+    }
+    for consumer in &consumers {
+        consumer.close().await?;
+    }
+    drop(consumers);
+    Ok(())
+}
+
+fn share_perf_config_path<'a>(
+    command_config: Option<&'a Path>,
+    consumer_config: Option<&'a Path>,
+) -> Result<Option<&'a Path>> {
+    if command_config.is_some() && consumer_config.is_some() {
+        return Err(Error::Usage(
+            "--consumer.config cannot be used with --command-config".into(),
+        ));
+    }
+    Ok(consumer_config.or(command_config))
+}
+
+async fn build_share_perf_consumer(
+    bootstrap: &str,
+    group: &str,
+    client_id: &str,
+    properties: &std::collections::HashMap<String, String>,
+    request_timeout: Duration,
+    num_records: u64,
+) -> Result<ShareConsumer> {
+    let mut builder = ShareConsumer::builder()
+        .bootstrap_servers(bootstrap)
+        .group_id(group)
+        .client_id(client_id)
+        .acknowledgement_mode(AcknowledgementMode::Implicit)
+        .request_timeout(
+            share_duration_property(properties, "request.timeout.ms")?.unwrap_or(request_timeout),
+        );
+    let auth = config::protocol_auth(properties)?;
+    if let Some(auth) = auth {
+        builder = builder.auth(auth);
+    }
+    let max_poll_records = share_i32_property(properties, "max.poll.records")?;
+    if let Some(value) = max_poll_records {
+        builder = builder.max_poll_records(value);
+    } else if let Ok(value) = i32::try_from(num_records)
+        && value > 0
+    {
+        builder = builder.max_poll_records(value);
+    }
+    let fetch_max_wait = share_i32_property(properties, "fetch.max.wait.ms")?;
+    if let Some(value) = fetch_max_wait {
+        builder = builder.fetch_max_wait_ms(value);
+    }
+    let session_timeout = share_duration_property(properties, "session.timeout.ms")?;
+    if let Some(value) = session_timeout {
+        builder = builder.session_timeout(value);
+    }
+    let heartbeat_interval = share_duration_property(properties, "heartbeat.interval.ms")?;
+    if let Some(value) = heartbeat_interval {
+        builder = builder.heartbeat_interval(value);
+    }
+    let metadata_max_age = share_duration_property(properties, "metadata.max.age.ms")?;
+    if let Some(value) = metadata_max_age {
+        builder = builder.metadata_max_age(value);
+    }
+    let metadata_max_idle = share_duration_property(properties, "metadata.max.idle.ms")?;
+    if let Some(value) = metadata_max_idle {
+        builder = builder.metadata_topic_cache_ttl(value);
+    }
+    if let Some(rack) = properties.get("client.rack") {
+        builder = builder.client_rack(rack);
+    }
+    Ok(builder.build().await?)
+}
+
+struct SharePerfWorkerOptions<'a> {
+    target: u64,
+    timeout_ms: u64,
+    reporting_interval_ms: u64,
+    detailed: bool,
+    date_format: &'a str,
+}
+
+async fn consume_share_perf_records(
+    consumer: &ShareConsumer,
+    index: usize,
+    options: &SharePerfWorkerOptions<'_>,
+    total_records: Arc<AtomicU64>,
+) -> Result<SharePerfStats> {
+    let mut stats = SharePerfStats::default();
+    let mut previous = stats;
+    let mut last_record = Instant::now();
+    let mut last_report = Instant::now();
+    while total_records.load(Ordering::Relaxed) < options.target
+        && last_record.elapsed() <= Duration::from_millis(options.timeout_ms)
+    {
+        let records = consumer.poll(Duration::from_millis(100)).await?;
+        let now = Instant::now();
+        if !records.is_empty() {
+            last_record = now;
+        }
+        for record in records {
+            stats.records = stats.records.saturating_add(1);
+            stats.bytes = stats.bytes.saturating_add(
+                record.key.as_ref().map_or(0, |value| value.len() as u64)
+                    + record.value.as_ref().map_or(0, |value| value.len() as u64),
+            );
+            total_records.fetch_add(1, Ordering::Relaxed);
+            if options.detailed
+                && last_report.elapsed() >= Duration::from_millis(options.reporting_interval_ms)
+            {
+                print_share_progress(
+                    index,
+                    stats,
+                    previous,
+                    last_report.elapsed(),
+                    options.date_format,
+                );
+                previous = stats;
+                last_report = now;
+            }
+        }
+    }
+    Ok(stats)
+}
+
+fn print_share_perf_header() {
+    println!(
+        "start.time, end.time, data.consumed.in.MB, MB.sec, nMsg.sec, data.consumed.in.nMsg, fetch.time.ms"
+    );
+}
+
+fn java_date_pattern(pattern: &str) -> String {
+    pattern
+        .replace("yyyy", "%Y")
+        .replace("SSS", "%.3f")
+        .replace("MM", "%m")
+        .replace("dd", "%d")
+        .replace("HH", "%H")
+        .replace("mm", "%M")
+        .replace("ss", "%S")
+}
+
+fn validate_share_date_pattern(pattern: &str) -> Result<()> {
+    let translated = java_date_pattern(pattern);
+    if StrftimeItems::new(&translated).any(|item| item == Item::Error) {
+        return Err(Error::Usage(format!(
+            "invalid --date-format pattern '{pattern}'"
+        )));
+    }
+    Ok(())
+}
+
+fn format_share_perf_time(timestamp_ms: i64, pattern: &str) -> String {
+    DateTime::from_timestamp_millis(timestamp_ms).map_or_else(
+        || timestamp_ms.to_string(),
+        |value| {
+            value
+                .with_timezone(&Local)
+                .format(&java_date_pattern(pattern))
+                .to_string()
+        },
+    )
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Kafka performance output uses floating point rates"
+)]
+fn share_perf_values(stats: SharePerfStats, elapsed: Duration) -> (f64, f64, f64, u128) {
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let megabytes = stats.bytes as f64 / (1024.0 * 1024.0);
+    (
+        megabytes,
+        megabytes / seconds,
+        stats.records as f64 / seconds,
+        elapsed.as_millis(),
+    )
+}
+
+fn print_share_progress(
+    index: usize,
+    stats: SharePerfStats,
+    previous: SharePerfStats,
+    interval: Duration,
+    date_format: &str,
+) {
+    let end_ms = Utc::now().timestamp_millis();
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
+    let delta = SharePerfStats {
+        records: stats.records.saturating_sub(previous.records),
+        bytes: stats.bytes.saturating_sub(previous.bytes),
+    };
+    let (_, mb_per_sec, records_per_sec, fetch_ms) = share_perf_values(delta, interval);
+    let total_mb = share_perf_values(stats, interval).0;
+    println!(
+        "{}, {}, {:.4}, {:.4}, {:.4}, {}, {} for share consumer {}",
+        format_share_perf_time(end_ms.saturating_sub(interval_ms), date_format),
+        format_share_perf_time(end_ms, date_format),
+        total_mb,
+        mb_per_sec,
+        records_per_sec,
+        stats.records,
+        fetch_ms,
+        index
+    );
+}
+
+fn print_share_consumer_stats(
+    index: usize,
+    client_id: &str,
+    stats: SharePerfStats,
+    elapsed: Duration,
+    start_ms: i64,
+    end_ms: i64,
+    date_format: &str,
+) {
+    let (megabytes, mb_per_sec, records_per_sec, fetch_ms) = share_perf_values(stats, elapsed);
+    println!(
+        "Share consumer {} having client id {} consumption metrics- {}, {}, {:.4}, {:.4}, {:.4}, {}, {}",
+        index,
+        client_id,
+        format_share_perf_time(start_ms, date_format),
+        format_share_perf_time(end_ms, date_format),
+        megabytes,
+        mb_per_sec,
+        records_per_sec,
+        stats.records,
+        fetch_ms
+    );
+}
+
+fn print_share_group_stats(
+    stats: SharePerfStats,
+    elapsed: Duration,
+    start_ms: i64,
+    end_ms: i64,
+    date_format: &str,
+) {
+    let (megabytes, mb_per_sec, records_per_sec, fetch_ms) = share_perf_values(stats, elapsed);
+    println!(
+        "{}, {}, {:.4}, {:.4}, {:.4}, {}, {}",
+        format_share_perf_time(start_ms, date_format),
+        format_share_perf_time(end_ms, date_format),
+        megabytes,
+        mb_per_sec,
+        records_per_sec,
+        stats.records,
+        fetch_ms
+    );
 }
 
 fn verifiable_event(name: &str, fields: serde_json::Value) -> serde_json::Value {
@@ -14486,6 +14909,34 @@ mod tests {
             share_i32_property(&properties, "max.poll.records"),
             Err(Error::Config(message)) if message.contains("max.poll.records")
         ));
+    }
+
+    #[test]
+    fn share_consumer_perf_should_match_default_date_and_rate_contract() {
+        assert_eq!(
+            java_date_pattern("yyyy-MM-dd HH:mm:ss:SSS"),
+            "%Y-%m-%d %H:%M:%S:%.3f"
+        );
+        let (megabytes, mb_per_sec, records_per_sec, fetch_ms) = share_perf_values(
+            SharePerfStats {
+                records: 200,
+                bytes: 1024 * 1024,
+            },
+            Duration::from_secs(2),
+        );
+        assert!((megabytes - 1.0).abs() < f64::EPSILON);
+        assert!((mb_per_sec - 0.5).abs() < f64::EPSILON);
+        assert!((records_per_sec - 100.0).abs() < f64::EPSILON);
+        assert_eq!(fetch_ms, 2_000);
+        assert!(matches!(
+            share_perf_config_path(
+                Some(Path::new("current.properties")),
+                Some(Path::new("deprecated.properties"))
+            ),
+            Err(Error::Usage(_))
+        ));
+        assert!(validate_share_date_pattern("yyyy-MM-dd HH:mm:ss:SSS").is_ok());
+        assert!(validate_share_date_pattern("%Q").is_err());
     }
 
     #[test]

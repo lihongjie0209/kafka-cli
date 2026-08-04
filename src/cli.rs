@@ -76,6 +76,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-console-producer" => Some("produce"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-console-share-consumer" => Some("share-consume"),
+        "kafka-share-consumer-perf-test" => Some("share-consumer-perf-test"),
         "kafka-verifiable-share-consumer" => Some("verifiable-share-consumer"),
         "kafka-consumer-groups" => Some("groups"),
         "kafka-groups" => Some("all-groups"),
@@ -299,6 +300,8 @@ pub enum Command {
     Consume(ConsumeArgs),
     /// Consume records through a Kafka Share group.
     ShareConsume(ShareConsumeArgs),
+    /// Measure Kafka Share consumer throughput.
+    ShareConsumerPerfTest(ShareConsumerPerfTestArgs),
     /// Emit Kafka system-test Share consumer events as JSON lines.
     VerifiableShareConsumer(VerifiableShareConsumerArgs),
     /// Inspect and manage consumer groups.
@@ -946,6 +949,63 @@ impl ShareConsumeArgs {
         } else {
             &self.properties
         }
+    }
+}
+
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka ShareConsumerPerformance exposes independent reporting flags"
+)]
+pub struct ShareConsumerPerfTestArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long, default_value = "perf-share-consumer")]
+    pub group: String,
+    #[arg(
+        long = "num-records",
+        required_unless_present = "messages",
+        conflicts_with = "messages"
+    )]
+    pub num_records: Option<u64>,
+    /// Deprecated alias for --num-records.
+    #[arg(
+        long,
+        required_unless_present = "num_records",
+        conflicts_with = "num_records"
+    )]
+    pub messages: Option<u64>,
+    #[arg(long, default_value_t = 1024 * 1024)]
+    pub fetch_size: i32,
+    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    pub socket_buffer_size: i32,
+    #[arg(long = "command-property")]
+    pub properties: Vec<String>,
+    /// Deprecated alias for --command-config.
+    #[arg(long = "consumer.config", conflicts_with = "command_config")]
+    pub consumer_config: Option<PathBuf>,
+    #[arg(long)]
+    pub print_metrics: bool,
+    #[arg(long)]
+    pub show_detailed_stats: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "10000", default_value_t = 10_000)]
+    pub timeout: u64,
+    #[arg(long, default_value_t = 5_000)]
+    pub reporting_interval: u64,
+    #[arg(long, default_value = "yyyy-MM-dd HH:mm:ss:SSS")]
+    pub date_format: String,
+    #[arg(long)]
+    pub hide_header: bool,
+    #[arg(long, default_value_t = 1)]
+    pub threads: usize,
+    #[arg(long)]
+    pub show_consumer_stats: bool,
+}
+
+impl ShareConsumerPerfTestArgs {
+    #[must_use]
+    pub fn num_records(&self) -> u64 {
+        self.num_records.or(self.messages).unwrap_or_default()
     }
 }
 
@@ -2042,6 +2102,58 @@ mod tests {
                 "events",
                 "--reject",
                 "--release",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn share_consumer_perf_should_parse_original_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "share-consumer-perf-test",
+            "--topic",
+            "events",
+            "--group",
+            "workers",
+            "--num-records",
+            "100",
+            "--threads",
+            "2",
+            "--timeout",
+            "--show-detailed-stats",
+            "--show-consumer-stats",
+            "--command-property",
+            "client.id=benchmark",
+        ])
+        .expect("Kafka Share consumer performance options");
+        let Command::ShareConsumerPerfTest(args) = cli.command else {
+            panic!("expected share-consumer-perf-test command");
+        };
+        assert_eq!(args.group, "workers");
+        assert_eq!(args.num_records(), 100);
+        assert_eq!(args.threads, 2);
+        assert_eq!(args.timeout, 10_000);
+        assert!(args.show_detailed_stats);
+        assert!(args.show_consumer_stats);
+    }
+
+    #[test]
+    fn share_consumer_perf_should_require_exactly_one_record_count() {
+        assert!(
+            Cli::try_parse_from(["kafka", "share-consumer-perf-test", "--topic", "events",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "kafka",
+                "share-consumer-perf-test",
+                "--topic",
+                "events",
+                "--num-records",
+                "1",
+                "--messages",
+                "1",
             ])
             .is_err()
         );

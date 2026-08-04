@@ -273,6 +273,32 @@ fn kafka_console_share_consumer_alias_should_accept_original_options() {
 
 #[cfg(unix)]
 #[test]
+fn kafka_share_consumer_perf_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-share-consumer-perf-test.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create Share performance alias");
+
+    Command::new(alias)
+        .args([
+            "--topic",
+            "events",
+            "--num-records",
+            "10",
+            "--threads",
+            "2",
+            "--show-consumer-stats",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--reporting-interval"))
+        .stdout(predicate::str::contains("--print-metrics"));
+}
+
+#[cfg(unix)]
+#[test]
 fn kafka_verifiable_share_consumer_alias_should_accept_original_options() {
     let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
     let binary = std::path::PathBuf::from(binary_command.get_program());

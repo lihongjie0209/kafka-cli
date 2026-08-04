@@ -41,7 +41,7 @@ compatibility.
 ## Command coverage
 
 The binary exposes `topics`, `produce`, `consume`, `share-consume`,
-`verifiable-share-consumer`, `groups`, `all-groups`,
+`share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
 `features`, `transactions`, `metadata-quorum`, and `delegation-tokens` command families. Run
@@ -77,6 +77,10 @@ native output implementation.
 `verifiable-share-consumer` emits Kafka system-test compatible JSON Lines for
 startup, optional offset-reset configuration, records, acknowledgements and
 shutdown, including cyclic accept/release/reject/renew patterns.
+`share-consumer-perf-test` runs one or more Share consumers and preserves the
+original seven-column CSV throughput summary, optional interval/per-consumer
+statistics, timeout warning, and native connection metrics. Its compatibility
+alias is `kafka-share-consumer-perf-test.sh`.
 
 ## Authentication
 

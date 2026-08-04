@@ -816,6 +816,78 @@ fn all_command_families_work_against_kafka_4_3_1() {
         ))
         .stdout(predicate::str::contains("\"ACCEPT\":1"))
         .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""));
+    success(
+        &bootstrap,
+        &[
+            "topics",
+            "create",
+            "--topic",
+            "share-perf-events",
+            "--partitions",
+            "2",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "groups",
+            "--entity-name",
+            "share-perf-integration",
+            "--add-config",
+            "share.auto.offset.reset=earliest",
+            "--execute",
+        ],
+    );
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
+            "share-perf-events",
+            "--sync",
+        ])
+        .write_stdin("perf-one\nperf-two\nperf-three\nperf-four\n")
+        .assert()
+        .success();
+    let performance = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "share-consumer-perf-test",
+            "--topic",
+            "share-perf-events",
+            "--group",
+            "share-perf-integration",
+            "--num-records",
+            "4",
+            "--threads",
+            "2",
+            "--timeout",
+            "30000",
+            "--show-consumer-stats",
+            "--print-metrics",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("data.consumed.in.MB"))
+        .stdout(predicate::str::contains("Share consumer 1"))
+        .stdout(predicate::str::contains("connections-created:client-id="))
+        .get_output()
+        .stdout
+        .clone();
+    let performance = String::from_utf8(performance).expect("UTF-8 performance output");
+    let summary = performance
+        .lines()
+        .rev()
+        .find(|line| line.split(',').count() == 7 && !line.contains("for share consumer"));
+    let summary = summary.expect("Share group performance summary");
+    assert_eq!(summary.split(',').nth(5).map(str::trim), Some("4"));
     assert!(
         success(
             &bootstrap,
