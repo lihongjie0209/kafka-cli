@@ -77,6 +77,7 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-producer-perf-test" => Some("producer-perf-test"),
         "kafka-e2e-latency" => Some("e2e-latency"),
         "kafka-verifiable-producer" => Some("verifiable-producer"),
+        "kafka-verifiable-consumer" => Some("verifiable-consumer"),
         "kafka-console-consumer" => Some("consume"),
         "kafka-consumer-perf-test" => Some("consumer-perf-test"),
         "kafka-console-share-consumer" => Some("share-consume"),
@@ -345,6 +346,8 @@ pub enum Command {
     E2eLatency(E2eLatencyArgs),
     /// Produce deterministic records and emit Kafka system-test JSON events.
     VerifiableProducer(VerifiableProducerArgs),
+    /// Consume records and emit Kafka system-test JSON events.
+    VerifiableConsumer(VerifiableConsumerArgs),
     /// Consume records to stdout.
     Consume(ConsumeArgs),
     /// Measure classic Kafka consumer throughput.
@@ -952,6 +955,45 @@ pub struct VerifiableProducerArgs {
     pub value_prefix: Option<i32>,
     #[arg(long)]
     pub repeating_keys: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum ConsumerGroupProtocol {
+    #[default]
+    Classic,
+    Consumer,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifiableConsumerArgs {
+    #[arg(long)]
+    pub topic: String,
+    #[arg(long = "group-protocol", value_enum, default_value_t)]
+    pub group_protocol: ConsumerGroupProtocol,
+    #[arg(long = "group-remote-assignor")]
+    pub group_remote_assignor: Option<String>,
+    #[arg(long = "group-id")]
+    pub group_id: String,
+    #[arg(long = "group-instance-id")]
+    pub group_instance_id: Option<String>,
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    pub max_messages: i32,
+    #[arg(long = "session-timeout")]
+    pub session_timeout: Option<i32>,
+    #[arg(long = "enable-autocommit")]
+    pub enable_autocommit: bool,
+    #[arg(long = "close-timeout", default_value_t = 30_000)]
+    pub close_timeout: i32,
+    #[arg(long = "reset-policy", default_value = "earliest")]
+    pub reset_policy: String,
+    #[arg(
+        long = "assignment-strategy",
+        default_value = "org.apache.kafka.clients.consumer.RangeAssignor"
+    )]
+    pub assignment_strategy: String,
+    /// Deprecated alias for the global --command-config.
+    #[arg(long = "consumer.config")]
+    pub consumer_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -2420,6 +2462,57 @@ mod tests {
         assert_eq!((args.max_messages, args.throughput, args.acks), (12, 4, 1));
         assert_eq!(args.message_create_time, 1_700_000_000_000);
         assert_eq!((args.value_prefix, args.repeating_keys), (Some(7), Some(3)));
+    }
+
+    #[test]
+    fn verifiable_consumer_should_parse_original_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "verifiable-consumer",
+            "--topic",
+            "events",
+            "--group-id",
+            "system-test",
+            "--group-protocol",
+            "consumer",
+            "--group-remote-assignor",
+            "uniform",
+            "--group-instance-id",
+            "instance-1",
+            "--max-messages",
+            "12",
+            "--session-timeout",
+            "10000",
+            "--verbose",
+            "--enable-autocommit",
+            "--close-timeout",
+            "5000",
+            "--reset-policy",
+            "latest",
+        ])
+        .expect("Kafka verifiable consumer options");
+        assert_eq!(cli.verbose, 1);
+        let Command::VerifiableConsumer(args) = cli.command else {
+            panic!("expected verifiable-consumer command");
+        };
+
+        assert!(matches!(
+            args.group_protocol,
+            ConsumerGroupProtocol::Consumer
+        ));
+        assert_eq!(args.group_remote_assignor.as_deref(), Some("uniform"));
+        assert_eq!(args.group_instance_id.as_deref(), Some("instance-1"));
+        assert_eq!(
+            (args.max_messages, args.session_timeout),
+            (12, Some(10_000))
+        );
+        assert!(args.enable_autocommit);
+        assert_eq!(
+            (args.close_timeout, args.reset_policy.as_str()),
+            (5_000, "latest")
+        );
     }
 
     #[test]

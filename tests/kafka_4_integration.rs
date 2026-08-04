@@ -735,6 +735,33 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""))
         .stdout(predicate::str::contains("\"sent\":3"))
         .stdout(predicate::str::contains("\"acked\":3"));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "verifiable-consumer",
+            "--topic",
+            "integration-events",
+            "--group-id",
+            "integration-verifiable-consumer",
+            "--group-protocol",
+            "consumer",
+            "--max-messages",
+            "3",
+            "--reset-policy",
+            "earliest",
+            "--verbose",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"startup_complete\""))
+        .stdout(predicate::str::contains("\"name\":\"partitions_assigned\""))
+        .stdout(predicate::str::contains("\"name\":\"record_data\""))
+        .stdout(predicate::str::contains("\"name\":\"records_consumed\""))
+        .stdout(predicate::str::contains("\"name\":\"offsets_committed\""))
+        .stdout(predicate::str::contains("\"success\":true"))
+        .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""));
     let consumer_performance = Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

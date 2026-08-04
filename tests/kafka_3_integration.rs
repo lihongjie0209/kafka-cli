@@ -239,6 +239,31 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .args([
             "--bootstrap-server",
             &bootstrap,
+            "verifiable-consumer",
+            "--topic",
+            "kafka-36-events",
+            "--group-id",
+            "kafka-36-verifiable-consumer",
+            "--max-messages",
+            "2",
+            "--reset-policy",
+            "earliest",
+            "--verbose",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\":\"startup_complete\""))
+        .stdout(predicate::str::contains("\"name\":\"partitions_assigned\""))
+        .stdout(predicate::str::contains("\"name\":\"record_data\""))
+        .stdout(predicate::str::contains("\"name\":\"records_consumed\""))
+        .stdout(predicate::str::contains("\"name\":\"offsets_committed\""))
+        .stdout(predicate::str::contains("\"success\":true"))
+        .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""));
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
             "consumer-perf-test",
             "--topic",
             "kafka-36-events",

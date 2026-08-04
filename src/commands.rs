@@ -42,7 +42,7 @@ use rdkafka::{
         ResourceSpecifier, TopicReplication,
     },
     client::{ClientContext, DefaultClientContext},
-    consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::{BorrowedHeaders, Header, Headers, OwnedHeaders, ToBytes},
     producer::{
@@ -57,14 +57,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     cli::{
         AclAction, AllGroupType, AllGroupsAction, Cli, ClientMetricsAction, ClusterAction, Command,
-        ConfigAction, ConfigEntityArgs, ConfigEntityType, ConsumerPerfTestArgs,
-        DelegationTokenAction, DescribeTopicArgs, E2eLatencyArgs, ElectionType, FeatureAction,
-        GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime, ProducerKeyDistribution,
-        ProducerPerfTestArgs, ReassignAction, ResetOffsetsArgs, ShareConsumeArgs,
-        ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
+        ConfigAction, ConfigEntityArgs, ConfigEntityType, ConsumerGroupProtocol,
+        ConsumerPerfTestArgs, DelegationTokenAction, DescribeTopicArgs, E2eLatencyArgs,
+        ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
+        ProducerKeyDistribution, ProducerPerfTestArgs, ReassignAction, ResetOffsetsArgs,
+        ShareConsumeArgs, ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
         StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
-        TransactionAction, VerifiableAcknowledgementMode, VerifiableProducerArgs,
-        VerifiableShareConsumerArgs,
+        TransactionAction, VerifiableAcknowledgementMode, VerifiableConsumerArgs,
+        VerifiableProducerArgs, VerifiableShareConsumerArgs,
     },
     config,
     error::{Error, Result},
@@ -173,6 +173,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
         Command::E2eLatency(args) => e2e_latency(bootstrap, command_config.as_deref(), args).await,
         Command::VerifiableProducer(args) => {
             verifiable_producer(bootstrap, command_config.as_deref(), args).await
+        }
+        Command::VerifiableConsumer(args) => {
+            verifiable_consumer(bootstrap, command_config.as_deref(), verbose, args).await
         }
         Command::Consume(args) => consume(client_config, timeout, args).await,
         Command::ConsumerPerfTest(args) => {
@@ -1556,6 +1559,306 @@ async fn verifiable_producer(
         target_throughput: args.throughput,
         avg_throughput: 1_000.0 * acked as f64 / elapsed_ms as f64,
     })
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiablePartition {
+    topic: String,
+    partition: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiablePartitionEvent {
+    timestamp: i64,
+    name: &'static str,
+    partitions: Vec<VerifiablePartition>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiableRecordSummary {
+    topic: String,
+    partition: i32,
+    count: u64,
+    #[serde(rename = "minOffset")]
+    min_offset: i64,
+    #[serde(rename = "maxOffset")]
+    max_offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiableRecordsConsumed {
+    timestamp: i64,
+    name: &'static str,
+    count: u64,
+    partitions: Vec<VerifiableRecordSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiableRecordData {
+    timestamp: i64,
+    name: &'static str,
+    key: Option<String>,
+    value: Option<String>,
+    topic: String,
+    partition: i32,
+    offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiableCommitData {
+    topic: String,
+    partition: i32,
+    offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifiableOffsetsCommitted {
+    timestamp: i64,
+    name: &'static str,
+    offsets: Vec<VerifiableCommitData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    success: bool,
+}
+
+#[derive(Debug)]
+struct VerifiableConsumerContext;
+
+impl ClientContext for VerifiableConsumerContext {}
+
+impl ConsumerContext for VerifiableConsumerContext {
+    fn pre_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        if let Rebalance::Revoke(partitions) = rebalance {
+            write_verifiable_partition_event("partitions_revoked", partitions);
+        }
+    }
+
+    fn post_rebalance(&self, _consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {
+        if let Rebalance::Assign(partitions) = rebalance {
+            write_verifiable_partition_event("partitions_assigned", partitions);
+        }
+    }
+}
+
+fn write_verifiable_event<T: Serialize>(event: &T) {
+    if let Err(error) = output::write_json_line(event) {
+        eprintln!("failed to write verifiable consumer event: {error}");
+    }
+}
+
+fn verifiable_partitions(partitions: &TopicPartitionList) -> Vec<VerifiablePartition> {
+    partitions
+        .elements()
+        .iter()
+        .map(|partition| VerifiablePartition {
+            topic: partition.topic().to_owned(),
+            partition: partition.partition(),
+        })
+        .collect()
+}
+
+fn write_verifiable_partition_event(name: &'static str, partitions: &TopicPartitionList) {
+    write_verifiable_event(&VerifiablePartitionEvent {
+        timestamp: Utc::now().timestamp_millis(),
+        name,
+        partitions: verifiable_partitions(partitions),
+    });
+}
+
+fn verifiable_assignment_strategy(strategy: &str) -> Result<&'static str> {
+    match strategy {
+        "org.apache.kafka.clients.consumer.RangeAssignor" | "range" => Ok("range"),
+        "org.apache.kafka.clients.consumer.RoundRobinAssignor" | "roundrobin" => Ok("roundrobin"),
+        "org.apache.kafka.clients.consumer.CooperativeStickyAssignor" | "cooperative-sticky" => {
+            Ok("cooperative-sticky")
+        }
+        _ => Err(Error::Unsupported(format!(
+            "Java consumer assignment strategy '{strategy}' cannot be loaded by the native client"
+        ))),
+    }
+}
+
+fn verifiable_consumer_config(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    args: &VerifiableConsumerArgs,
+) -> Result<rdkafka::ClientConfig> {
+    let config_path = share_perf_config_path(command_config, args.consumer_config.as_deref())?;
+    let mut client = config::client_config(bootstrap, config_path)?;
+    client
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", &args.group_id)
+        .set(
+            "group.protocol",
+            match args.group_protocol {
+                ConsumerGroupProtocol::Classic => "classic",
+                ConsumerGroupProtocol::Consumer => "consumer",
+            },
+        )
+        .set("enable.auto.commit", args.enable_autocommit.to_string())
+        .set("auto.offset.reset", &args.reset_policy);
+    match args.group_protocol {
+        ConsumerGroupProtocol::Classic => {
+            client.set(
+                "partition.assignment.strategy",
+                verifiable_assignment_strategy(&args.assignment_strategy)?,
+            );
+        }
+        ConsumerGroupProtocol::Consumer => {
+            if let Some(assignor) = args.group_remote_assignor.as_deref() {
+                client.set("group.remote.assignor", assignor);
+            }
+        }
+    }
+    if let Some(timeout) = args.session_timeout {
+        client.set("session.timeout.ms", timeout.to_string());
+    }
+    if let Some(instance_id) = args.group_instance_id.as_deref() {
+        client.set("group.instance.id", instance_id);
+    }
+    Ok(client)
+}
+
+fn write_verifiable_commit(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    result: std::result::Result<(), KafkaError>,
+) {
+    let (success, error) = match result {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    write_verifiable_event(&VerifiableOffsetsCommitted {
+        timestamp: Utc::now().timestamp_millis(),
+        name: "offsets_committed",
+        offsets: vec![VerifiableCommitData {
+            topic: topic.to_owned(),
+            partition,
+            offset,
+        }],
+        error,
+        success,
+    });
+}
+
+fn write_verifiable_consumed_record<M: Message>(message: &M, verbose: bool) {
+    let topic = message.topic();
+    let partition = message.partition();
+    let offset = message.offset();
+    if verbose {
+        write_verifiable_event(&VerifiableRecordData {
+            timestamp: Utc::now().timestamp_millis(),
+            name: "record_data",
+            key: message
+                .key()
+                .map(|key| String::from_utf8_lossy(key).into_owned()),
+            value: message
+                .payload()
+                .map(|value| String::from_utf8_lossy(value).into_owned()),
+            topic: topic.to_owned(),
+            partition,
+            offset,
+        });
+    }
+    write_verifiable_event(&VerifiableRecordsConsumed {
+        timestamp: Utc::now().timestamp_millis(),
+        name: "records_consumed",
+        count: 1,
+        partitions: vec![VerifiableRecordSummary {
+            topic: topic.to_owned(),
+            partition,
+            count: 1,
+            min_offset: offset,
+            max_offset: offset,
+        }],
+    });
+}
+
+async fn verifiable_consumer(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    verbose: bool,
+    args: VerifiableConsumerArgs,
+) -> Result<()> {
+    if args.consumer_config.is_some() {
+        println!(
+            "Option --consumer.config has been deprecated and will be removed in a future version. Use --command-config instead."
+        );
+    }
+    if args.close_timeout < 0 {
+        return Err(Error::Usage("--close-timeout must not be negative".into()));
+    }
+    let config = verifiable_consumer_config(bootstrap, command_config, &args)?;
+    let consumer: StreamConsumer<VerifiableConsumerContext> =
+        config.create_with_context(VerifiableConsumerContext)?;
+    write_verifiable_event(&VerifiableLifecycleEvent {
+        timestamp: Utc::now().timestamp_millis(),
+        name: "startup_complete",
+    });
+    consumer.subscribe(&[&args.topic])?;
+
+    let max_messages = if args.max_messages < 0 {
+        u64::MAX
+    } else {
+        u64::try_from(args.max_messages).unwrap_or_default()
+    };
+    let mut received_count = 0_u64;
+    let mut shutdown_requested = false;
+    while received_count < max_messages {
+        let message = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                shutdown_requested = true;
+                write_verifiable_event(&VerifiableLifecycleEvent {
+                    timestamp: Utc::now().timestamp_millis(),
+                    name: "shutdown_requested",
+                });
+                break;
+            }
+            message = consumer.recv() => message,
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                eprintln!("Error during processing, terminating consumer process: {error}");
+                break;
+            }
+        };
+        let topic = message.topic();
+        let partition = message.partition();
+        let offset = message.offset();
+        write_verifiable_consumed_record(&message, verbose);
+        received_count = received_count.saturating_add(1);
+        if !args.enable_autocommit {
+            let mut offsets = TopicPartitionList::new();
+            offsets.add_partition_offset(topic, partition, Offset::Offset(offset + 1))?;
+            write_verifiable_commit(
+                topic,
+                partition,
+                offset + 1,
+                consumer.commit(&offsets, CommitMode::Sync),
+            );
+        }
+    }
+    consumer.unsubscribe();
+    let close_timeout =
+        Duration::from_millis(u64::try_from(args.close_timeout).unwrap_or_default());
+    let close_started = Instant::now();
+    while consumer.assignment()?.count() != 0 && close_started.elapsed() < close_timeout {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(consumer);
+    write_verifiable_event(&VerifiableLifecycleEvent {
+        timestamp: Utc::now().timestamp_millis(),
+        name: "shutdown_complete",
+    });
+    if !shutdown_requested {
+        write_verifiable_event(&VerifiableLifecycleEvent {
+            timestamp: Utc::now().timestamp_millis(),
+            name: "shutdown_requested",
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -17861,6 +18164,73 @@ mod tests {
                 "offset": 3
             })
         );
+    }
+
+    #[test]
+    fn verifiable_consumer_config_should_map_classic_java_assignor() {
+        let args = VerifiableConsumerArgs {
+            topic: "events".into(),
+            group_protocol: ConsumerGroupProtocol::Classic,
+            group_remote_assignor: None,
+            group_id: "system-test".into(),
+            group_instance_id: Some("instance-1".into()),
+            max_messages: 1,
+            session_timeout: Some(10_000),
+            enable_autocommit: false,
+            close_timeout: 30_000,
+            reset_policy: "earliest".into(),
+            assignment_strategy: "org.apache.kafka.clients.consumer.RoundRobinAssignor".into(),
+            consumer_config: None,
+        };
+
+        let config = verifiable_consumer_config("localhost:9092", None, &args)
+            .expect("verifiable consumer configuration");
+        assert_eq!(config.get("group.protocol"), Some("classic"));
+        assert_eq!(
+            config.get("partition.assignment.strategy"),
+            Some("roundrobin")
+        );
+        assert_eq!(config.get("group.instance.id"), Some("instance-1"));
+        assert_eq!(config.get("enable.auto.commit"), Some("false"));
+    }
+
+    #[test]
+    fn verifiable_consumer_record_event_should_use_kafka_json_contract() {
+        let event = serde_json::to_value(VerifiableRecordData {
+            timestamp: 1,
+            name: "record_data",
+            key: None,
+            value: Some("value".into()),
+            topic: "events".into(),
+            partition: 2,
+            offset: 3,
+        })
+        .expect("serialize event");
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "timestamp": 1,
+                "name": "record_data",
+                "key": null,
+                "value": "value",
+                "topic": "events",
+                "partition": 2,
+                "offset": 3
+            })
+        );
+    }
+
+    #[test]
+    fn verifiable_consumer_commit_error_should_omit_only_success_error_field() {
+        let success = serde_json::to_value(VerifiableOffsetsCommitted {
+            timestamp: 1,
+            name: "offsets_committed",
+            offsets: Vec::new(),
+            error: None,
+            success: true,
+        })
+        .expect("serialize event");
+        assert!(success.get("error").is_none());
     }
 
     #[test]

@@ -380,6 +380,34 @@ fn kafka_verifiable_producer_alias_should_accept_original_options() {
 
 #[cfg(unix)]
 #[test]
+fn kafka_verifiable_consumer_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-verifiable-consumer.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create verifiable consumer alias");
+
+    Command::new(alias)
+        .args([
+            "--topic",
+            "events",
+            "--group-id",
+            "system-test",
+            "--group-protocol",
+            "classic",
+            "--max-messages",
+            "2",
+            "--verbose",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--assignment-strategy"))
+        .stdout(predicate::str::contains("--consumer.config"));
+}
+
+#[cfg(unix)]
+#[test]
 fn kafka_share_consumer_perf_alias_should_accept_original_options() {
     let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
     let binary = std::path::PathBuf::from(binary_command.get_program());

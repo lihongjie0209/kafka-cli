@@ -40,7 +40,7 @@ compatibility.
 
 ## Command coverage
 
-The binary exposes `topics`, `produce`, `producer-perf-test`, `e2e-latency`, `verifiable-producer`, `consume`, `consumer-perf-test`, `share-consume`,
+The binary exposes `topics`, `produce`, `producer-perf-test`, `e2e-latency`, `verifiable-producer`, `verifiable-consumer`, `consume`, `consumer-perf-test`, `share-consume`,
 `share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
@@ -101,6 +101,11 @@ statistics. It preserves finite or unbounded production, throughput limiting,
 acknowledgement selection, repeating keys, value prefixes, record create-time
 progression, and the deprecated producer properties file through
 `kafka-verifiable-producer.sh`.
+`verifiable-consumer` emits the corresponding classic consumer system-test
+events for assignment/revocation, consumed batches, optional record data,
+offset commits, startup, and shutdown. It supports classic and KIP-848 consumer
+group protocols, static membership, reset policy, auto commit, and the original
+`kafka-verifiable-consumer.sh` options.
 
 ## Authentication
 
