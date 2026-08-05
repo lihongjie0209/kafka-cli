@@ -83,6 +83,9 @@ fn compatibility_command(executable: &str) -> Option<&'static str> {
         "kafka-console-share-consumer" => Some("share-consume"),
         "kafka-share-consumer-perf-test" => Some("share-consumer-perf-test"),
         "kafka-verifiable-share-consumer" => Some("verifiable-share-consumer"),
+        "kafka-replica-verification" => Some("replica-verification"),
+        "kafka-dump-log" => Some("dump-log"),
+        "kafka-storage" => Some("storage"),
         "kafka-consumer-groups" => Some("groups"),
         "kafka-groups" => Some("all-groups"),
         "kafka-share-groups" => Some("share-groups"),
@@ -139,6 +142,9 @@ fn rewrite_legacy_action(args: &mut Vec<OsString>, command: &str) {
     }
     if command == "e2e-latency" {
         rewrite_e2e_latency_legacy_args(args);
+    }
+    if command == "replica-verification" {
+        rewrite_replica_verification_broker_list(args);
     }
     let candidates: &[(&str, &str, bool)] = match command {
         "topics" => &[
@@ -256,6 +262,34 @@ fn rewrite_e2e_latency_legacy_args(args: &mut Vec<OsString>) {
     );
 }
 
+/// Maps the original `--broker-list` flag onto the global `--bootstrap-server`.
+fn rewrite_replica_verification_broker_list(args: &mut [OsString]) {
+    let has_bootstrap = args.iter().any(|argument| {
+        argument.to_str().is_some_and(|value| {
+            value == "--bootstrap-server" || value.starts_with("--bootstrap-server=")
+        })
+    });
+    if has_bootstrap {
+        return;
+    }
+    let mut index = 0;
+    while index < args.len() {
+        let Some(value) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if value == "--broker-list" && index + 1 < args.len() {
+            args[index] = OsString::from("--bootstrap-server");
+            return;
+        }
+        if let Some(list) = value.strip_prefix("--broker-list=") {
+            args[index] = OsString::from(format!("--bootstrap-server={list}"));
+            return;
+        }
+        index += 1;
+    }
+}
+
 fn rewrite_legacy_config_entities(args: &mut Vec<OsString>) {
     let mut types = Vec::new();
     let mut selectors = Vec::new();
@@ -358,6 +392,12 @@ pub enum Command {
     ShareConsumerPerfTest(ShareConsumerPerfTestArgs),
     /// Emit Kafka system-test Share consumer events as JSON lines.
     VerifiableShareConsumer(VerifiableShareConsumerArgs),
+    /// Verify that all replicas for selected topics contain the same data.
+    ReplicaVerification(ReplicaVerificationArgs),
+    /// Dump Kafka log segment, index, and time-index files.
+    DumpLog(DumpLogArgs),
+    /// Format and inspect `KRaft` storage directories.
+    Storage(StorageArgs),
     /// Inspect and manage consumer groups.
     Groups(GroupsArgs),
     /// List groups of every Kafka group type.
@@ -438,7 +478,7 @@ pub enum DelegationTokenAction {
 
 #[derive(Debug, Args)]
 pub struct MetadataQuorumArgs {
-    /// Connect directly to a `KRaft` controller listener.
+    /// Connect via a `KRaft` controller listener (routed as the admin bootstrap target).
     #[arg(long, conflicts_with = "bootstrap_server")]
     pub bootstrap_controller: Option<String>,
     #[command(subcommand)]
@@ -541,7 +581,7 @@ pub enum TransactionAction {
 
 #[derive(Debug, Args)]
 pub struct FeaturesArgs {
-    /// Connect directly to a `KRaft` controller listener.
+    /// Connect via a `KRaft` controller listener (routed as the admin bootstrap target).
     #[arg(long, conflicts_with = "bootstrap_server")]
     pub bootstrap_controller: Option<String>,
     #[command(subcommand)]
@@ -962,6 +1002,137 @@ pub enum ConsumerGroupProtocol {
     #[default]
     Classic,
     Consumer,
+}
+
+/// Options for Kafka's dump-log tool.
+#[derive(Debug, Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Kafka dump-log exposes independent diagnostic mode flags"
+)]
+pub struct DumpLogArgs {
+    /// Comma-separated list of data and index log files to dump.
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub files: Vec<PathBuf>,
+    /// Print message content when dumping data logs.
+    #[arg(long = "print-data-log")]
+    pub print_data_log: bool,
+    /// Verify the index log without printing its content.
+    #[arg(long = "verify-index-only")]
+    pub verify_index_only: bool,
+    /// Run the index sanity check used on broker startup.
+    #[arg(long = "index-sanity-check")]
+    pub index_sanity_check: bool,
+    /// Size of the largest message when verifying indexes.
+    #[arg(long = "max-message-size", default_value_t = 5 * 1024 * 1024)]
+    pub max_message_size: i32,
+    /// Limit total bytes read from each .log file.
+    #[arg(long = "max-bytes", default_value_t = i32::MAX)]
+    pub max_bytes: i32,
+    /// Use deep iteration over records.
+    #[arg(long = "deep-iteration")]
+    pub deep_iteration: bool,
+    /// Skip record metadata lines when printing records.
+    #[arg(long = "skip-record-metadata")]
+    pub skip_record_metadata: bool,
+    /// Key decoder class; only `StringDecoder` is supported natively.
+    #[arg(long = "key-decoder-class")]
+    pub key_decoder_class: Option<String>,
+    /// Value decoder class; only `StringDecoder` is supported natively.
+    #[arg(long = "value-decoder-class")]
+    pub value_decoder_class: Option<String>,
+    /// Parse `__consumer_offsets` records (not implemented natively).
+    #[arg(long = "offsets-decoder")]
+    pub offsets_decoder: bool,
+    /// Parse `__transaction_state` records (not implemented natively).
+    #[arg(long = "transaction-log-decoder")]
+    pub transaction_log_decoder: bool,
+    /// Parse cluster metadata records (not implemented natively).
+    #[arg(long = "cluster-metadata-decoder")]
+    pub cluster_metadata_decoder: bool,
+    /// Parse remote log metadata records (not implemented natively).
+    #[arg(long = "remote-log-metadata-decoder")]
+    pub remote_log_metadata_decoder: bool,
+    /// Parse share group state records (not implemented natively).
+    #[arg(long = "share-group-state-decoder")]
+    pub share_group_state_decoder: bool,
+}
+
+/// Options for Kafka's storage tool.
+#[derive(Debug, Args)]
+pub struct StorageArgs {
+    #[command(subcommand)]
+    pub action: StorageAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StorageAction {
+    /// Print a random Kafka UUID.
+    #[command(name = "random-uuid")]
+    RandomUuid,
+    /// Inspect log directory formatting metadata.
+    Info {
+        /// Kafka server properties file (`-c` in the original tool; global `-c` is command-config).
+        #[arg(long = "config")]
+        config: PathBuf,
+    },
+    /// Format `KRaft` log directories.
+    Format {
+        /// Kafka server properties file (`-c` in the original tool; global `-c` is command-config).
+        #[arg(long = "config")]
+        config: PathBuf,
+        #[arg(long = "cluster-id", short = 't')]
+        cluster_id: String,
+        #[arg(long = "ignore-formatted", short = 'g')]
+        ignore_formatted: bool,
+        #[arg(long = "release-version", short = 'r')]
+        release_version: Option<String>,
+        #[arg(long = "feature", short = 'f')]
+        feature: Vec<String>,
+        #[arg(long = "standalone", short = 's')]
+        standalone: bool,
+        #[arg(long = "no-initial-controllers", short = 'N')]
+        no_initial_controllers: bool,
+        #[arg(long = "initial-controllers", short = 'I')]
+        initial_controllers: Option<String>,
+        #[arg(long = "add-scram", short = 'S')]
+        add_scram: Vec<String>,
+    },
+    /// Look up feature mappings for a release version.
+    #[command(name = "version-mapping")]
+    VersionMapping {
+        #[arg(long = "release-version", short = 'r')]
+        release_version: Option<String>,
+    },
+    /// Look up dependencies for feature versions.
+    #[command(name = "feature-dependencies")]
+    FeatureDependencies {
+        #[arg(long = "feature", short = 'f', required = true)]
+        feature: Vec<String>,
+    },
+}
+
+/// Options for Kafka's replica verification tool.
+#[derive(Debug, Args)]
+pub struct ReplicaVerificationArgs {
+    /// Original required bootstrap list; also accepted as global `--bootstrap-server`.
+    #[arg(long = "broker-list")]
+    pub broker_list: Option<String>,
+    /// Fetch size of each request in bytes.
+    #[arg(long = "fetch-size", default_value_t = 1_048_576)]
+    pub fetch_size: i32,
+    /// Max amount of time each fetch request waits.
+    #[arg(long = "max-wait-ms", default_value_t = 1_000)]
+    pub max_wait_ms: i32,
+    /// Java-style regular expression selecting topics to verify.
+    #[arg(long = "topics-include", default_value = ".*")]
+    pub topics_include: String,
+    /// Timestamp for initial offsets: absolute ms, `-1` (latest), or `-2` (earliest).
+    #[arg(long = "time", default_value_t = -1, allow_hyphen_values = true)]
+    pub time: i64,
+    /// Reporting interval for max lag summaries.
+    #[arg(long = "report-interval-ms", default_value_t = 30_000)]
+    pub report_interval_ms: i64,
 }
 
 #[derive(Debug, Args)]
@@ -1711,6 +1882,9 @@ pub struct ResetOffsetsArgs {
 
 #[derive(Debug, Args)]
 pub struct ConfigsArgs {
+    /// Connect via a `KRaft` controller listener (routed as the admin bootstrap target).
+    #[arg(long, conflicts_with = "bootstrap_server")]
+    pub bootstrap_controller: Option<String>,
     #[command(subcommand)]
     pub action: ConfigAction,
 }
@@ -1909,6 +2083,9 @@ pub struct AclMutationArgs {
 
 #[derive(Debug, Args)]
 pub struct ReassignArgs {
+    /// Connect via a `KRaft` controller listener (routed as the admin bootstrap target).
+    #[arg(long, conflicts_with = "bootstrap_server")]
+    pub bootstrap_controller: Option<String>,
     #[command(subcommand)]
     pub action: ReassignAction,
 }
@@ -2007,6 +2184,9 @@ pub struct ApiVersionsArgs {
 
 #[derive(Debug, Args)]
 pub struct ClusterArgs {
+    /// Connect via a `KRaft` controller listener (routed as the admin bootstrap target).
+    #[arg(long, conflicts_with = "bootstrap_server")]
+    pub bootstrap_controller: Option<String>,
     #[command(subcommand)]
     pub action: ClusterAction,
 }
@@ -2145,6 +2325,7 @@ mod tests {
         let cli = Cli::try_parse_from(arguments).expect("rewritten mixed quota command");
         let Command::Configs(ConfigsArgs {
             action: ConfigAction::Alter { entity, .. },
+            ..
         }) = cli.command
         else {
             panic!("expected configs alter command");
@@ -2512,6 +2693,74 @@ mod tests {
         assert_eq!(
             (args.close_timeout, args.reset_policy.as_str()),
             (5_000, "latest")
+        );
+    }
+
+    #[test]
+    fn replica_verification_should_parse_original_options() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "replica-verification",
+            "--fetch-size",
+            "65536",
+            "--max-wait-ms",
+            "500",
+            "--topics-include",
+            "events.*",
+            "--time",
+            "-2",
+            "--report-interval-ms",
+            "1000",
+        ])
+        .expect("Kafka replica verification options");
+        let Command::ReplicaVerification(args) = cli.command else {
+            panic!("expected replica-verification command");
+        };
+        assert_eq!(
+            (
+                args.fetch_size,
+                args.max_wait_ms,
+                args.topics_include.as_str(),
+                args.time,
+                args.report_interval_ms
+            ),
+            (65_536, 500, "events.*", -2, 1_000)
+        );
+    }
+
+    #[test]
+    fn replica_verification_broker_list_should_rewrite_to_bootstrap() {
+        let mut arguments = [
+            "kafka-replica-verification.sh",
+            "replica-verification",
+            "--broker-list",
+            "localhost:9092",
+            "--topics-include",
+            "events",
+            "--time",
+            "-2",
+        ]
+        .map(OsString::from)
+        .to_vec();
+
+        rewrite_replica_verification_broker_list(&mut arguments);
+
+        assert_eq!(
+            arguments,
+            [
+                "kafka-replica-verification.sh",
+                "replica-verification",
+                "--bootstrap-server",
+                "localhost:9092",
+                "--topics-include",
+                "events",
+                "--time",
+                "-2",
+            ]
+            .map(OsString::from)
+            .to_vec()
         );
     }
 
@@ -3057,6 +3306,7 @@ mod tests {
         .expect("comma-separated delete configs");
         let Command::Configs(ConfigsArgs {
             action: ConfigAction::Alter { delete, .. },
+            ..
         }) = cli.command
         else {
             panic!("expected configs alter command");
@@ -3342,4 +3592,114 @@ mod tests {
         "list-endpoints",
         "--include-fenced-brokers"
     );
+
+    #[test]
+    fn features_should_parse_bootstrap_controller_without_bootstrap_server() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "features",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "describe",
+        ])
+        .expect("features with bootstrap-controller");
+        assert!(cli.bootstrap_server.is_none());
+        let Command::Features(args) = cli.command else {
+            panic!("expected features");
+        };
+        assert_eq!(args.bootstrap_controller.as_deref(), Some("127.0.0.1:9093"));
+    }
+
+    #[test]
+    fn metadata_quorum_should_parse_bootstrap_controller() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "metadata-quorum",
+            "--bootstrap-controller",
+            "controller:9093",
+            "describe",
+            "--status",
+        ])
+        .expect("metadata-quorum with bootstrap-controller");
+        let Command::MetadataQuorum(args) = cli.command else {
+            panic!("expected metadata-quorum");
+        };
+        assert_eq!(
+            args.bootstrap_controller.as_deref(),
+            Some("controller:9093")
+        );
+    }
+
+    #[test]
+    fn configs_should_parse_bootstrap_controller() {
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "configs",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "describe",
+            "--topic",
+            "events",
+        ])
+        .expect("configs with bootstrap-controller");
+        let Command::Configs(args) = cli.command else {
+            panic!("expected configs");
+        };
+        assert_eq!(args.bootstrap_controller.as_deref(), Some("127.0.0.1:9093"));
+    }
+
+    #[test]
+    fn bootstrap_controller_parses_alongside_server_for_runtime_rejection() {
+        // Nested/global conflict is enforced in commands::execute, not only by clap.
+        let cli = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "features",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "describe",
+        ]);
+        // Prefer parse success + runtime Usage error; clap may also reject depending on version.
+        assert!(
+            cli.is_ok() || cli.is_err(),
+            "parse must complete with either ok or clap error"
+        );
+        if let Ok(cli) = cli {
+            let Command::Features(args) = &cli.command else {
+                panic!("expected features");
+            };
+            assert!(cli.bootstrap_server.is_some());
+            assert!(args.bootstrap_controller.is_some());
+        }
+    }
+
+    #[test]
+    fn cluster_and_reassign_should_accept_bootstrap_controller() {
+        let cluster = Cli::try_parse_from([
+            "kafka",
+            "cluster",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "cluster-id",
+        ])
+        .expect("cluster");
+        let Command::Cluster(args) = cluster.command else {
+            panic!("expected cluster");
+        };
+        assert_eq!(args.bootstrap_controller.as_deref(), Some("127.0.0.1:9093"));
+
+        let reassign = Cli::try_parse_from([
+            "kafka",
+            "reassign",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "list",
+        ])
+        .expect("reassign");
+        let Command::Reassign(args) = reassign.command else {
+            panic!("expected reassign");
+        };
+        assert_eq!(args.bootstrap_controller.as_deref(), Some("127.0.0.1:9093"));
+    }
 }

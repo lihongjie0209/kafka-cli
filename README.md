@@ -41,7 +41,7 @@ compatibility.
 ## Command coverage
 
 The binary exposes `topics`, `produce`, `producer-perf-test`, `e2e-latency`, `verifiable-producer`, `verifiable-consumer`, `consume`, `consumer-perf-test`, `share-consume`,
-`share-consumer-perf-test`, `verifiable-share-consumer`, `groups`, `all-groups`,
+`share-consumer-perf-test`, `verifiable-share-consumer`, `replica-verification`, `dump-log`, `storage`, `groups`, `all-groups`,
 `share-groups`, `streams-groups`, `streams-application-reset`, `configs`, `offsets`, `acls`, `reassign`, `delete-records`,
 `leader-election`, `log-dirs`, `api-versions`, `cluster`, `client-metrics`,
 `features`, `transactions`, `metadata-quorum`, and `delegation-tokens` command families. Run
@@ -106,6 +106,20 @@ events for assignment/revocation, consumed batches, optional record data,
 offset commits, startup, and shutdown. It supports classic and KIP-848 consumer
 group protocols, static membership, reset policy, auto commit, and the original
 `kafka-verifiable-consumer.sh` options.
+`replica-verification` fetches each replica independently, compares record-batch
+offsets and checksums up to the high watermark, and periodically reports the
+maximum lag. Its compatibility alias is `kafka-replica-verification.sh` and
+accepts the original `--broker-list` flag.
+`dump-log` dumps local Kafka `.log` / `.index` / `.timeindex` segment files,
+including batch headers, deep record iteration, and StringDecoder payloads.
+It also dumps `.txnindex` (AbortedTxn v0) and producer `.snapshot` files
+(ProducerSnapshot v1). Coordinator-specific decoders remain unsupported.
+`storage` provides KRaft `random-uuid`, `info`, and `format` (writes
+`meta.properties`; controller metadata dirs also get `__cluster_metadata-0/`
+and `kafka-cli-bootstrap.residual.json`). It never writes a non-binary file
+named `bootstrap.checkpoint` (Kafka reserves that name for BatchFileReader
+data). Full RecordsSnapshotWriter snapshots, SCRAM bootstrap records, and
+interactive metadata shell remain out of scope or partial.
 
 ## Authentication
 

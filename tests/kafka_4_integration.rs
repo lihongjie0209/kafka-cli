@@ -87,6 +87,12 @@ fn all_command_families_work_against_kafka_4_3_1() {
             "1",
         )
         .with_env_var("KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR", "1")
+        // Single-broker fixture: Kafka defaults RF=3 for the transaction state log.
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        // Keep e2e-latency on the explicit create path (prints "does not exist…").
+        .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false")
         .start()
         .expect("start Kafka 4.3.1");
     let port = broker
@@ -762,6 +768,39 @@ fn all_command_families_work_against_kafka_4_3_1() {
         .stdout(predicate::str::contains("\"name\":\"offsets_committed\""))
         .stdout(predicate::str::contains("\"success\":true"))
         .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""));
+    let kafka_binary = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .get_program()
+        .to_owned();
+    let replica_verification = ProcessCommand::new("timeout")
+        .args([
+            "15s",
+            kafka_binary.to_str().expect("kafka binary path"),
+            "--bootstrap-server",
+            &bootstrap,
+            "replica-verification",
+            "--topics-include",
+            "integration-events",
+            "--time",
+            "-2",
+            "--report-interval-ms",
+            "0",
+            "--max-wait-ms",
+            "500",
+        ])
+        .output()
+        .expect("run replica verification");
+    let replica_stdout = String::from_utf8_lossy(&replica_verification.stdout);
+    assert!(
+        replica_stdout.contains("verification process is started"),
+        "missing startup line: {replica_stdout}\nstderr: {}",
+        String::from_utf8_lossy(&replica_verification.stderr)
+    );
+    assert!(
+        replica_stdout.contains("max lag is"),
+        "missing lag report: {replica_stdout}\nstderr: {}",
+        String::from_utf8_lossy(&replica_verification.stderr)
+    );
     let consumer_performance = Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

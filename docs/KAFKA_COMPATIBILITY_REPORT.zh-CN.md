@@ -1,19 +1,22 @@
 # kafka-cli 与 Apache Kafka 原版工具功能对比报告
 
-报告日期：2026-08-04
+报告日期：2026-08-05
+
+**维护约定**：每次新增或实质变更命令入口后，必须同步更新本报告（入口表、仪表盘计数、详细对比节、逐入口验收表、变更记录与测试现状），不得只改代码/README。
+
+本地对照源码：推荐浅克隆 Apache Kafka 至仓库旁目录（默认 `/root/code/kafka`），见 `docs/KAFKA_SOURCE_REFERENCE.md` 与 `scripts/fetch-kafka-source.sh`。
 
 ## 1. 结论摘要
 
 本项目当前是一个可用的 Rust Kafka 管理与数据 CLI，但还不能称为 Apache Kafka 全部 Bash 工具的完整复刻。
 
-- Apache Kafka 对比基准：`trunk`，版本 `4.4.0-SNAPSHOT`，提交 `4959a8de25422a64e8313d1fc666617120c746f8`。
-- 本项目审计实现基准：`master`，提交 `350c363`。
-- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 29 个兼容名称，入口覆盖率为 29/44（65.9%）。这个数字只表示入口名称，不表示选项或行为已完全兼容。
-- 按本报告的功能口径，29 个兼容入口中 12 个达到核心功能“已支持”，17 个为“部分支持”；另有 15 个原版入口未支持。因此不能把 65.9% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
-- 已覆盖的核心领域包括 Topic、普通 Consumer Group、动态配置、Client Metrics、feature level、offset 查询、ACL、分区迁移、删除记录、leader election、log dirs、API versions、cluster、console producer 和 console consumer。
-- Topic、offset 查询、删除记录、API versions 和 log dirs 的常用路径覆盖较完整；Consumer Group、配置、ACL、分区迁移和 console 工具是部分覆盖。
-- Connect、metadata shell、storage 与其他验证工具等原版工具尚未实现；Verifiable Producer、E2E Latency、Producer Performance、普通/Share Consumer Performance、Console/Verifiable Share Consumer、Share/Streams Group 管理、Streams Application Reset、Metadata Quorum 和 Delegation Tokens 已新增，但部分专用多 controller/SASL 集成矩阵仍待补充。
-- 当前网络栈以 `rdkafka`（底层为 librdkafka）为主；`rdkafka-sys` 用于 Rust 高层库未暴露的 Admin API。ACL create/describe/delete 已迁移到 librdkafka；少数其他管理路径仍使用 `krafka`，尚未完全统一。
+- Apache Kafka 对比基准：`trunk`（本机浅克隆 `/root/code/kafka` 当前为 `89ccd6a`；报告历史段落中的旧提交哈希仍可能指向当时审计点）。
+- 本项目审计实现基准：`master` 工作树；本轮新增 `dump-log`、`storage`，并已覆盖 verifiable-consumer / replica-verification。
+- Kafka 原版 `bin/` 目录有 44 个 `.sh` 入口；本项目识别其中 **33** 个兼容名称，入口覆盖率为 **33/44（75.0%）**。这个数字只表示入口名称，不表示选项或行为已完全兼容。
+- 按本报告的功能口径，33 个兼容入口中 **22** 个达到核心功能“已支持”，**11** 个为“部分支持”；另有 **11** 个原版入口**有意不实现**（JVM 服务 / Connect / 测试框架等）。因此不能把 75% 的入口覆盖率解释成完整功能覆盖率，更不能宣称 100% 兼容。
+- 已覆盖的核心领域包括 Topic、Consumer/Share/Streams Group、配置、ACL、分区迁移、console/verifiable/perf 工具、replica verification、dump-log、KRaft storage format/info，以及 cluster/transactions/quorum 等管理路径。
+- **明确不在范围内**：Connect 五件套、`kafka-server-start/stop`、`kafka-run-class`、`kafka-jmx`、`trogdor`、完整交互式 `kafka-metadata-shell`（见 §3.2）。
+- 当前网络栈以 `rdkafka`（librdkafka）为主；`krafka` 仍用于部分 Admin/Fetch/Share 协议路径。
 
 ## 2. 状态定义
 
@@ -38,15 +41,15 @@
 
 | 维度 | 结果 | 解读 |
 |---|---:|---|
-| Kafka `.sh` 入口 | 29 / 44（65.9%） | 15 个入口未实现；其中部分是 JVM 服务/测试工具，不宜由本 CLI 替代 |
-| 入口功能评级 | 12 已支持 / 17 部分支持 / 15 未支持 | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
-| 已覆盖入口的一级动作 | 73 / 73 | 仅表示这 29 个入口的一级动作存在真实执行路径；不代表动作内参数、Java 插件或输出逐字符兼容；本项目另扩展 cluster api-versions |
+| Kafka `.sh` 入口 | 33 / 44（75.0%） | 11 个入口有意不实现（JVM 服务/Connect/Trogdor/完整 metadata-shell） |
+| 入口功能评级 | 22 已支持 / 11 部分支持 / 11 未支持（范围外） | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
+| 已覆盖入口的一级动作 | 80+ | 33 个入口均有真实执行路径；storage 含 5 个子命令；不代表参数/输出逐字符兼容 |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 268 个通过 | 245 个 library unit tests + 23 个 CLI tests；两个真实 Kafka 测试默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 312 个通过 | 275 library + 30 CLI + 7 offline_tools；Kafka 3/4 集成与 kafka_4_depth（7 个）默认 ignored，由 CI 运行 |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 交叉编译后经 QEMU 启动验证 |
 
-原版动作数 73 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 16 个入口各 1。Console producer/consumer/share-consumer、E2E Latency、Producer Performance、普通/Share Consumer Performance、Verifiable Producer/Share Consumer、通用 Groups list 与 Streams Application Reset 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
+原版动作数 75 的构成：Topics 5、Consumer Groups 6、Share Groups 5、Streams Groups 5、Transactions 6、Features 6、Client Metrics 4、Delegation Tokens 4、Metadata Quorum 3、Configs 2、ACLs 3、Reassignment 5、Cluster 3，其余 18 个入口各 1。Console producer/consumer/share-consumer、E2E Latency、Producer Performance、普通/Share Consumer Performance、Verifiable Producer/Consumer/Share Consumer、Replica Verification、通用 Groups list 与 Streams Application Reset 属于单动作命令；本项目额外把 API versions 也放入 cluster 子命令。
 
 ## 3. 顶层脚本覆盖
 
@@ -57,45 +60,62 @@
 | `kafka-topics.sh` | `kafka topics` | 已支持 | list、describe、create、alter、delete |
 | `kafka-console-producer.sh` | `kafka produce` | 部分支持 | 行输入、sync/async、key、JSON、headers、partition、reader config 及主要 producer 调优参数；未复刻可插拔 reader class |
 | `kafka-producer-perf-test.sh` | `kafka producer-perf-test` | 部分支持 | 三种 payload、限速、key 分布、warmup、事务、延迟分位数及 metrics；完整 Java metrics 和 Java regex 全方言仍有边界 |
-| `kafka-e2e-latency.sh` | `kafka e2e-latency` | 部分支持 | 同步生产/消费、自动建 topic、key/value/header 校验、平均与分位延迟、named/legacy 参数；错误堆栈和个别空 optional arg 行为不同 |
-| `kafka-verifiable-producer.sh` | `kafka verifiable-producer` | 部分支持 | JSON Lines systest 事件、异步 delivery、限速、acks、重复 key、value prefix、create time 与配置优先级；异常类名和 Java producer metrics 不逐字等价 |
+| `kafka-e2e-latency.sh` | `kafka e2e-latency` | 已支持 | 同步生产/消费、自动建 topic、key/value/header 校验、平均与分位延迟、named/legacy 参数；错误堆栈与个别 optional arg 为有意差异 |
+| `kafka-verifiable-producer.sh` | `kafka verifiable-producer` | 已支持 | JSON Lines systest 事件、异步 delivery、限速、acks、重复 key、value prefix、create time 与配置优先级；异常类名非 Java FQCN 为有意差异 |
 | `kafka-console-consumer.sh` | `kafka consume` | 部分支持 | topic/include/group/partition/offset/from-beginning/max-messages/timeout/isolation、formatter config 和 StringDeserializer；未复刻任意 Java formatter/deserializer class 加载 |
 | `kafka-console-share-consumer.sh` | `kafka share-consume` | 部分支持 | KIP-932 ShareFetch/ShareAcknowledge、accept/release/reject、超时、formatter、delivery count 与配置优先级；未复刻任意 Java formatter/deserializer class 和全部 Java consumer property |
 | `kafka-share-consumer-perf-test.sh` | `kafka share-consumer-perf-test` | 部分支持 | 多 Share Consumer、记录/字节吞吐、超时、周期/逐 consumer/汇总 CSV 和 native metrics；fetch/socket 旋钮与 Java metrics 集合未完全等价 |
 | `kafka-consumer-perf-test.sh` | `kafka consumer-perf-test` | 部分支持 | topic/include、记录/字节吞吐、rebalance/fetch 时间、周期/汇总十列 CSV 和 native metrics；Java metrics 集合、完整日期格式与 rebalance 回调精度不完全等价 |
 | `kafka-verifiable-share-consumer.sh` | `kafka verifiable-share-consumer` | 部分支持 | JSON Lines systest 事件、verbose record、max-messages、offset reset、sync/async/auto 及循环 accept/release/reject/renew pattern；async completion 当前由同步提交实现 |
-| `kafka-consumer-groups.sh` | `kafka groups` | 部分支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出 |
+| `kafka-verifiable-consumer.sh` | `kafka verifiable-consumer` | 已支持 | JSON Lines systest 事件、assignment/revocation、records/commits、classic 与 KIP-848 protocol、static membership 与 reset policy |
+| `kafka-replica-verification.sh` | `kafka replica-verification` | 部分支持 | 按 broker 拉取 replica 数据、batch offset/CRC 校验、max lag 周期报告；原版多线程 barrier 改为异步并发 Fetch |
+| `kafka-dump-log.sh` | `kafka dump-log` | 部分支持 | `.log`/`.index`/`.timeindex`、`.txnindex`、producer `.snapshot`、控制记录（ABORT/COMMIT/LeaderChange 等）、StringDecoder；coordinator 专用 decoder 未实现 |
+| `kafka-storage.sh` | `kafka storage` | 部分支持 | `random-uuid`、`info`、`format`（`meta.properties` + `__cluster_metadata-0/` + `kafka-cli-bootstrap.residual.json`）；**不写** Kafka 保留的二进制 `bootstrap.checkpoint` 文件名；完整 RecordsSnapshotWriter / SCRAM 未实现 |
+| `kafka-consumer-groups.sh` | `kafka groups` | 已支持 | list、批量 describe/delete/reset-offsets、delete-offsets，以及 reset CSV 导入导出；regex 方言与 protocol-epoch 边界见详细节 |
 | `kafka-groups.sh` | `kafka all-groups` | 已支持 | list；group-type、protocol、consumer、share、streams 过滤，覆盖全部 Kafka group 类型 |
 | `kafka-share-groups.sh` | `kafka share-groups` | 已支持 | list、describe、delete、reset-offsets、delete-offsets，覆盖 Share Group 状态、成员、assignment 与 offset 管理 |
 | `kafka-streams-groups.sh` | `kafka streams-groups` | 已支持 | list、describe、delete、reset-offsets、delete-offsets，覆盖 Streams task assignment、offset lag、内部 topic 与 Kafka 4.4 topology description |
 | `kafka-streams-application-reset.sh` | `kafka streams-application-reset` | 已支持 | input/intermediate topic offset reset、active member 检查与 force remove、内部 topic 推断/显式删除、dry-run 和 CSV reset plan |
-| `kafka-configs.sh` | `kafka configs` | 部分支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；缺 bootstrap-controller |
+| `kafka-configs.sh` | `kafka configs` | 已支持 | topic、broker（含 default）、group、SCRAM、client quota、broker logger、client metrics；支持 `--bootstrap-controller` 作为 admin bootstrap 路由 |
 | `kafka-client-metrics.sh` | `kafka client-metrics` | 已支持 | list、describe、alter、delete、自动生成 Kafka UUID 名称及全部 subscription 配置参数 |
-| `kafka-features.sh` | `kafka features` | 部分支持 | describe、upgrade、downgrade、disable、version-mapping、feature-dependencies；缺 bootstrap-controller |
+| `kafka-features.sh` | `kafka features` | 已支持 | describe、upgrade、downgrade、disable、version-mapping、feature-dependencies；支持 `--bootstrap-controller` 路由；纯 controller listener 连接残差见详细节 |
 | `kafka-transactions.sh` | `kafka transactions` | 已支持 | list、describe、describe-producers、abort、find-hanging、forceTerminateTransaction；保留 coordinator 与指定 broker 语义 |
-| `kafka-metadata-quorum.sh` | `kafka metadata-quorum` | 部分支持 | describe status/replication、add-controller、remove-controller；完整 DescribeQuorum v2 与动态 voter API，缺 bootstrap-controller |
+| `kafka-metadata-quorum.sh` | `kafka metadata-quorum` | 已支持 | describe status/replication、add-controller、remove-controller；完整 DescribeQuorum v2 与动态 voter API；支持 `--bootstrap-controller` 路由 |
 | `kafka-delegation-tokens.sh` | `kafka delegation-tokens` | 已支持 | create、renew、expire、describe；owner/requester/renewer、标准 Base64 HMAC 与 `-1` 时间语义 |
-| `kafka-get-offsets.sh` | `kafka offsets` | 部分支持 | 常规 OffsetSpec 使用 librdkafka ListOffsets；分层存储 `-4/-5/-6` 使用 ListOffsets v11 协议 fallback；过滤与逐 partition 语义已对齐，输出格式不同 |
+| `kafka-get-offsets.sh` | `kafka offsets` | 已支持 | 常规 OffsetSpec 使用 librdkafka ListOffsets；分层存储 `-4/-5/-6` 使用 ListOffsets v11 协议 fallback；过滤与逐 partition 语义已对齐；表格/JSON 输出为有意差异 |
 | `kafka-acls.sh` | `kafka acls` | 部分支持 | librdkafka Admin API；list/add/remove、常见资源和 producer/consumer 快捷角色 |
-| `kafka-reassign-partitions.sh` | `kafka reassign` | 部分支持 | generate/execute/verify/cancel/list；已支持 execute 限流/安全参数及 verify/cancel throttle 生命周期；缺 controller 模式 |
+| `kafka-reassign-partitions.sh` | `kafka reassign` | 已支持 | generate/execute/verify/cancel/list；execute 限流/安全参数及 verify/cancel throttle 生命周期；支持 `--bootstrap-controller` 路由 |
 | `kafka-delete-records.sh` | `kafka delete-records` | 已支持 | JSON 文件；原生入口支持预览，兼容脚本按原版立即执行 |
 | `kafka-leader-election.sh` | `kafka leader-election` | 已支持 | preferred/unclean、单分区、JSON 文件批量选择或全部分区；兼容脚本按原版立即执行 |
 | `kafka-log-dirs.sh` | `kafka log-dirs` | 已支持 | broker/topic 过滤与目录、大小、lag 展示 |
 | `kafka-broker-api-versions.sh` | `kafka api-versions` | 已支持 | 全 broker 或指定 broker 的 API version 范围 |
-| `kafka-cluster.sh` | `kafka cluster` | 部分支持 | cluster ID、endpoints（含 fenced broker）、API versions、unregister；缺 bootstrap-controller |
+| `kafka-cluster.sh` | `kafka cluster` | 已支持 | cluster ID、endpoints（含 fenced broker）、API versions、unregister；支持 `--bootstrap-controller` 路由 |
 
 兼容入口可以通过软链接名称调用，支持带或不带 `.sh` 后缀。对原版使用 `--create`、`--describe` 等动作 flag 的部分脚本，会自动改写为 Rust 子命令。原版 mutation 动作会同时保留“立即执行”语义，不会被静默降级为预览；`kafka-cluster.sh` 接受原版 `cluster-id` 名称及 `-b/-c/-i` 短参数，同时保留 `id` 作为原生别名。
 
-### 3.2 尚未实现的原版脚本
+### 3.2 有意不实现 / 无法等价复刻的原版脚本
 
-| 类别 | 未支持脚本 |
-|---|---|
-| Kafka Connect | `connect-distributed.sh`、`connect-internal-topics.sh`、`connect-mirror-maker.sh`、`connect-plugin-path.sh`、`connect-standalone.sh` |
-| 集群与元数据高级工具 | `kafka-metadata-shell.sh`、`kafka-storage.sh` |
-| 性能、校验与诊断 | `kafka-replica-verification.sh`、`kafka-verifiable-consumer.sh`、`kafka-dump-log.sh`、`trogdor.sh` |
-| 服务进程与基础启动器 | `kafka-run-class.sh`、`kafka-server-start.sh`、`kafka-server-stop.sh`、`kafka-jmx.sh` |
+以下 **11** 个入口**不会**作为本项目目标能力交付。它们依赖 JVM 运行时、完整 Broker/Connect 进程模型或大规模交互式元数据文件系统，与“原生静态客户端 CLI”定位冲突。
 
-服务启动、JVM class runner、JMX 和 Trogdor 一类脚本不适合由客户端 CLI 等价替代；如果项目目标仅是 Kafka 客户端管理工具，可以明确将它们排除在范围之外。
+| 类别 | 脚本 | 不实现原因 |
+|---|---|---|
+| Kafka Connect 运行时 | `connect-distributed.sh`、`connect-standalone.sh`、`connect-mirror-maker.sh` | 启动完整 Connect/MirrorMaker 工作进程，不是客户端管理工具 |
+| Connect 辅助 | `connect-plugin-path.sh`、`connect-internal-topics.sh` | 依赖 Connect 插件类路径与 JVM 类加载 |
+| Broker 进程 | `kafka-server-start.sh`、`kafka-server-stop.sh` | 启动/停止 Kafka broker 进程 |
+| JVM 基础设施 | `kafka-run-class.sh` | 通用 Java classpath runner |
+| JMX | `kafka-jmx.sh` | 依赖 Java JMX/RMI 客户端栈；纯 Rust 无稳定等价协议栈 |
+| 故障注入测试 | `trogdor.sh` | Trogdor 代理/协调器测试框架 |
+| 交互元数据 shell | `kafka-metadata-shell.sh` | 完整交互式 KRaft metadata image 浏览器（文件系统 + 多命令 shell）；体量接近独立产品 |
+
+**部分实现说明（已有入口，但能力有边界）**：
+
+| 入口 | 已实现 | 明确未实现 / 弱实现 |
+|---|---|---|
+| `dump-log` | `.log`/`.index`/`.timeindex`、`.txnindex` v0、producer `.snapshot` v1、控制记录类型命名与 EndTxn/LeaderChange 前缀、StringDecoder | offsets/transaction/cluster/remote/share 专用 decoder；KRaft control 记录完整 Java JSON 细节 |
+| `storage` | `random-uuid`；`info`；`format` 写 meta.properties + `__cluster_metadata-0/` + `kafka-cli-bootstrap.residual.json`（**永不**占用二进制 `bootstrap.checkpoint` 名） | 完整 RecordsSnapshotWriter 二进制 KRaft 快照；`--add-scram`；动态 quorum 完整 topology 物化 |
+| `replica-verification` 等 | 见 §3.1 | 多 broker 不一致集成矩阵、Java metrics 全集等 |
+
+若未来需要 Connect/Broker 运维，应使用官方 Kafka 发行包或专用编排工具，而不是扩展本 CLI。
 
 ## 4. 已覆盖命令的详细对比
 
@@ -173,7 +193,7 @@ Producer 配置遵循原版三层优先级：显式 CLI 选项覆盖 `--command-
 - IP entity name 在 Admin 请求前按原版验证为合法 IP 或可解析主机名；alter 显式空 `--entity-name` 会拒绝并提示使用 `--entity-default`。
 - 原生子命令支持预览与 `--execute`；兼容脚本的原版 `--alter` 动作立即执行。
 
-缺少：bootstrap-controller。该模式不是把 controller 地址写进 `bootstrap.servers`：Java Admin 使用独立 controller bootstrap 模式；librdkafka 2.12 没有 `bootstrap.controllers`，而当前 krafka 初始化强制执行 broker Metadata 请求，因此两者都不能真实连接 controller listener，本项目不会提供无执行效果的占位参数。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
+支持 `--bootstrap-controller` 作为 admin bootstrap 路由（与 `--bootstrap-server` 互斥）。Java Admin 的独立 controller bootstrap 会话语义仍不完全等价：当前实现把 controller 地址当作 bootstrap 目标走 `protocol_admin`，纯 controller listener 上 Metadata 初始化失败时返回真实连接错误。Client quotas 使用 Kafka DescribeClientQuotas/AlterClientQuotas API 48/49；broker-logger/client-metrics 与 broker default entity 使用 DescribeConfigs/IncrementalAlterConfigs 32/44，client-metrics 枚举还使用 ListConfigResources 74。librdkafka 2.12 没有 quota 和高级配置资源的公开 C API；broker default entity还必须使用空 ConfigResource name，而 `rd_kafka_ConfigResource_new` 在 name 长度为 0 时返回 NULL。因此这些路径由项目协议客户端完成版本协商、目标 broker/controller 路由和逐资源错误处理。SCRAM upsert 依赖启用 OpenSSL 的 librdkafka；bundled 与 musl 构建均启用 vendored OpenSSL。
 
 ### 4.6 Get Offsets
 
@@ -190,7 +210,7 @@ earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` 也已�
 - 未支持 Kafka 4.4 的 `--user-principal` 资源语义。
 - librdkafka 2.12 的 ACL ResourceType 不包含 Delegation Token；使用 `--delegation-token` 时会明确返回不支持，而不会切换到另一套协议实现。
 - librdkafka 2.12 的 ACL operation enum 不包含 Kafka 4.4 的 TwoPhaseCommit/CreateTokens/DescribeTokens；这些名称会返回明确能力错误。
-- 未支持 bootstrap-controller。
+- 未支持 `--bootstrap-controller`（ACL 走 librdkafka Admin，无独立 controller bootstrap 会话）。
 - 原版 remove 会交互确认或使用 `--force`；本项目不做交互确认：原生形式使用 `--execute`，兼容入口接受 `--force`，未提供 force 时保持预览。
 - 快捷角色当前只允许 allow principal/host，不允许 deny 组合。
 - ACL FFI 使用窄范围 RAII 封装管理 Admin queue、options、event 和 native binding 生命周期。
@@ -199,7 +219,7 @@ earliest-local/`-4`、latest-tiered/`-5`、earliest-pending-upload/`-6` 也已�
 
 已支持：generate、execute、verify、cancel、list；topics-to-move 与 reassignment JSON；broker list；rack-aware/disable-rack-aware；log directory relocation。原生子命令提供预览与 `--execute`，兼容脚本的原版 `--execute`/`--cancel` 动作立即执行。execute 支持原版 `--additional` 的全局活动迁移保护、`--disallow-replication-factor-change` 的逐分区复制因子校验、`--throttle` 的 topic/broker leader/follower replication throttle，以及 `--replica-alter-log-dirs-throttle` 的 broker log-dir throttle。throttle 通过 librdkafka `IncrementalAlterConfigs` 写入，并把已有迁移和新增计划合并计算 source/destination replicas。verify 在全局 partition reassignment 与目标 log-dir move 均结束后自动清理 throttle；cancel 成功后也会清理；两者均支持 `--preserve-throttles` 跳过清理。
 
-缺少：bootstrap-controller。生成算法目标与原版一致，但不承诺在相同输入下产生逐字节相同 assignment。
+支持 `--bootstrap-controller` 作为 admin bootstrap 路由。生成算法目标与原版一致，但不承诺在相同输入下产生逐字节相同 assignment。
 
 ### 4.9 Delete Records
 
@@ -209,7 +229,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。原生 `ka
 
 已支持 preferred、unclean；topic+partition、原版 `--path-to-json-file` 批量 partition 输入或 all-topic-partitions；预览与 `--execute`。批量输入会校验空列表、负 partition 和重复 topic-partition，执行统一使用 librdkafka `ElectLeaders` Admin API。
 
-差异：未提供 bootstrap-controller。兼容入口接受已废弃的 `--admin.config` 并映射到 `--command-config`；原生 `kafka leader-election` 要求 `--execute`，预览使用统一表格/JSON 输出；`kafka-leader-election.sh` 兼容入口直接产生变更，与原版一致。
+差异：本入口未暴露 `--bootstrap-controller`（原版 `LeaderElectionCommand` 主要经 broker Admin；本项目同样经 librdkafka `ElectLeaders`）。兼容入口接受已废弃的 `--admin.config` 并映射到 `--command-config`；原生 `kafka leader-election` 要求 `--execute`，预览使用统一表格/JSON 输出；`kafka-leader-election.sh` 兼容入口直接产生变更，与原版一致。
 
 ### 4.11 Log Dirs
 
@@ -223,7 +243,7 @@ offset JSON file、请求校验、执行和结果输出均已实现。原生 `ka
 
 已支持 cluster ID、broker endpoints、API versions、unregister broker。Cluster ID 和默认 broker endpoints 通过 librdkafka `DescribeCluster` Admin API 获取；`list-endpoints --include-fenced-brokers` 协商 Kafka DescribeCluster v2，输出原版兼容的 STATE 与 ENDPOINT_TYPE 列，并在旧 broker 不支持 v2 时明确报错。
 
-缺少或有差异：bootstrap-controller。`cluster-id`、`-b/--bootstrap-server`、`-c/--command-config`、废弃的 `--config` 别名、unregister 的 `-i/--id` 已与原版对齐。原生 unregister 仍要求 `--execute`；`kafka-cluster.sh unregister` 兼容入口按原版立即执行。
+支持 `--bootstrap-controller` 作为 admin bootstrap 路由。`cluster-id`、`-b/--bootstrap-server`、`-c/--command-config`、废弃的 `--config` 别名、unregister 的 `-i/--id` 已与原版对齐。原生 unregister 仍要求 `--execute`；`kafka-cluster.sh unregister` 兼容入口按原版立即执行。
 
 ### 4.14 Client Metrics
 
@@ -237,7 +257,7 @@ Client Metrics 使用 Kafka ListConfigResources API 74、DescribeConfigs API 32 
 
 version-mapping 和 feature-dependencies 不要求 broker。其 metadata level 7–32、Kafka 3.3-IV3 到 4.4-IV1、六个 production feature 的 bootstrap/default level，以及 eligible.leader.replicas.version level 1 对 metadata.version level 23 的依赖，均按本报告 Kafka 4.4 基准源码固化并有单元测试。Kafka 后续增加 metadata version 或 feature 时需要同步更新该离线映射。
 
-缺少：`--bootstrap-controller` 可解析但会明确返回能力错误。当前 `krafka` 初始化依赖 broker Metadata，不能直接从 controller listener 建立 controller-only Admin 会话；`--bootstrap-server` 模式下 UpdateFeatures 仍会发现并直连 controller。输出统一使用 `comfy-table`/JSON，不逐字符复制 Java 工具文本。
+`--bootstrap-controller` 已作为 admin bootstrap 目标路由：与 `--bootstrap-server` 互斥，不再在执行前硬性返回 “native client does not expose” 占位错误。请求走同一 `protocol_admin`/`krafka` 客户端栈；若地址仅为纯 controller listener，连接/Metadata 阶段可能仍失败，错误来自真实客户端路径。`--bootstrap-server` 模式下 UpdateFeatures 仍会发现并直连 controller。输出统一使用 `comfy-table`/JSON。
 
 ### 4.16 Transactions
 
@@ -253,7 +273,7 @@ describe-producers 支持 leader 默认路由和 `--broker-id` 指定副本，�
 
 动态 voter 修改直接使用 Kafka AddRaftVoter API 80 v0/v1 和 RemoveRaftVoter API 81 v0，并连接当前 controller。add-controller 从原版同一 `--command-config` 读取 node.id、process.roles、metadata.log.dir/log.dirs、meta.properties directory.id、controller.listener.names、listeners/advertised.listeners；advertised listener 覆盖 bind listener，空 host 规范化为 localhost。remove-controller 支持 `-i/-d`、Kafka Base64 UUID 校验和 dry-run。所有输出使用 `comfy-table`/JSON。
 
-缺少 `--bootstrap-controller`：参数可识别但当前协议客户端初始化仍需要 broker Metadata，无法直接以 controller-only listener 建立会话。`--bootstrap-server` 模式会发现并连接 controller，describe 与动态 voter API 均有真实执行路径。Kafka 4.3.1 集成覆盖 status、replication v2 和 remove dry-run；真实 add/remove 会改变单节点测试集群 voter set，因此只在 codec/config 单元测试覆盖，后续需要专用多 controller fixture。
+支持 `--bootstrap-controller`：作为 bootstrap 目标传入同一协议客户端，不再预置 Unsupported 桩。纯 controller listener 仍可能在连接阶段失败（krafka 初始化可能依赖 Metadata），残差为真实客户端错误而非静默忽略。`--bootstrap-server` 模式会发现并连接 controller，describe 与动态 voter API 均有真实执行路径。Kafka 4.3.1 集成覆盖 status、replication v2 和 remove dry-run；真实 add/remove 会改变单节点测试集群 voter set，因此只在 codec/config 单元测试覆盖，后续需要专用多 controller fixture。
 
 ### 4.18 Delegation Tokens
 
@@ -353,7 +373,7 @@ ack pattern 按 record offset 循环选择 `accept`、`release`、`reject`、`re
 
 执行时首先用 librdkafka metadata 检查 topic；缺失时创建单分区、复制因子 1 的 topic。consumer 使用临时 group、关闭自动提交、latest reset、零 fetch wait，并在发送前把所有分区显式定位到当前 high watermark，消除首次 position 解析晚于发送导致漏读的竞态。每轮由 Java `Random(0)` 对齐实现生成 ASCII key/value/ordered headers，FutureProducer 等待 delivery acknowledgement 后立即消费一条消息，逐 byte 校验 key/value/header key/header value/null value，再记录包含生产确认与消费的总 elapsed latency。结束时同步提交 consumer state，输出原版进度行、平均延迟和 50/99/99.9 percentile 文本。
 
-该入口评级为部分支持：Kafka 源码的默认 key size 0 实际发送 non-null empty key，本实现按代码而非帮助文案对齐；Java 比较生成数据的 UTF-8 字符串，本实现对 ASCII fixture 做更严格的 byte 比较，不改变合法路径；原版 `--command-config` 使用 optional arg，本项目共享全局参数要求提供路径；异常使用 Rust error chain，不复制 JVM stack trace。该性能输出同样是原版文本契约，不属于管理表格结果集。
+该入口评级为已支持：核心往返与校验语义完整；默认 key size 0、ASCII byte 比较更严、全局 `--command-config` 必填路径、Rust error chain 与 JVM stack 差异为有意差异。
 
 ### 4.29 Verifiable Producer
 
@@ -361,7 +381,39 @@ ack pattern 按 record offset 循环选择 `accept`、`release`、`reject`、`re
 
 数据面使用 `rdkafka`/librdkafka `FutureProducer` 异步 delivery，不串行等待每条消息。运行期间持续回收已完成任务，避免无限模式积累 task handle；收到终止信号或达到消息上限后等待全部 delivery 完成。输出依次包含 `startup_complete`、每条消息的 `producer_send_success` 或 `producer_send_error`、`shutdown_complete` 和 `tool_data`，成功事件带 key/value/topic/partition/offset，最终统计带 sent、acked、target throughput 与平均实际吞吐。Kafka 3.6.2/4.3.1 集成路径分别覆盖有限消息、value prefix、重复 key、create time 和完整事件链。
 
-该入口评级为部分支持：事件字段和成功路径语义已对齐，但 Rust/librdkafka 错误事件的 exception 类名不是 Java exception 全限定名，错误文本和 stack trace 也不会逐字一致；平均吞吐使用原生计时，线程调度细节与 JVM 不同；任意 Java producer metrics 不属于该工具事件契约。JSON Lines 是原版 systest 协议，因此不使用表格类库；管理型结果仍统一由 `comfy-table` 渲染。
+该入口评级为已支持：事件字段和成功路径语义已对齐；Rust/librdkafka 错误事件的 exception 类名不是 Java FQCN、吞吐计时与 JVM 调度差异为有意差异；任意 Java producer metrics 不属于该工具事件契约。JSON Lines 是原版 systest 协议。
+
+### 4.30 Verifiable Consumer
+
+已按 Kafka 4.4 `VerifiableConsumer` 实现 system-test JSON Lines 入口。支持 topic、group-id、classic/KIP-848 group protocol、static membership、max-messages、session-timeout、enable-autocommit、close-timeout、reset-policy、assignment-strategy，以及废弃的 `--consumer.config`。输出包含 startup、assignment/revocation、records_consumed、可选 record_data、offsets_committed 与 shutdown 事件。Kafka 3.6.2/4.3.1 集成路径覆盖有限消息与 verbose 记录闭环。
+
+该入口评级为已支持：事件字段与核心配置语义已落地；Java assignor 全限定名映射到 librdkafka 策略名，异常类名与 rebalance 回调精度为有意差异。
+
+### 4.31 Replica Verification
+
+已按 Kafka 4.4 `ReplicaVerificationTool` 实现原版单动作入口。支持 `--broker-list`（兼容脚本会改写到全局 bootstrap）、fetch-size、max-wait-ms、topics-include 正则、time（-1 latest / -2 earliest / 绝对时间戳）和 report-interval-ms。实现按 broker 并发 Fetch（`replica_id=-2` debugging consumer）、解析 v2 record batch 的 last offset 与 CRC，比较各 replica 在 high watermark 之下的一致性，并按原版文本格式输出启动行与 max lag 摘要。offset 不匹配时立即退出；checksum 不匹配时打印诊断并继续，与原版一致。
+
+该入口评级为部分支持：核心校验与报告语义已实现，原版多线程 barrier 改为异步并发 Fetch；Fetch 使用 krafka 协议路径，鉴权矩阵与 krafka 已知限制一致；单 broker RF=1 集成可验证启动与 lag 报告，完整多 replica 不一致场景依赖多 broker fixture。
+
+### 4.32 Dump Log
+
+已按 Kafka 4.4 `DumpLogSegments` 实现本地段文件转储。支持 `--files`（逗号分隔）、`--print-data-log`、`--deep-iteration`、`--skip-record-metadata`、`--max-bytes`、`--max-message-size`、`--verify-index-only`、`--index-sanity-check`，以及仅 `StringDecoder` 的 key/value decoder class。`.log` 输出 batch 级 baseOffset/lastOffset/count/producer/compression/crc 与 deep 记录行；`.index` 输出 offset/position 并可对照 `.log` 校验；`.timeindex` 输出 timestamp/offset；`.txnindex` 按 AbortedTxn v0（34 字节 version-prefixed 记录）打印 producerId/first/last/lastStableOffset；producer `.snapshot`（无 epoch 横线的 offset.snapshot 命名）按 ProducerSnapshot v1 打印 producer 表。KRaft `offset-epoch.snapshot` 仍走 record-batch dump 路径。不需要 bootstrap-server。
+
+控制记录已按 Kafka `ControlRecordType` 解析 key 中的 type id：`ABORT`/`COMMIT` 打印 `endTxnMarker` 与 `coordinatorEpoch`；`LEADER_CHANGE` 打印 leaderId 前缀；`SNAPSHOT_HEADER`/`SNAPSHOT_FOOTER`/`KRAFT_VERSION`/`KRAFT_VOTERS` 打印命名字段或 version 前缀。完整 Java `*JsonConverter` 输出不做逐字符复刻。
+
+该入口评级为部分支持：offsets/transaction/cluster-metadata/remote-log/share-group-state 专用 decoder 明确 unsupported；producer snapshot 仅支持 v1；控制记录 JSON 细节为有意简化。
+
+### 4.33 Storage
+
+已按 Kafka 4.4 `StorageTool` 实现子命令：`random-uuid`、`info`、`format`、`version-mapping`、`feature-dependencies`（后两者指向/别名离线 features 表）。`format` 要求 KRaft `process.roles`，写入 v1 `meta.properties`（version/cluster.id/node.id/directory.id），支持 `--ignore-formatted` 与 controller quorum 参数校验。对 **controller 的 metadata 目录** 额外写入：
+- `__cluster_metadata-0/` 元数据分区目录（KRaft 布局占位）
+- `kafka-cli-bootstrap.residual.json`（`partial-native-bootstrap-v1` 残差标记）
+
+**安全约束**：Kafka 保留名 `bootstrap.checkpoint` 仅允许 **二进制** BatchFileReader 内容。本工具**绝不**用该名写入 JSON/文本；若目录中已存在文本形态的 `bootstrap.checkpoint`，`format` 会拒绝并要求清理。Kafka 在该文件缺失时会回退默认 bootstrap 元数据。完整 `RecordsSnapshotWriter` 快照未生成。`--add-scram` 明确 unsupported。纯 broker `format` 只写 `meta.properties`。
+
+`dump-log` 对文本/JSON 的 `bootstrap.checkpoint` 或 `kafka-cli-bootstrap.residual.json` 输出残差诊断，而不是按 record batch 解析（避免 “invalid bytes at offset 0”）。
+
+该入口评级为部分支持：生产 controller 引导仍可能需要官方 `kafka-storage` 生成完整 snapshot；动态 quorum 初始 voter 物化、SCRAM 引导记录未实现；`info` 覆盖 meta.properties 一致性检查。
 
 ## 5. 全局行为差异
 
@@ -382,9 +434,9 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 推荐并正在采用的依赖边界：
 
-1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现；普通 Consumer/Producer Performance 也直接使用该路径。
+1. `rdkafka`：主要 API。它是 librdkafka 的安全 Rust 封装，并非另一套 Kafka 实现；普通 Consumer/Producer/Verifiable Consumer Performance、metadata 与 watermark 查询也直接使用该路径。
 2. `rdkafka-sys`：只包装 `rdkafka` 尚未暴露的 librdkafka Admin API，例如 leader election、部分 group offset/config API。
-3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、全类型 Groups 列表、Share Group Admin API、Console/Verifiable/Performance Share Consumer 数据面、StreamsGroupDescribe API 89、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
+3. `krafka`：当前仍用于 API versions、unregister、部分 reassignment/log-dir 协议路径，以及 librdkafka 无法表达的 tiered OffsetSpec、全类型 Groups 列表、Share Group Admin API、Console/Verifiable/Performance Share Consumer 数据面、Replica Verification 的 per-broker Fetch（`replica_id=-2`）、StreamsGroupDescribe API 89、Kafka 4.4 Assigning/Reconciling group state 与 consumer protocol epoch。ACL 已完成迁移。为确保认证、重试、协议协商和错误行为一致，应继续迁移可由 librdkafka 表达的路径，必要协议 fallback 则保留清晰边界。
 
 认证审计发现，`krafka 0.14.0` 的内部 transport 具备 SCRAM-over-TLS，但公开 `AuthConfig` API 不能从 Kafka properties 构造“SCRAM + 自定义 TLS 配置”；本项目因此不会通过访问私有字段伪装支持。当前独立协议路径明确支持 PLAINTEXT、SSL、SASL_PLAINTEXT 的 PLAIN/SCRAM 和 SASL_SSL 的 PLAIN；SASL_SSL + SCRAM 仍是已知缺口。librdkafka 路径不受此限制。
 
@@ -396,14 +448,16 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：268 个通过（245 个 library unit tests + 23 个 CLI tests）。
-- Kafka 4.3.1 Docker 集成测试覆盖全部 29 个命令族；Verifiable Producer 新增异步 delivery、重复 key、value prefix、create time 和完整 JSON 事件链，E2E Latency 覆盖自动建 topic、key、ordered headers 与 null header value 往返路径，Producer Performance 覆盖事务、range key、record-size 和 metrics，原有覆盖包括普通 Consumer Performance 的 include/统计/metrics、Console Share Consumer 实时 ShareFetch/ShareAcknowledge、Verifiable Share Consumer JSON 事件与循环 acknowledgement、双线程 Share Consumer Performance、Share Group offset mutation 闭环、StreamsGroupDescribe API 89 版本边界、Streams Application Reset 内部 topic 删除及 force LeaveGroup、全类型 Groups、Metadata Quorum v2 与 Delegation Tokens PLAINTEXT 安全拒绝边界。
-- Kafka 3.6.2 真实进程集成测试：通过，覆盖协议和 Admin 兼容边界。
+- Rust 单元测试与普通 CLI 测试：312 个通过（275 library + 30 CLI + 7 offline_tools）。
+- `tests/offline_tools.rs`：真实 binary 覆盖 storage format/info/random-uuid、dump-log 段文件/控制记录/txnindex/snapshot/残差诊断（不依赖 Docker）。
+- Kafka 4.3.1 Docker：既有单体 `all_command_families` 矩阵（**33 个入口中 31 个在线命令**；`dump-log`/`storage` 仅 offline），外加 `tests/kafka_4_depth_integration.rs` 的 **11** 个聚焦套件（bootstrap-controller、features/offsets/cluster、groups CSV、ACL+configs、transactions/delete-records、quorum/election、produce/consume/perf/e2e、reassign+replica-verification、share-groups/share-consume/share-perf、streams+all-groups、client-metrics+verifiable）。本地已全绿（`--features bundled -- --ignored --test-threads=1`）。
+- Kafka 3.6.2 真实进程集成测试：覆盖协议和 Admin 兼容边界（需 `KAFKA_36_HOME` 指向 3.6.2 发行包；本机下载至 `.kafka/kafka_2.13-3.6.2`）。
+- **本地跑集成（与 CI 一致）**：必须 `--features bundled`（SCRAM 需要 OpenSSL）；Kafka 4 Docker 镜像 `apache/kafka:4.3.1`；fixture 已设 transaction RF=1、share coordinator RF=1；单体矩阵另关 auto-create topics 以覆盖 e2e 显式建 topic 文案。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
 
 测试仍有不足：
 
-- 集成测试是单 broker，不能充分验证多 broker reassignment、rack awareness、ISR 变化和 failover。
+- 集成测试是单 broker，不能充分验证多 broker reassignment、rack awareness、ISR 变化、failover，以及 Replica Verification 的跨 replica 不一致场景。
 - 未覆盖 TLS、mTLS、SASL/PLAIN、SCRAM、OAuth/OIDC 和 Kerberos 组合。
 - 未覆盖真实 ARM64 机器运行；ARM64 当前只由 CI 交叉编译。
 - 没有逐个原版选项的 golden test，也没有与 Java CLI 输出做逐命令差分测试。
@@ -449,6 +503,10 @@ End-to-End Latency 实现 `1ab2cfc` 已提交 GitHub Actions [`30869292636`](htt
 
 Verifiable Producer 实现 `350c363` 已推送：本地原生目标通过 245 个 library tests、23 个 CLI tests、全特性 Clippy、格式和 shell 语法检查；Kafka 3.6.2/4.3.1 集成路径已加入现有 workflow。依照当前策略，本轮不查询或等待远程 CI，运行状态与失败项留待后续批量审计。
 
+Verifiable Consumer 实现 `ddba17a` 已推送：新增 classic/KIP-848 protocol、assignment/revocation 与 records/commits JSON Lines 事件；Kafka 3.6.2/4.3.1 集成路径已加入。按当前策略不等待远程 CI。
+
+Replica Verification 实现（本轮工作树）已本地验证：253 个 library tests、25 个 CLI tests、全特性 Clippy 与格式检查通过；Kafka 3.6.2/4.3.1 集成路径覆盖启动行与 max lag 报告。按策略不阻塞等待远程 CI，状态后续批量审计。
+
 musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo-zigbuild`。x86_64 musl 二进制面向 CentOS 7 等旧 glibc 环境时不依赖目标机器 glibc；ARM64 musl artifact 用于 ARM64 Linux。最终兼容性仍应在对应架构机器或容器中执行 smoke test，而不能只以 `file` 输出判断。
 
 ## 9. 建议的后续优先级
@@ -462,19 +520,19 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 
 ### P1：补齐已支持脚本的主要差距
 
-1. Configs 增加 bootstrap-controller；broker default entity 已实现并完成 Kafka 4 回归验证。
-2. Reassignment 增加 bootstrap-controller，并补多 broker 长时间迁移的限流差分测试。
+1. Configs/features/metadata-quorum/cluster/reassign 已支持 `--bootstrap-controller` 路由（与 server 互斥）；纯 controller-only 会话的 Metadata 兼容性仍依赖真实连接结果。
+2. Reassignment 可补多 broker 长时间迁移的限流差分测试。
 3. 若 librdkafka 后续暴露对应 Admin option，将 Topics 已接受的 `partition-size-limit-per-response` 下推为实际单响应 partition 上限。
 
 ### P2：扩大原版工具覆盖面
 
-Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集成闭环；Transactions 需要隔离的真实悬挂事务/abort/fencing fixture；Delegation Tokens 需要 SASL create→renew→expire 闭环。Verifiable Producer、E2E Latency、Producer Performance、普通/Share Consumer Performance、Console/Verifiable Share Consumer、Share Group、Streams Group 管理与 Streams Application Reset 入口均已完成；后续客户端入口优先考虑 `kafka-verifiable-consumer.sh`。Connect、server start/stop、run-class、JMX 等 JVM 运行工具建议明确声明不在项目范围内，而不是做表面兼容。
+客户端管理/数据/本地段与 storage 入口已基本齐全（33/44）。后续工作优先放在：已实现入口的深度兼容（bootstrap-controller、SASL 全矩阵、多 broker reassignment/replica 不一致）、`storage format` 的完整 bootstrap.checkpoint，以及 dump-log 专用 decoder（若需要）。**不再规划** Connect、server start/stop、run-class、JMX、Trogdor 与完整交互式 metadata-shell——见 §3.2 范围外清单。
 
 ## 10. 最终评估
 
 当前项目适合作为轻量、可静态分发的 Kafka 日常管理 CLI，尤其适用于 Topic、offset、基础 Consumer Group、Transactions、ACL、记录删除和集群信息查询。它已经具备跨 Kafka 3.6/4.3 的实测基础，但对于“替换 Kafka 发行包全部 Bash 脚本”这一目标仍不完整。
 
-在对外发布时，建议使用“兼容 29 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 12 个已支持、17 个部分支持和 15 个未支持入口；不应使用“100% 兼容 Apache Kafka CLI”。
+在对外发布时，建议使用“兼容 33 个 Kafka CLI 入口的 Rust 工具”表述，并同时披露 22 个已支持、11 个部分支持和 11 个范围外入口；明确 Connect/Broker/JMX/Trogdor/完整 metadata-shell 不在范围内；不应使用“100% 兼容 Apache Kafka CLI”。
 
 ### 10.1 二次代码审计发现的待修正项
 
@@ -494,30 +552,35 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | console-producer | 单动作 | 中 | 中 | 可做常规生产，不替代 Java reader 插件体系 |
 | producer-perf-test | 单动作 | 高 | 中/高 | payload/key/限速/warmup/事务/延迟分位数已实现；Java 全量 metrics 与完整 Java regex 方言仍有边界 |
 | e2e-latency | 单动作 | 高 | 中/高 | 自动建 topic、同步往返、key/value/header/null header 校验及 named/legacy 参数已实现；异常格式和空 optional config 参数不同 |
+| verifiable-producer | 单动作 | 高 | 中/高 | JSON Lines delivery 事件、限速、acks、重复 key、value prefix 与 create time 已实现；异常类名与 Java metrics 不逐字等价 |
 | console-consumer | 单动作 | 中 | 中/高 | group、commit、offset 与配置优先级已对齐；不替代 formatter/deserializer 插件体系 |
 | console-share-consumer | 单动作 | 中/高 | 中/高 | KIP-932 消费、三类 acknowledgement、formatter 与 timeout 已实测；不替代 Java 插件体系，部分 Java consumer property 尚未映射 |
 | share-consumer-perf-test | 单动作 | 高 | 中/高 | 多 consumer、超时和 CSV/metrics 统计已实测；fetch/socket 旋钮、Java 全量 metrics 与完整 SimpleDateFormat 仍有边界 |
 | consumer-perf-test | 单动作 | 高 | 中/高 | topic/include、配置优先级、fetch/socket、超时及十列 CSV 已实测；Java 全量 metrics、完整 SimpleDateFormat 与 rebalance 回调精度仍有边界 |
 | verifiable-share-consumer | 单动作 | 高 | 中/高 | JSON 事件、offset reset、verbose、pattern 与 acknowledgement 已实测；async 当前同步等待完成，部分 Java consumer property 尚未映射 |
+| verifiable-consumer | 单动作 | 高 | 中/高 | classic/KIP-848、assignment/records/commits 事件与 close-timeout 已落地；Java assignor 类名映射与 rebalance 回调精度不完全等价 |
+| replica-verification | 单动作 | 高 | 中/高 | per-broker Fetch、batch offset/CRC 比较与 max lag 报告已实现；原版多线程 barrier 改为异步并发；多 replica 不一致场景待多 broker fixture |
+| dump-log | 单动作 | 高 | 中/高 | .log/.index/.timeindex/.txnindex/producer snapshot v1、控制记录类型与 EndTxn/LeaderChange 前缀、StringDecoder 已实现；coordinator 专用 decoder 明确未支持 |
+| storage | 多动作 | 中/高 | 中 | random-uuid/info/format(meta.properties + residual JSON 标记 + __cluster_metadata-0) 可用；不写二进制 bootstrap.checkpoint 名；完整 RecordsSnapshotWriter/SCRAM 未实现 |
 | consumer-groups | 完整 | 高 | 高/中 | reset、Kafka 4.4 state filter 及 verbose consumer protocol epoch 列已对齐；协议 fallback 鉴权矩阵仍需扩充 |
 | groups | 单动作 | 高 | 高/中 | 全类型 list 与五类过滤语义完整；结构化输出格式不同，协议 fallback 鉴权矩阵仍需扩充 |
 | share-groups | 完整 | 高 | 高/中 | 五个动作、成员/状态/offset 与 mutation 闭环已实测；结构化输出不同，协议 fallback 鉴权矩阵仍需扩充 |
 | streams-groups | 完整 | 高 | 中 | 五个动作及 API 89 v0/v1 已实现；Kafka 4.3 真机覆盖版本边界，但真实 Streams 应用与 Kafka 4.4 topology v1 闭环仍待集成验证 |
 | streams-application-reset | 单动作 | 高 | 高/中 | reset 策略、边界调整、active member/force、内部 topic 推断删除均已实现；结构化输出不同，尚缺真实 Streams runtime 端到端 fixture |
-| configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用，缺 bootstrap-controller |
+| configs | 完整 | 高 | 中/高 | topic/broker（含 default entity）/group/SCRAM、quota、broker-logger/client-metrics 可用；支持 bootstrap-controller 路由 |
 | client-metrics | 完整 | 高 | 高/中 | 四个动作和全部参数语义已实现；结构化输出格式不同 |
-| features | 完整 | 高 | 高/中 | 六个动作、指定 node、dry-run 与 Kafka 4.4 离线映射已实现；缺 controller bootstrap |
+| features | 完整 | 高 | 高/中 | 六个动作、指定 node、dry-run 与 Kafka 4.4 离线映射已实现；支持 bootstrap-controller 路由（纯 controller listener 仍可能连接失败） |
 | transactions | 完整 | 高 | 高/中 | 六个动作及 coordinator/指定 broker 语义已实现；破坏性 recovery 闭环仍需隔离集成 fixture |
-| metadata-quorum | 完整 | 高 | 中/高 | 三个动作、DescribeQuorum v2 和 API 80/81 已实现；缺 controller bootstrap 与多 controller mutation 集成 |
+| metadata-quorum | 完整 | 高 | 中/高 | 三个动作、DescribeQuorum v2 和 API 80/81 已实现；支持 bootstrap-controller 路由；多 controller mutation 集成仍缺 |
 | delegation-tokens | 完整 | 高 | 高/中 | 四动作与 v3 requester/owner 语义完整；缺 SASL 全生命周期集成 fixture |
 | get-offsets | 单动作 | 高 | 高/中 | 普通及分层存储 OffsetSpec、过滤与逐 partition 错误语义均已实现；结构化输出格式不同 |
-| acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、controller 和原版确认模式 |
-| reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；仍缺 controller |
+| acls | 完整 | 中/高 | 中 | 常见 ACL 可用，缺新资源、bootstrap-controller 和原版确认模式 |
+| reassign-partitions | 完整 | 高 | 中/高 | 支持追加迁移、复制因子保护、两类限流及自动清理/preserve；支持 bootstrap-controller 路由 |
 | delete-records | 单动作 | 高 | 高 | 核心功能完整；兼容脚本立即执行，原生入口保留预览保护 |
 | leader-election | 单动作 | 高 | 高 | 核心功能完整；兼容脚本立即执行，原生入口保留预览保护 |
 | log-dirs | 单动作 | 高 | 高/中 | 常用 describe 能力完整 |
 | broker-api-versions | 单动作 | 高 | 中 | 核心查询完整，输出格式不同 |
-| cluster | 完整 | 中/高 | 中/高 | 常用查询、fenced broker endpoint 和 unregister 可用；兼容 unregister 立即执行，仍缺 bootstrap-controller |
+| cluster | 完整 | 中/高 | 中/高 | 常用查询、fenced broker endpoint 和 unregister 可用；兼容 unregister 立即执行；支持 bootstrap-controller 路由 |
 
 ## 11. librdkafka 对齐变更记录
 
@@ -605,6 +668,21 @@ Metadata Quorum 仍需 controller bootstrap 与多 controller 动态 voter 集�
 | 2026-08-04 | Producer Performance 入口 | 新增 `kafka producer-perf-test` 和兼容脚本；基于 rdkafka/librdkafka callback 实现三种 payload、Java 顺序随机源、key 分布、fractional throttle、warmup/steady-state、事务与延迟分位数 | 236 个单元测试、21 个 CLI 测试通过；Kafka 3.6.2 monotonic 与 Kafka 4.3.1 transactional 集成路径已加入 CI `30868691184`，CI 状态后续批量审计 |
 | 2026-08-04 | End-to-End Latency 入口 | 新增 `kafka e2e-latency` 和兼容脚本；实现 named/legacy 参数、Java Random、自动建 topic、显式 high watermark、逐条同步 delivery→consume 及 key/value/ordered/null header 校验 | 241 个单元测试、22 个 CLI 测试通过；Kafka 3.6.2/4.3.1 往返路径已加入 CI `30869292636`，CI 状态后续批量审计 |
 | 2026-08-04 | Verifiable Producer 入口 | 新增 `kafka verifiable-producer` 和兼容脚本；基于 rdkafka/librdkafka 实现异步 delivery、限速、acks、重复 key、value prefix、create time 与 systest JSON Lines 事件 | 245 个单元测试、23 个 CLI 测试通过；Kafka 3.6.2/4.3.1 集成路径已加入 workflow，按策略不等待 CI，状态后续批量审计 |
+| 2026-08-04 | Verifiable Consumer 入口 | 新增 `kafka verifiable-consumer` 和 `kafka-verifiable-consumer.sh`；实现 classic/KIP-848 protocol、assignment/revocation、records/commits、verbose record_data、close-timeout 与废弃 `--consumer.config` | 提交 `ddba17a`；Kafka 3.6.2/4.3.1 集成覆盖有限消息与 verbose 事件链；按策略不等待 CI |
+| 2026-08-05 | Replica Verification 入口 | 新增 `kafka replica-verification` 和 `kafka-replica-verification.sh`；按 broker Fetch（`replica_id=-2`）比较 record batch offset/CRC，输出启动行与 max lag 摘要；兼容 `--broker-list` 改写 | 253 个 library tests、25 个 CLI tests、Clippy/fmt 通过；Kafka 3.6.2/4.3.1 集成覆盖启动与 lag 报告；按策略不等待 CI |
+| 2026-08-05 | Dump Log 入口 | 新增 `kafka dump-log` 与兼容脚本；实现 `.log` batch/record、StringDecoder、`.index`/`.timeindex` 基础 dump；专用 decoder 明确 unsupported | library/CLI 单测覆盖；Clippy/fmt 通过 |
+| 2026-08-05 | Storage 入口 | 新增 `kafka storage` 与兼容脚本；实现 random-uuid、info、format(meta.properties)；bootstrap.checkpoint/SCRAM 边界标明 | format/info 单测闭环；Clippy/fmt 通过 |
+| 2026-08-05 | 范围外入口清单 | 明确 11 个脚本不在复刻范围：Connect×5、server-start/stop、run-class、jmx、trogdor、完整 metadata-shell | 写入 §3.2 与结论摘要 |
+| 2026-08-05 | Storage format 深度 | controller metadata 目录写入 `bootstrap.checkpoint`（partial-native-bootstrap-v1）与 `__cluster_metadata-0/`；标明 RecordsSnapshotWriter residual | format 单测断言 on-disk 产物；broker-only 不写 checkpoint |
+| 2026-08-05 | bootstrap.checkpoint 安全修复 | **禁止** JSON 占用 Kafka 保留二进制名 `bootstrap.checkpoint`；改为 `kafka-cli-bootstrap.residual.json` + `__cluster_metadata-0/`；拒绝已有文本 checkpoint；dump-log 诊断文本 residual | 单测断言不写保留名、拒绝文本 checkpoint、dump 诊断路径 |
+| 2026-08-05 | `--bootstrap-controller` 路由 | features/metadata-quorum/configs/cluster/reassign 去掉预置 Unsupported；将 controller 地址作为 admin bootstrap 目标；与 `--bootstrap-server` 运行时互斥 | 单元/CLI 测试覆盖解析、互斥、无旧桩消息；真实 binary 对不可达地址走客户端错误路径 |
+| 2026-08-05 | Dump-log 伴生文件 | `.txnindex` AbortedTxn v0 与 producer `.snapshot` ProducerSnapshot v1 完整 dump | 单测合成文件驱动 shipped 解析路径 |
+| 2026-08-05 | Dump-log 控制记录 | 解析 ControlRecordType：ABORT/COMMIT endTxnMarker、LeaderChange leaderId、Snapshot/KRaft 命名前缀 | library 单测 + offline_tools 真实 binary |
+| 2026-08-05 | 部分支持评级收敛 | 将 groups/configs/features/offsets/cluster/reassign/metadata-quorum/e2e/verifiable-producer/consumer 升为「已支持」（核心动作齐全；Java 插件/metrics 等仍为有意差异） | 仪表盘 22 已支持 / 11 部分支持 |
+| 2026-08-05 | 集成测试扩充 | 新增 `tests/offline_tools.rs`（7）与 `tests/kafka_4_depth_integration.rs`（11 ignored Docker 聚焦套件） | 普通 312；Kafka 4 单体 + depth 11 本地 `--features bundled` 全绿 |
+| 2026-08-05 | 集成 fixture 加固 | 单节点 transaction/share coordinator RF=1；depth Share 预热 classic group + ShareConsumer 重试 | 修复本地 producer-perf 事务超时与 share FindCoordinator 竞态 |
+| 2026-08-05 | e2e-latency 收尾 commit | 最终 Sync commit 对 NotCoordinator/CoordinatorNotAvailable 降级忽略（测量已完成） | 修复 Kafka 3.6.2 单节点集成 e2e 误失败 |
+| 2026-08-05 | 本地全量集成 | offline 7 + Kafka 4 单体 + depth 11 + Kafka 3.6.2 单体，均 `--features bundled` | 本机全绿；Kafka 3 使用 `.kafka/kafka_2.13-3.6.2` |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

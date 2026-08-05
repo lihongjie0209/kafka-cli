@@ -11,7 +11,8 @@ directory=$(dirname "$binary")
 
 for name in \
     kafka-topics kafka-console-producer kafka-producer-perf-test kafka-e2e-latency kafka-verifiable-producer kafka-verifiable-consumer kafka-console-consumer kafka-consumer-perf-test kafka-console-share-consumer \
-    kafka-share-consumer-perf-test kafka-verifiable-share-consumer \
+    kafka-share-consumer-perf-test kafka-verifiable-share-consumer kafka-replica-verification \
+    kafka-dump-log kafka-storage \
     kafka-consumer-groups kafka-groups kafka-share-groups kafka-streams-groups \
     kafka-streams-application-reset kafka-configs kafka-client-metrics \
     kafka-features kafka-transactions kafka-metadata-quorum \

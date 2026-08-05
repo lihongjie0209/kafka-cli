@@ -25,6 +25,85 @@ fn missing_bootstrap_server_should_return_usage_exit_code() {
 }
 
 #[test]
+fn features_bootstrap_controller_should_not_use_preemptive_stub() {
+    let mut command = Command::cargo_bin("kafka").expect("kafka binary");
+    let assertion = command
+        .args([
+            "features",
+            "--bootstrap-controller",
+            "127.0.0.1:1",
+            "describe",
+        ])
+        .assert()
+        .failure();
+    let output = assertion.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("native client does not expose"),
+        "must not use the old preemptive capability stub; got:\n{combined}"
+    );
+    // Live client path: connection/timeout/protocol error is acceptable.
+    assert!(
+        !combined.is_empty() || output.status.code().unwrap_or(0) != 0,
+        "expected a real client-path failure"
+    );
+}
+
+#[test]
+fn metadata_quorum_bootstrap_controller_should_not_use_preemptive_stub() {
+    let mut command = Command::cargo_bin("kafka").expect("kafka binary");
+    let assertion = command
+        .args([
+            "metadata-quorum",
+            "--bootstrap-controller",
+            "127.0.0.1:1",
+            "describe",
+            "--status",
+        ])
+        .assert()
+        .failure();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&assertion.get_output().stdout),
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+    );
+    assert!(
+        !combined.contains("native client does not expose"),
+        "must not use the old preemptive capability stub; got:\n{combined}"
+    );
+}
+
+#[test]
+fn bootstrap_controller_conflicts_with_bootstrap_server_on_cli() {
+    let mut command = Command::cargo_bin("kafka").expect("kafka binary");
+    let assertion = command
+        .args([
+            "--bootstrap-server",
+            "localhost:9092",
+            "features",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "describe",
+        ])
+        .assert()
+        .failure();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&assertion.get_output().stdout),
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+    );
+    assert!(
+        combined.contains("cannot use both --bootstrap-server and --bootstrap-controller")
+            || combined.contains("cannot be used with"),
+        "expected mutual exclusion error; got:\n{combined}"
+    );
+}
+
+#[test]
 fn group_regex_validation_should_not_require_a_broker() {
     let mut command = Command::cargo_bin("kafka").expect("kafka binary");
     command
@@ -404,6 +483,79 @@ fn kafka_verifiable_consumer_alias_should_accept_original_options() {
         .success()
         .stdout(predicate::str::contains("--assignment-strategy"))
         .stdout(predicate::str::contains("--consumer.config"));
+}
+
+#[cfg(unix)]
+#[test]
+fn kafka_dump_log_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-dump-log.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create dump-log alias");
+
+    Command::new(alias)
+        .args([
+            "--files",
+            "/tmp/00000000000000000000.log",
+            "--print-data-log",
+            "--deep-iteration",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--max-message-size"))
+        .stdout(predicate::str::contains("--skip-record-metadata"));
+}
+
+#[cfg(unix)]
+#[test]
+fn kafka_storage_alias_should_accept_original_subcommands() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-storage.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create storage alias");
+
+    Command::new(alias)
+        .args(["random-uuid", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("random-uuid"));
+
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["storage", "random-uuid"])
+        .assert()
+        .success();
+}
+
+#[cfg(unix)]
+#[test]
+fn kafka_replica_verification_alias_should_accept_original_options() {
+    let binary_command = Command::cargo_bin("kafka").expect("kafka binary");
+    let binary = std::path::PathBuf::from(binary_command.get_program());
+    let directory = tempfile::TempDir::new().expect("alias directory");
+    let alias = directory.path().join("kafka-replica-verification.sh");
+    std::os::unix::fs::symlink(binary, &alias).expect("create replica verification alias");
+
+    Command::new(alias)
+        .args([
+            "--broker-list",
+            "localhost:9092",
+            "--topics-include",
+            "events.*",
+            "--time",
+            "-2",
+            "--report-interval-ms",
+            "1000",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--fetch-size"))
+        .stdout(predicate::str::contains("--max-wait-ms"))
+        .stdout(predicate::str::contains("--topics-include"));
 }
 
 #[cfg(unix)]

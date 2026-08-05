@@ -259,6 +259,39 @@ fn protocol_and_admin_commands_work_against_kafka_3_6_2() {
         .stdout(predicate::str::contains("\"name\":\"offsets_committed\""))
         .stdout(predicate::str::contains("\"success\":true"))
         .stdout(predicate::str::contains("\"name\":\"shutdown_complete\""));
+    let kafka_binary = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .get_program()
+        .to_owned();
+    let replica_verification = ProcessCommand::new("timeout")
+        .args([
+            "15s",
+            kafka_binary.to_str().expect("kafka binary path"),
+            "--bootstrap-server",
+            &bootstrap,
+            "replica-verification",
+            "--topics-include",
+            "kafka-36-events",
+            "--time",
+            "-2",
+            "--report-interval-ms",
+            "0",
+            "--max-wait-ms",
+            "500",
+        ])
+        .output()
+        .expect("run replica verification");
+    let replica_stdout = String::from_utf8_lossy(&replica_verification.stdout);
+    assert!(
+        replica_stdout.contains("verification process is started"),
+        "missing startup line: {replica_stdout}\nstderr: {}",
+        String::from_utf8_lossy(&replica_verification.stderr)
+    );
+    assert!(
+        replica_stdout.contains("max lag is"),
+        "missing lag report: {replica_stdout}\nstderr: {}",
+        String::from_utf8_lossy(&replica_verification.stderr)
+    );
     Command::cargo_bin("kafka")
         .expect("kafka binary")
         .args([

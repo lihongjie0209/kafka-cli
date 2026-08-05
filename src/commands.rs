@@ -1,7 +1,7 @@
 //! Kafka command implementations.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{self, Write},
     net::ToSocketAddrs,
@@ -18,7 +18,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{
     DateTime, Local, NaiveDateTime, Utc,
     format::{Item, StrftimeItems},
@@ -60,11 +60,12 @@ use crate::{
         ConfigAction, ConfigEntityArgs, ConfigEntityType, ConsumerGroupProtocol,
         ConsumerPerfTestArgs, DelegationTokenAction, DescribeTopicArgs, E2eLatencyArgs,
         ElectionType, FeatureAction, GroupAction, ListTopicArgs, MetadataQuorumAction, OffsetTime,
-        ProducerKeyDistribution, ProducerPerfTestArgs, ReassignAction, ResetOffsetsArgs,
-        ShareConsumeArgs, ShareConsumerPerfTestArgs, ShareGroupAction, ShareGroupResetOffsetsArgs,
-        StreamsApplicationResetArgs, StreamsGroupAction, StreamsGroupResetOffsetsArgs, TopicAction,
-        TransactionAction, VerifiableAcknowledgementMode, VerifiableConsumerArgs,
-        VerifiableProducerArgs, VerifiableShareConsumerArgs,
+        ProducerKeyDistribution, ProducerPerfTestArgs, ReassignAction, ReplicaVerificationArgs,
+        ResetOffsetsArgs, ShareConsumeArgs, ShareConsumerPerfTestArgs, ShareGroupAction,
+        ShareGroupResetOffsetsArgs, StreamsApplicationResetArgs, StreamsGroupAction,
+        StreamsGroupResetOffsetsArgs, TopicAction, TransactionAction,
+        VerifiableAcknowledgementMode, VerifiableConsumerArgs, VerifiableProducerArgs,
+        VerifiableShareConsumerArgs,
     },
     config,
     error::{Error, Result},
@@ -119,34 +120,106 @@ pub async fn execute(cli: Cli) -> Result<()> {
     {
         return features_local(cli.output, &args.action);
     }
-    if let Command::MetadataQuorum(args) = &cli.command
-        && args.bootstrap_controller.is_some()
-    {
-        return Err(Error::Unsupported(
-            "--bootstrap-controller requires controller-listener bootstrap, which the current native client does not expose"
-                .into(),
-        ));
+    if let Command::DumpLog(args) = &cli.command {
+        return crate::dump_log::dump_log_segments(&crate::dump_log::DumpLogOptions {
+            files: args.files.clone(),
+            print_data_log: args.print_data_log,
+            verify_index_only: args.verify_index_only,
+            index_sanity_check: args.index_sanity_check,
+            max_message_size: args.max_message_size,
+            max_bytes: args.max_bytes,
+            deep_iteration: args.deep_iteration,
+            skip_record_metadata: args.skip_record_metadata,
+            key_decoder: args.key_decoder_class.clone(),
+            value_decoder: args.value_decoder_class.clone(),
+            offsets_decoder: args.offsets_decoder,
+            transaction_log_decoder: args.transaction_log_decoder,
+            cluster_metadata_decoder: args.cluster_metadata_decoder,
+            remote_log_metadata_decoder: args.remote_log_metadata_decoder,
+            share_group_state_decoder: args.share_group_state_decoder,
+        });
     }
-    if let Command::Features(args) = &cli.command
-        && args.bootstrap_controller.is_some()
-    {
-        return Err(Error::Unsupported(
-            "--bootstrap-controller requires controller-listener bootstrap, which the current native client does not expose"
-                .into(),
-        ));
+    if let Command::Storage(args) = &cli.command {
+        return crate::storage_tool::storage(match &args.action {
+            crate::cli::StorageAction::RandomUuid => crate::storage_tool::StorageAction::RandomUuid,
+            crate::cli::StorageAction::Info { config } => {
+                crate::storage_tool::StorageAction::Info {
+                    config: config.clone(),
+                }
+            }
+            crate::cli::StorageAction::Format {
+                config,
+                cluster_id,
+                ignore_formatted,
+                release_version,
+                feature,
+                standalone,
+                no_initial_controllers,
+                initial_controllers,
+                add_scram,
+            } => crate::storage_tool::StorageAction::Format {
+                config: config.clone(),
+                cluster_id: cluster_id.clone(),
+                ignore_formatted: *ignore_formatted,
+                release_version: release_version.clone(),
+                feature: feature.clone(),
+                standalone: *standalone,
+                no_initial_controllers: *no_initial_controllers,
+                initial_controllers: initial_controllers.clone(),
+                add_scram: add_scram.clone(),
+            },
+            crate::cli::StorageAction::VersionMapping { release_version } => {
+                crate::storage_tool::StorageAction::VersionMapping {
+                    release_version: release_version.clone(),
+                }
+            }
+            crate::cli::StorageAction::FeatureDependencies { feature } => {
+                crate::storage_tool::StorageAction::FeatureDependencies {
+                    feature: feature.clone(),
+                }
+            }
+        });
     }
     let is_streams_application_reset = matches!(&cli.command, Command::StreamsApplicationReset(_));
     let allows_property_bootstrap = matches!(&cli.command, Command::ProducerPerfTest(_));
+    let replica_broker_list = match &cli.command {
+        Command::ReplicaVerification(args) => args.broker_list.clone(),
+        _ => None,
+    };
+    // When only the controller flag is set, route it as the admin bootstrap target.
+    // Mutual exclusion is enforced here because clap does not always surface
+    // conflicts between global --bootstrap-server and nested --bootstrap-controller.
+    let bootstrap_controller = command_bootstrap_controller(&cli.command).map(str::to_owned);
+    if cli.bootstrap_server.is_some() && bootstrap_controller.is_some() {
+        return Err(Error::Usage(
+            "cannot use both --bootstrap-server and --bootstrap-controller".into(),
+        ));
+    }
+    let supports_controller_bootstrap = bootstrap_controller.is_some()
+        || matches!(
+            &cli.command,
+            Command::Features(_)
+                | Command::MetadataQuorum(_)
+                | Command::Configs(_)
+                | Command::Cluster(_)
+                | Command::Reassign(_)
+        );
     let bootstrap = cli
         .bootstrap_server
         .as_deref()
+        .or(bootstrap_controller.as_deref())
+        .or(replica_broker_list.as_deref())
         .or_else(|| is_streams_application_reset.then_some("localhost:9092"))
         .or_else(|| allows_property_bootstrap.then_some(""))
         .ok_or_else(|| {
-            Error::Usage(
-                "--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into(),
-            )
-        })?;
+            Error::Usage(if supports_controller_bootstrap {
+                "--bootstrap-server or --bootstrap-controller is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into()
+            } else {
+                "--bootstrap-server is required (or set KAFKA_CLI_BOOTSTRAP_SERVER)".into()
+            })
+        })?
+        .to_owned();
+    let bootstrap = bootstrap.as_str();
     let command_config = match &cli.command {
         Command::StreamsApplicationReset(args) => {
             args.config_file.as_ref().or(cli.command_config.as_ref())
@@ -206,6 +279,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 command_config.as_deref(),
                 timeout,
                 verbose,
+                args,
+            ))
+            .await
+        }
+        Command::ReplicaVerification(args) => {
+            Box::pin(replica_verification(
+                bootstrap,
+                command_config.as_deref(),
+                timeout,
                 args,
             ))
             .await
@@ -405,6 +487,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
             )
             .await
         }
+        // Handled earlier without a broker bootstrap.
+        Command::DumpLog(_) | Command::Storage(_) => unreachable!("local-only commands"),
     }
 }
 
@@ -414,6 +498,37 @@ fn admin(config: &rdkafka::ClientConfig) -> Result<Admin> {
 
 fn base_consumer(config: &rdkafka::ClientConfig) -> Result<BaseConsumer> {
     Ok(config.create()?)
+}
+
+/// Returns `--bootstrap-controller` from commands that accept controller bootstrap.
+fn command_bootstrap_controller(command: &Command) -> Option<&str> {
+    match command {
+        Command::Features(args) => args.bootstrap_controller.as_deref(),
+        Command::MetadataQuorum(args) => args.bootstrap_controller.as_deref(),
+        Command::Configs(args) => args.bootstrap_controller.as_deref(),
+        Command::Cluster(args) => args.bootstrap_controller.as_deref(),
+        Command::Reassign(args) => args.bootstrap_controller.as_deref(),
+        _ => None,
+    }
+}
+
+/// Resolves the bootstrap address used for admin/protocol clients.
+///
+/// `--bootstrap-controller` is treated as an alternate bootstrap target (not a
+/// silent no-op). Clap enforces mutual exclusion with `--bootstrap-server`.
+#[cfg(test)]
+fn resolve_bootstrap_for_test(
+    bootstrap_server: Option<&str>,
+    bootstrap_controller: Option<&str>,
+) -> std::result::Result<String, String> {
+    match (bootstrap_server, bootstrap_controller) {
+        (Some(_), Some(_)) => {
+            Err("cannot use both --bootstrap-server and --bootstrap-controller".into())
+        }
+        (Some(server), None) => Ok(server.to_owned()),
+        (None, Some(controller)) => Ok(controller.to_owned()),
+        (None, None) => Err("--bootstrap-server or --bootstrap-controller is required".into()),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1342,7 +1457,15 @@ async fn e2e_latency(
         e2e_percentile(&latencies, 99, 100),
         e2e_percentile(&latencies, 999, 1_000)
     );
-    consumer.commit_consumer_state(CommitMode::Sync)?;
+    // Assigned partitions do not require a successful group commit for latency output.
+    // Fresh single-node brokers can return NotCoordinator during the final commit while
+    // the group coordinator is still electing; do not fail the measurement for that.
+    if let Err(error) = consumer.commit_consumer_state(CommitMode::Sync) {
+        let message = error.to_string();
+        if !(message.contains("NotCoordinator") || message.contains("CoordinatorNotAvailable")) {
+            return Err(Error::Kafka(error));
+        }
+    }
     Ok(())
 }
 
@@ -1859,6 +1982,696 @@ async fn verifiable_consumer(
         });
     }
     Ok(())
+}
+
+/// Kafka Fetch `replica_id` used by the original `ReplicaVerificationTool`.
+const DEBUGGING_CONSUMER_ID: i32 = -2;
+const LIST_OFFSETS_LATEST: i64 = -1;
+const LIST_OFFSETS_EARLIEST: i64 = -2;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+struct TopicPartitionKey {
+    topic: String,
+    partition: i32,
+}
+
+impl TopicPartitionKey {
+    fn new(topic: impl Into<String>, partition: i32) -> Self {
+        Self {
+            topic: topic.into(),
+            partition,
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("{}-{}", self.topic, self.partition)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReplicaPartitionData {
+    high_watermark: i64,
+    records: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BatchMessageInfo {
+    replica_id: i32,
+    last_offset: i64,
+    next_offset: i64,
+    checksum: u32,
+}
+
+struct ReplicaBuffer {
+    expected_replicas: HashMap<TopicPartitionKey, usize>,
+    fetch_offsets: HashMap<TopicPartitionKey, i64>,
+    records_cache: HashMap<TopicPartitionKey, HashMap<i32, ReplicaPartitionData>>,
+    report_interval: Duration,
+    last_report_time: Instant,
+    max_lag: i64,
+    offset_with_max_lag: i64,
+    max_lag_partition: Option<TopicPartitionKey>,
+}
+
+impl ReplicaBuffer {
+    fn new(
+        expected_replicas: HashMap<TopicPartitionKey, usize>,
+        initial_offsets: HashMap<TopicPartitionKey, i64>,
+        report_interval_ms: i64,
+    ) -> Self {
+        let records_cache = expected_replicas
+            .keys()
+            .cloned()
+            .map(|key| (key, HashMap::new()))
+            .collect();
+        Self {
+            expected_replicas,
+            fetch_offsets: initial_offsets,
+            records_cache,
+            report_interval: Duration::from_millis(
+                u64::try_from(report_interval_ms.max(0)).unwrap_or(0),
+            ),
+            last_report_time: Instant::now(),
+            max_lag: -1,
+            offset_with_max_lag: -1,
+            max_lag_partition: None,
+        }
+    }
+
+    fn add_fetched_data(
+        &mut self,
+        key: TopicPartitionKey,
+        replica_id: i32,
+        data: ReplicaPartitionData,
+    ) {
+        self.records_cache
+            .entry(key)
+            .or_default()
+            .insert(replica_id, data);
+    }
+
+    fn offset(&self, key: &TopicPartitionKey) -> i64 {
+        self.fetch_offsets.get(key).copied().unwrap_or(0)
+    }
+
+    fn verify_checksum(&mut self, println: &mut dyn FnMut(String)) -> Result<()> {
+        self.max_lag = -1;
+        self.offset_with_max_lag = -1;
+        self.max_lag_partition = None;
+
+        let partitions = self.records_cache.keys().cloned().collect::<Vec<_>>();
+        for key in partitions {
+            self.verify_partition(&key, println)?;
+        }
+        self.maybe_report_max_lag(println);
+        Ok(())
+    }
+
+    fn maybe_report_max_lag(&mut self, println: &mut dyn FnMut(String)) {
+        if self.last_report_time.elapsed() <= self.report_interval {
+            return;
+        }
+        let partition = self
+            .max_lag_partition
+            .as_ref()
+            .map_or_else(|| "null".into(), TopicPartitionKey::label);
+        println(format!(
+            "{}: max lag is {} for partition {} at offset {} among {} partitions",
+            replica_verification_timestamp(),
+            self.max_lag,
+            partition,
+            self.offset_with_max_lag,
+            self.records_cache.len()
+        ));
+        self.last_report_time = Instant::now();
+    }
+
+    fn verify_partition(
+        &mut self,
+        key: &TopicPartitionKey,
+        println: &mut dyn FnMut(String),
+    ) -> Result<()> {
+        let expected = self.expected_replicas.get(key).copied().unwrap_or_default();
+        let Some(fetch_response) = self.records_cache.get(key) else {
+            return Ok(());
+        };
+        if fetch_response.len() != expected {
+            return Err(Error::Config(format!(
+                "fetched {} replicas for {}, but expected {expected} replicas",
+                fetch_response.len(),
+                key.label()
+            )));
+        }
+
+        let mut batch_iters = HashMap::new();
+        for (&replica_id, partition_data) in fetch_response {
+            batch_iters.insert(replica_id, parse_record_batches(&partition_data.records)?);
+        }
+        let max_hw = fetch_response
+            .values()
+            .map(|data| data.high_watermark)
+            .max()
+            .unwrap_or(-1);
+        let high_watermarks = fetch_response
+            .iter()
+            .map(|(&replica_id, data)| (replica_id, data.high_watermark))
+            .collect::<HashMap<_, _>>();
+
+        let mut cursors = batch_iters
+            .into_iter()
+            .map(|(replica_id, batches)| (replica_id, 0_usize, batches))
+            .collect::<Vec<_>>();
+        while let Some(next_offset) =
+            advance_matching_batches(key, &mut cursors, &high_watermarks, println)
+        {
+            self.fetch_offsets.insert(key.clone(), next_offset);
+        }
+
+        let verified_offset = self.offset(key);
+        if max_hw - verified_offset > self.max_lag {
+            self.offset_with_max_lag = verified_offset;
+            self.max_lag = max_hw - verified_offset;
+            self.max_lag_partition = Some(key.clone());
+        }
+        if let Some(cache) = self.records_cache.get_mut(key) {
+            cache.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Compares one batch across all replicas. Returns the next fetch offset when
+/// every replica still had a matching batch below its high watermark.
+fn advance_matching_batches(
+    key: &TopicPartitionKey,
+    cursors: &mut [(i32, usize, Vec<ParsedBatch>)],
+    high_watermarks: &HashMap<i32, i64>,
+    println: &mut dyn FnMut(String),
+) -> Option<i64> {
+    let mut first_message: Option<BatchMessageInfo> = None;
+    for (replica_id, index, batches) in cursors.iter_mut() {
+        let batch = batches.get(*index).copied()?;
+        let high_watermark = high_watermarks.get(replica_id).copied().unwrap_or(-1);
+        if batch.last_offset >= high_watermark {
+            return None;
+        }
+        if let Some(first) = first_message {
+            if first.last_offset != batch.last_offset {
+                println(format!(
+                    "{}: partition {}: replica {}'s offset {} doesn't match replica {}'s offset {}",
+                    replica_verification_timestamp(),
+                    key.label(),
+                    first.replica_id,
+                    first.last_offset,
+                    replica_id,
+                    batch.last_offset
+                ));
+                process::exit(1);
+            }
+            if first.checksum != batch.checksum {
+                println(format!(
+                    "{}: partition {} has unmatched checksum at offset {}; replica {}'s checksum {}; replica {}'s checksum {}",
+                    replica_verification_timestamp(),
+                    key.label(),
+                    batch.last_offset,
+                    first.replica_id,
+                    first.checksum,
+                    replica_id,
+                    batch.checksum
+                ));
+            }
+        } else {
+            first_message = Some(BatchMessageInfo {
+                replica_id: *replica_id,
+                last_offset: batch.last_offset,
+                next_offset: batch.next_offset,
+                checksum: batch.checksum,
+            });
+        }
+        *index = index.saturating_add(1);
+    }
+    first_message.map(|message| message.next_offset)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedBatch {
+    last_offset: i64,
+    next_offset: i64,
+    checksum: u32,
+}
+
+fn parse_record_batches(records: &[u8]) -> Result<Vec<ParsedBatch>> {
+    let mut batches = Vec::new();
+    let mut offset = 0;
+    while offset + 61 <= records.len() {
+        let base_offset = i64::from_be_bytes(
+            records[offset..offset + 8]
+                .try_into()
+                .map_err(|_| Error::Config("truncated record batch base offset".into()))?,
+        );
+        let batch_length = i32::from_be_bytes(
+            records[offset + 8..offset + 12]
+                .try_into()
+                .map_err(|_| Error::Config("truncated record batch length".into()))?,
+        );
+        if batch_length < 49 {
+            return Err(Error::Config(format!(
+                "invalid record batch length: {batch_length}"
+            )));
+        }
+        let total_size = 12 + usize::try_from(batch_length).unwrap_or(usize::MAX);
+        if offset + total_size > records.len() {
+            break;
+        }
+        let magic = records[offset + 16];
+        if magic != 2 {
+            return Err(Error::Unsupported(format!(
+                "unsupported record batch magic: {magic}"
+            )));
+        }
+        let checksum = u32::from_be_bytes(
+            records[offset + 17..offset + 21]
+                .try_into()
+                .map_err(|_| Error::Config("truncated record batch checksum".into()))?,
+        );
+        let last_offset_delta = i32::from_be_bytes(
+            records[offset + 23..offset + 27]
+                .try_into()
+                .map_err(|_| Error::Config("truncated record batch last offset delta".into()))?,
+        );
+        let last_offset = base_offset + i64::from(last_offset_delta);
+        batches.push(ParsedBatch {
+            last_offset,
+            next_offset: last_offset + 1,
+            checksum,
+        });
+        offset += total_size;
+    }
+    Ok(batches)
+}
+
+fn replica_verification_timestamp() -> String {
+    let now = Local::now();
+    format!(
+        "{},{:03}",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.timestamp_subsec_millis()
+    )
+}
+
+fn validate_bootstrap_list(bootstrap: &str) -> Result<()> {
+    if bootstrap.trim().is_empty() {
+        return Err(Error::Usage(
+            "bootstrap server list must not be empty".into(),
+        ));
+    }
+    for server in bootstrap.split(',') {
+        let server = server.trim();
+        if server.is_empty() {
+            return Err(Error::Usage(
+                "bootstrap server list contains an empty entry".into(),
+            ));
+        }
+        let Some((host, port)) = server.rsplit_once(':') else {
+            return Err(Error::Usage(format!(
+                "bootstrap server '{server}' must be host:port"
+            )));
+        };
+        if host.is_empty() {
+            return Err(Error::Usage(format!(
+                "bootstrap server '{server}' is missing a host"
+            )));
+        }
+        if port.parse::<u16>().is_err() {
+            return Err(Error::Usage(format!(
+                "bootstrap server '{server}' has an invalid port"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_replica_verification_args(
+    bootstrap: &str,
+    args: &ReplicaVerificationArgs,
+) -> Result<()> {
+    if args.fetch_size <= 0 {
+        return Err(Error::Usage("--fetch-size must be positive".into()));
+    }
+    if args.max_wait_ms < 0 {
+        return Err(Error::Usage("--max-wait-ms must not be negative".into()));
+    }
+    if args.report_interval_ms < 0 {
+        return Err(Error::Usage(
+            "--report-interval-ms must not be negative".into(),
+        ));
+    }
+    validate_bootstrap_list(bootstrap)
+}
+
+struct ReplicaVerificationPlan {
+    brokers: HashMap<i32, String>,
+    expected_replicas: HashMap<TopicPartitionKey, usize>,
+    broker_partitions: HashMap<i32, Vec<TopicPartitionKey>>,
+    topic_partitions: Vec<TopicPartitionKey>,
+}
+
+fn build_replica_verification_plan(
+    metadata: &rdkafka::metadata::Metadata,
+    topics_include: &str,
+) -> Result<ReplicaVerificationPlan> {
+    let topic_filter = Regex::new(topics_include)
+        .map_err(|error| Error::Usage(format!("{topics_include} is an invalid regex: {error}")))?;
+    let brokers = metadata
+        .brokers()
+        .iter()
+        .map(|broker| (broker.id(), format!("{}:{}", broker.host(), broker.port())))
+        .collect::<HashMap<_, _>>();
+    if brokers.is_empty() {
+        return Err(Error::Config("no brokers found in cluster metadata".into()));
+    }
+
+    let mut expected_replicas = HashMap::new();
+    let mut broker_partitions: HashMap<i32, Vec<TopicPartitionKey>> = HashMap::new();
+    let mut topic_partitions = Vec::new();
+    for topic in metadata.topics() {
+        if !topic_filter.is_match(topic.name()) {
+            continue;
+        }
+        if let Some(error) = topic.error() {
+            return Err(Error::Config(format!(
+                "topic {} metadata error: {error:?}",
+                topic.name()
+            )));
+        }
+        for partition in topic.partitions() {
+            if let Some(error) = partition.error() {
+                return Err(Error::Config(format!(
+                    "partition {}-{} metadata error: {error:?}",
+                    topic.name(),
+                    partition.id()
+                )));
+            }
+            let key = TopicPartitionKey::new(topic.name(), partition.id());
+            let replicas = partition.replicas();
+            if replicas.is_empty() {
+                continue;
+            }
+            expected_replicas.insert(key.clone(), replicas.len());
+            topic_partitions.push(key.clone());
+            for &replica_id in replicas {
+                broker_partitions
+                    .entry(replica_id)
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+    }
+    if expected_replicas.is_empty() {
+        return Err(Error::Usage(format!(
+            "No topics found. --topics-include {topics_include}, if specified, is either filtering out all topics or there is no topic."
+        )));
+    }
+    Ok(ReplicaVerificationPlan {
+        brokers,
+        expected_replicas,
+        broker_partitions,
+        topic_partitions,
+    })
+}
+
+async fn replica_verification(
+    bootstrap: &str,
+    command_config: Option<&Path>,
+    timeout: Duration,
+    args: ReplicaVerificationArgs,
+) -> Result<()> {
+    eprintln!("This tool is deprecated and may be removed in a future major release.");
+    validate_replica_verification_args(bootstrap, &args)?;
+
+    let client_config = config::client_config(bootstrap, command_config)?;
+    let consumer = base_consumer(&client_config)?;
+    let metadata = consumer.fetch_metadata(None, timeout)?;
+    let plan = build_replica_verification_plan(&metadata, &args.topics_include)?;
+    let initial_offsets =
+        replica_initial_offsets(&consumer, &plan.topic_partitions, args.time, timeout)?;
+    drop(consumer);
+    let mut buffer = ReplicaBuffer::new(
+        plan.expected_replicas,
+        initial_offsets,
+        args.report_interval_ms,
+    );
+    let client = config::protocol_admin(bootstrap, timeout, command_config).await?;
+
+    println!(
+        "{}: verification process is started",
+        replica_verification_timestamp()
+    );
+
+    run_replica_verification_loop(
+        &client,
+        &plan.brokers,
+        &plan.broker_partitions,
+        &mut buffer,
+        args.fetch_size,
+        args.max_wait_ms,
+    )
+    .await
+}
+
+async fn run_replica_verification_loop(
+    client: &krafka::admin::AdminClient,
+    brokers: &HashMap<i32, String>,
+    broker_partitions: &HashMap<i32, Vec<TopicPartitionKey>>,
+    buffer: &mut ReplicaBuffer,
+    fetch_size: i32,
+    max_wait_ms: i32,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Stopping all fetchers");
+                break;
+            }
+            result = replica_verification_round(
+                client,
+                brokers,
+                broker_partitions,
+                buffer,
+                fetch_size,
+                max_wait_ms,
+            ) => {
+                result?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replica_initial_offsets(
+    consumer: &BaseConsumer,
+    partitions: &[TopicPartitionKey],
+    time: i64,
+    timeout: Duration,
+) -> Result<HashMap<TopicPartitionKey, i64>> {
+    let mut offsets = HashMap::with_capacity(partitions.len());
+    match time {
+        LIST_OFFSETS_LATEST => {
+            for key in partitions {
+                let (_low, high) = consumer.fetch_watermarks(&key.topic, key.partition, timeout)?;
+                offsets.insert(key.clone(), high);
+            }
+        }
+        LIST_OFFSETS_EARLIEST => {
+            for key in partitions {
+                let (low, _high) = consumer.fetch_watermarks(&key.topic, key.partition, timeout)?;
+                offsets.insert(key.clone(), low);
+            }
+        }
+        timestamp if timestamp >= 0 => {
+            let mut tpl = TopicPartitionList::with_capacity(partitions.len());
+            for key in partitions {
+                tpl.add_partition_offset(&key.topic, key.partition, Offset::Offset(timestamp))?;
+            }
+            let resolved = consumer.offsets_for_times(tpl, timeout)?;
+            for key in partitions {
+                let element = resolved
+                    .find_partition(&key.topic, key.partition)
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "no offset returned for {} at timestamp {timestamp}",
+                            key.label()
+                        ))
+                    })?;
+                let offset = match element.offset() {
+                    Offset::Offset(value) => value,
+                    Offset::Invalid => {
+                        return Err(Error::Config(format!(
+                            "no offset found for {} at timestamp {timestamp}",
+                            key.label()
+                        )));
+                    }
+                    other => {
+                        return Err(Error::Config(format!(
+                            "unexpected offset {other:?} for {}",
+                            key.label()
+                        )));
+                    }
+                };
+                offsets.insert(key.clone(), offset);
+            }
+        }
+        other => {
+            return Err(Error::Usage(format!(
+                "invalid --time value {other}; expected timestamp, -1 (latest), or -2 (earliest)"
+            )));
+        }
+    }
+    Ok(offsets)
+}
+
+async fn replica_verification_round(
+    client: &krafka::admin::AdminClient,
+    brokers: &HashMap<i32, String>,
+    broker_partitions: &HashMap<i32, Vec<TopicPartitionKey>>,
+    buffer: &mut ReplicaBuffer,
+    fetch_size: i32,
+    max_wait_ms: i32,
+) -> Result<()> {
+    let mut fetch_tasks = Vec::with_capacity(broker_partitions.len());
+    for (&broker_id, partitions) in broker_partitions {
+        let address = brokers.get(&broker_id).cloned().ok_or_else(|| {
+            Error::Config(format!(
+                "broker {broker_id} is listed as a replica but missing from metadata"
+            ))
+        })?;
+        let partitions = partitions.clone();
+        let offsets = partitions
+            .iter()
+            .map(|key| (key.clone(), buffer.offset(key)))
+            .collect::<HashMap<_, _>>();
+        fetch_tasks.push(async move {
+            let fetched = fetch_replica_partitions(
+                client,
+                broker_id,
+                &address,
+                &partitions,
+                &offsets,
+                fetch_size,
+                max_wait_ms,
+            )
+            .await?;
+            Ok::<_, Error>((broker_id, fetched))
+        });
+    }
+
+    let results = futures::future::try_join_all(fetch_tasks).await?;
+    for (broker_id, fetched) in results {
+        for (key, data) in fetched {
+            buffer.add_fetched_data(key, broker_id, data);
+        }
+    }
+    let mut printer = |line: String| println!("{line}");
+    buffer.verify_checksum(&mut printer)?;
+    Ok(())
+}
+
+async fn fetch_replica_partitions(
+    client: &krafka::admin::AdminClient,
+    broker_id: i32,
+    address: &str,
+    partitions: &[TopicPartitionKey],
+    offsets: &HashMap<TopicPartitionKey, i64>,
+    fetch_size: i32,
+    max_wait_ms: i32,
+) -> Result<HashMap<TopicPartitionKey, ReplicaPartitionData>> {
+    let connection = client
+        .pool()
+        .get_connection_by_id(broker_id, address)
+        .await?;
+    let version = connection
+        .negotiate_api_version(ApiKey::Fetch, 12, 4)
+        .await
+        .ok_or_else(|| Error::Unsupported("broker does not support Fetch".into()))?;
+
+    let mut topics: BTreeMap<String, Vec<krafka::protocol::FetchPartitionRequest>> =
+        BTreeMap::new();
+    for key in partitions {
+        let mut partition = krafka::protocol::FetchPartitionRequest::default();
+        partition.partition = key.partition;
+        partition.current_leader_epoch = -1;
+        partition.fetch_offset = offsets.get(key).copied().unwrap_or(0);
+        partition.last_fetched_epoch = -1;
+        partition.log_start_offset = 0;
+        partition.partition_max_bytes = fetch_size;
+        topics.entry(key.topic.clone()).or_default().push(partition);
+    }
+    let mut request = krafka::protocol::FetchRequest::default();
+    request.replica_id = DEBUGGING_CONSUMER_ID;
+    request.max_wait_ms = max_wait_ms;
+    request.min_bytes = 1;
+    request.max_bytes = i32::MAX;
+    request.isolation_level = 0;
+    request.session_id = 0;
+    request.session_epoch = -1;
+    request.topics = topics
+        .into_iter()
+        .map(|(topic, partitions)| {
+            let mut topic_request = krafka::protocol::FetchTopicRequest::default();
+            topic_request.topic = topic;
+            topic_request.partitions = partitions;
+            topic_request
+        })
+        .collect();
+    request.forgotten_topics = Vec::new();
+    request.rack_id = String::new();
+
+    let Ok(mut response_bytes) = connection
+        .send_request(ApiKey::Fetch, version, |buffer| {
+            request.encode_versioned(version, buffer)
+        })
+        .await
+    else {
+        // Match the original tool: when a broker is temporarily unreachable, contribute empty
+        // partition responses so verification of other brokers can continue.
+        return Ok(partitions
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    ReplicaPartitionData {
+                        high_watermark: -1,
+                        records: Bytes::new(),
+                    },
+                )
+            })
+            .collect());
+    };
+    drop(connection);
+
+    let response = krafka::protocol::FetchResponse::decode_versioned(version, &mut response_bytes)?;
+    let mut fetched = HashMap::new();
+    for topic in response.responses {
+        for partition in topic.partitions {
+            let key = TopicPartitionKey::new(topic.topic.clone(), partition.partition);
+            fetched.insert(
+                key,
+                ReplicaPartitionData {
+                    high_watermark: partition.high_watermark,
+                    records: partition.records.unwrap_or_default(),
+                },
+            );
+        }
+    }
+    for key in partitions {
+        fetched
+            .entry(key.clone())
+            .or_insert_with(|| ReplicaPartitionData {
+                high_watermark: -1,
+                records: Bytes::new(),
+            });
+    }
+    Ok(fetched)
 }
 
 #[derive(Debug)]
@@ -15601,6 +16414,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bootstrap_should_prefer_controller_when_server_absent() {
+        assert_eq!(
+            resolve_bootstrap_for_test(None, Some("127.0.0.1:9093")).as_deref(),
+            Ok("127.0.0.1:9093")
+        );
+        assert_eq!(
+            resolve_bootstrap_for_test(Some("broker:9092"), None).as_deref(),
+            Ok("broker:9092")
+        );
+        assert!(resolve_bootstrap_for_test(Some("a"), Some("b")).is_err());
+        assert!(resolve_bootstrap_for_test(None, None).is_err());
+    }
+
+    #[test]
+    fn command_bootstrap_controller_should_read_supported_families() {
+        let features = Cli::try_parse_from([
+            "kafka",
+            "features",
+            "--bootstrap-controller",
+            "c:9093",
+            "describe",
+        ])
+        .expect("parse features");
+        assert_eq!(
+            command_bootstrap_controller(&features.command),
+            Some("c:9093")
+        );
+
+        let topics = Cli::try_parse_from([
+            "kafka",
+            "--bootstrap-server",
+            "localhost:9092",
+            "topics",
+            "list",
+        ])
+        .expect("parse topics");
+        assert_eq!(command_bootstrap_controller(&topics.command), None);
+    }
+
+    #[test]
     fn generated_client_metrics_name_should_match_kafka_uuid_format() {
         let name = kafka_random_uuid();
 
@@ -18231,6 +19084,93 @@ mod tests {
         })
         .expect("serialize event");
         assert!(success.get("error").is_none());
+    }
+
+    fn encode_test_batch(base_offset: i64, records: &[(&str, &str)]) -> Bytes {
+        let mut batch = krafka::protocol::RecordBatch::new();
+        batch.base_offset = base_offset;
+        for (index, (key, value)) in records.iter().enumerate() {
+            let offset_delta = i32::try_from(index).expect("record index fits i32");
+            batch.add_record(
+                krafka::protocol::Record::new(
+                    Some(Bytes::copy_from_slice(key.as_bytes())),
+                    Some(Bytes::copy_from_slice(value.as_bytes())),
+                )
+                .with_offset_delta(offset_delta),
+            );
+        }
+        batch.last_offset_delta = i32::try_from(records.len().saturating_sub(1)).unwrap_or(0);
+        batch.encode().expect("encode record batch")
+    }
+
+    #[test]
+    fn parse_record_batches_should_read_last_offset_and_checksum() {
+        let encoded = encode_test_batch(
+            4,
+            &[
+                ("key 0", "value 0"),
+                ("key 1", "value 1"),
+                ("key 2", "value 2"),
+                ("key 3", "value 3"),
+                ("key 4", "value 4"),
+                ("key 5", "value 5"),
+            ],
+        );
+        let batches = parse_record_batches(&encoded).expect("parse batches");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].last_offset, 9);
+        assert_eq!(batches[0].next_offset, 10);
+        assert_ne!(batches[0].checksum, 0);
+    }
+
+    #[test]
+    fn replica_buffer_verify_checksum_should_report_max_lag() {
+        let expected = HashMap::from([
+            (TopicPartitionKey::new("a", 0), 3),
+            (TopicPartitionKey::new("a", 1), 3),
+            (TopicPartitionKey::new("b", 0), 2),
+        ]);
+        let mut buffer = ReplicaBuffer::new(expected.clone(), HashMap::new(), 0);
+        for (key, replica_count) in expected {
+            let records = encode_test_batch(
+                4,
+                &[
+                    ("key 0", "value 0"),
+                    ("key 1", "value 1"),
+                    ("key 2", "value 2"),
+                    ("key 3", "value 3"),
+                    ("key 4", "value 4"),
+                    ("key 5", "value 5"),
+                ],
+            );
+            for replica_id in 0..i32::try_from(replica_count).expect("replica count fits i32") {
+                buffer.add_fetched_data(
+                    key.clone(),
+                    replica_id,
+                    ReplicaPartitionData {
+                        high_watermark: 20,
+                        records: records.clone(),
+                    },
+                );
+            }
+        }
+
+        let mut lines = Vec::new();
+        buffer
+            .verify_checksum(&mut |line| lines.push(line))
+            .expect("verify checksum");
+        let output = lines.join("\n");
+        assert!(
+            output.contains(": max lag is 10 for partition a-1 at offset 10 among 3 partitions")
+                || output
+                    .contains(": max lag is 10 for partition a-0 at offset 10 among 3 partitions")
+                || output
+                    .contains(": max lag is 10 for partition b-0 at offset 10 among 3 partitions"),
+            "unexpected verification output: {output}"
+        );
+        assert!(output.contains("among 3 partitions"));
+        assert!(output.contains("max lag is 10"));
+        assert!(output.contains("at offset 10"));
     }
 
     #[test]

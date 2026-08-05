@@ -3,9 +3,11 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod dump_log;
 pub mod error;
 mod ffi;
 pub mod output;
+pub mod storage_tool;
 
 use cli::Cli;
 use error::Result;
