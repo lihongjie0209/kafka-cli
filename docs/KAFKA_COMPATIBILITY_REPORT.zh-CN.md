@@ -1,6 +1,6 @@
 # kafka-cli 与 Apache Kafka 原版工具功能对比报告
 
-报告日期：2026-08-05
+报告日期：2026-08-06
 
 **维护约定**：每次新增或实质变更命令入口后，必须同步更新本报告（入口表、仪表盘计数、详细对比节、逐入口验收表、变更记录与测试现状），不得只改代码/README。
 
@@ -33,7 +33,7 @@
 
 1. Apache Kafka 基准提交的 `bin/*.sh`，以及脚本实际转发到的 Java `*CommandOptions`/`OptionSpec` 定义。
 2. 本项目 `src/cli.rs` 的 clap 命令树、`src/commands.rs` 的执行路径、`src/ffi.rs` 的 librdkafka 调用。
-3. `tests/cli.rs`、Kafka 3.6.2/4.3.1 集成测试与 GitHub Actions 结果。
+3. `tests/cli.rs`、Kafka 3.6.2/4.3.1 集成测试（含 `kafka_full_integration` 完整 testcontainers 矩阵）与 GitHub Actions 结果。
 
 “入口覆盖”只统计可识别的脚本名称；“动作覆盖”统计 list/create/alter 等一级动作；“选项覆盖”必须同时具备解析和有效执行语义。仅能解析、没有后端效果的参数不算支持。本报告不以输出逐字符一致为目标，表格/JSON 属于本项目自己的输出契约。
 
@@ -45,7 +45,7 @@
 | 入口功能评级 | 22 已支持 / 11 部分支持 / 11 未支持（范围外） | “已支持”表示核心动作与主要语义可用，不表示输出逐字符一致 |
 | 已覆盖入口的一级动作 | 80+ | 33 个入口均有真实执行路径；storage 含 5 个子命令；不代表参数/输出逐字符兼容 |
 | librdkafka 2.12 Admin operation | 21 / 21 个应调用操作 | 22 个实际枚举中，旧 `AlterConfigs` 被 `IncrementalAlterConfigs` 替代 |
-| 普通自动化测试 | 312 个通过 | 275 library + 30 CLI + 7 offline_tools；Kafka 3/4 集成与 kafka_4_depth（7 个）默认 ignored，由 CI 运行 |
+| 普通自动化测试 | 400 个通过 | 337 library + 48 CLI + 13 offline_tools + 2 full_integration（offline/inventory）；Kafka 3/4 集成、`kafka_4_depth`（13）、`kafka_full_integration` live（6）默认 ignored，由 CI/本地 Docker 运行；含集成后 `cargo llvm-cov --include-ignored` 行覆盖约 80% |
 | 已验证 broker | Kafka 3.6.2、Kafka 4.3.1 | 当前基准在两者全绿；均为单 broker 代表性路径，不等于完整兼容矩阵 |
 | 静态发布目标 | glibc、x86_64 musl、aarch64 musl | musl 只在 CI 构建；ARM64 交叉编译后经 QEMU 启动验证 |
 
@@ -448,9 +448,13 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets --locked -- -D warnings`：通过。
-- Rust 单元测试与普通 CLI 测试：312 个通过（275 library + 30 CLI + 7 offline_tools）。
+- Rust 单元测试与普通 CLI 测试：**400** 个通过（337 library + 48 CLI + 13 offline_tools + 2 full_integration offline/inventory）。
 - `tests/offline_tools.rs`：真实 binary 覆盖 storage format/info/random-uuid、dump-log 段文件/控制记录/txnindex/snapshot/残差诊断（不依赖 Docker）。
-- Kafka 4.3.1 Docker：既有单体 `all_command_families` 矩阵（**33 个入口中 31 个在线命令**；`dump-log`/`storage` 仅 offline），外加 `tests/kafka_4_depth_integration.rs` 的 **11** 个聚焦套件（bootstrap-controller、features/offsets/cluster、groups CSV、ACL+configs、transactions/delete-records、quorum/election、produce/consume/perf/e2e、reassign+replica-verification、share-groups/share-consume/share-perf、streams+all-groups、client-metrics+verifiable）。本地已全绿（`--features bundled -- --ignored --test-threads=1`）。
+- **`tests/kafka_full_integration.rs`（完整 testcontainers 矩阵）**：按域覆盖全部 **33** 个兼容入口——6 个 ignored live 套件（data-plane、groups/streams、share、configs/ACL/metrics/SCRAM、admin/cluster/features/quorum/txn/reassign/replica/delegation、perf/verifiable）+ offline dump-log/storage + 入口清单守卫。本地已全绿：
+  ```text
+  cargo test --locked --features bundled --test kafka_full_integration -- --ignored --nocapture --test-threads=1
+  ```
+- Kafka 4.3.1 Docker（既有）：单体 `all_command_families` 矩阵 + `tests/kafka_4_depth_integration.rs` 的 **13** 个聚焦套件（ACL 幂等、client quota、delete-records、broker-logger 等）。本地 `--features bundled` 全绿。
 - Kafka 3.6.2 真实进程集成测试：覆盖协议和 Admin 兼容边界（需 `KAFKA_36_HOME` 指向 3.6.2 发行包；本机下载至 `.kafka/kafka_2.13-3.6.2`）。
 - **本地跑集成（与 CI 一致）**：必须 `--features bundled`（SCRAM 需要 OpenSSL）；Kafka 4 Docker 镜像 `apache/kafka:4.3.1`；fixture 已设 transaction RF=1、share coordinator RF=1；单体矩阵另关 auto-create topics 以覆盖 e2e 显式建 topic 文案。
 - GitHub Actions workflow 经 `actionlint` 校验通过。
@@ -458,7 +462,7 @@ JSON 输出是本项目扩展，不属于原版 Bash 输出兼容。所有管理
 测试仍有不足：
 
 - 集成测试是单 broker，不能充分验证多 broker reassignment、rack awareness、ISR 变化、failover，以及 Replica Verification 的跨 replica 不一致场景。
-- 未覆盖 TLS、mTLS、SASL/PLAIN、SCRAM、OAuth/OIDC 和 Kerberos 组合。
+- 未覆盖 TLS、mTLS、SASL/PLAIN 握手、OAuth/OIDC 和 Kerberos 组合（SCRAM credential 管理路径在 full suite 中有条件覆盖）。
 - 未覆盖真实 ARM64 机器运行；ARM64 当前只由 CI 交叉编译。
 - 没有逐个原版选项的 golden test，也没有与 Java CLI 输出做逐命令差分测试。
 - ACL 快捷角色和复杂 deny/host/prefix 组合仍需更完整矩阵。
@@ -683,6 +687,9 @@ musl 构建只在 CI 内进行，使用 Rust 1.88、固定 Zig 0.15.2 和 `cargo
 | 2026-08-05 | 集成 fixture 加固 | 单节点 transaction/share coordinator RF=1；depth Share 预热 classic group + ShareConsumer 重试 | 修复本地 producer-perf 事务超时与 share FindCoordinator 竞态 |
 | 2026-08-05 | e2e-latency 收尾 commit | 最终 Sync commit 对 NotCoordinator/CoordinatorNotAvailable 降级忽略（测量已完成） | 修复 Kafka 3.6.2 单节点集成 e2e 误失败 |
 | 2026-08-05 | 本地全量集成 | offline 7 + Kafka 4 单体 + depth 11 + Kafka 3.6.2 单体，均 `--features bundled` | 本机全绿；Kafka 3 使用 `.kafka/kafka_2.13-3.6.2` |
+| 2026-08-05 | 完整 testcontainers 套件 | 新增 `tests/kafka_full_integration.rs`：33 入口清单守卫 + offline dump-log/storage + 6 个 live 域矩阵（data-plane / groups / share / configs+ACL / admin / perf） | 普通 393；live 6 全绿（`--features bundled -- --ignored --test-threads=1`，约 2 分钟） |
+| 2026-08-06 | 审计修复与回归测试 | storage residual 改为 `serde_json` 安全序列化；ISO-8601 `P`/`PT` 空时长拒绝并在 reset 规划前校验；topic-id 要求可解码 UUID；partition 负边界拒绝；CLI/offline/full live 回归 | 普通 400；`kafka_full_integration` live 6 全绿 |
+| 2026-08-06 | 发布 v0.1.1 | 版本号 0.1.0 → 0.1.1；纳入完整 testcontainers 矩阵、审计修复与扩展测试 | 本地 fmt/clippy/400 普通测试 + full/mono live 全绿后打 tag |
 
 ## 12. librdkafka 2.12 能力闭环审计
 

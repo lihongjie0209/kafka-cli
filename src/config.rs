@@ -165,4 +165,60 @@ mod tests {
         ]);
         assert!(protocol_auth(&values).is_ok());
     }
+
+    #[test]
+    fn normalize_key_should_map_keystore_and_pass_through_unknown() {
+        assert_eq!(
+            normalize_key("ssl.keystore.location"),
+            "ssl.certificate.location"
+        );
+        assert_eq!(normalize_key("ssl.key.password"), "ssl.key.password");
+        assert_eq!(normalize_key("bootstrap.servers"), "bootstrap.servers");
+    }
+
+    #[test]
+    fn protocol_auth_should_reject_missing_scram_credentials() {
+        let values = HashMap::from([
+            ("security.protocol".into(), "SASL_PLAINTEXT".into()),
+            ("sasl.mechanism".into(), "SCRAM-SHA-256".into()),
+            ("sasl.username".into(), "alice".into()),
+            // missing password
+        ]);
+        let err = protocol_auth(&values).expect_err("password required");
+        assert!(
+            err.to_string().contains("password")
+                || err.to_string().contains("sasl")
+                || err.to_string().contains("credential"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn load_properties_should_ignore_comments_and_blank_lines() {
+        let mut file = tempfile::NamedTempFile::new().expect("temporary file");
+        writeln!(file, "# header").expect("write");
+        writeln!(file).expect("blank");
+        writeln!(file, "! bang comment").expect("write");
+        writeln!(file, "client.id=demo").expect("write");
+        let values = load_properties(file.path()).expect("load");
+        assert_eq!(values.get("client.id").map(String::as_str), Some("demo"));
+        assert!(!values.contains_key("# header"));
+    }
+
+    #[test]
+    fn client_config_should_accept_bootstrap_and_optional_properties_file() {
+        let plain = client_config("127.0.0.1:9092", None).expect("plain config");
+        // Creating a client fails without a live broker, but config construction must succeed.
+        drop(plain);
+        let mut file = tempfile::NamedTempFile::new().expect("cfg");
+        writeln!(file, "client.id=from-file").expect("write");
+        writeln!(file, "request.timeout.ms=5000").expect("write");
+        let with_file = client_config("broker:9092", Some(file.path())).expect("with file");
+        drop(with_file);
+        let missing = client_config(
+            "broker:9092",
+            Some(std::path::Path::new("/no/such/file.props")),
+        );
+        assert!(missing.is_err(), "missing properties file must error");
+    }
 }

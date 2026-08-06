@@ -1113,7 +1113,7 @@ pub enum StorageAction {
 }
 
 /// Options for Kafka's replica verification tool.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct ReplicaVerificationArgs {
     /// Original required bootstrap list; also accepted as global `--bootstrap-server`.
     #[arg(long = "broker-list")]

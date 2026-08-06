@@ -1175,4 +1175,229 @@ mod tests {
         std::fs::write(&path, sample_log_bytes()).expect("write fixture log");
         assert!(path.is_file());
     }
+
+    fn default_opts(files: Vec<PathBuf>) -> DumpLogOptions {
+        DumpLogOptions {
+            files,
+            print_data_log: false,
+            verify_index_only: false,
+            index_sanity_check: false,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_bytes: i32::MAX,
+            deep_iteration: false,
+            skip_record_metadata: false,
+            key_decoder: None,
+            value_decoder: None,
+            offsets_decoder: false,
+            transaction_log_decoder: false,
+            cluster_metadata_decoder: false,
+            remote_log_metadata_decoder: false,
+            share_group_state_decoder: false,
+        }
+    }
+
+    #[test]
+    fn validate_options_should_reject_empty_files_and_non_positive_limits() {
+        let err = validate_options(&default_opts(vec![])).expect_err("empty files");
+        assert!(err.to_string().contains("files"), "{err}");
+
+        let mut opts = default_opts(vec![PathBuf::from("x.log")]);
+        opts.max_message_size = 0;
+        let err = validate_options(&opts).expect_err("max-message-size");
+        assert!(err.to_string().contains("max-message-size"), "{err}");
+
+        opts.max_message_size = 1024;
+        opts.max_bytes = -1;
+        let err = validate_options(&opts).expect_err("max-bytes");
+        assert!(err.to_string().contains("max-bytes"), "{err}");
+    }
+
+    #[test]
+    fn validate_options_should_reject_coordinator_decoders_and_custom_classes() {
+        let mut opts = default_opts(vec![PathBuf::from("x.log")]);
+        opts.offsets_decoder = true;
+        let err = validate_options(&opts).expect_err("offsets decoder");
+        assert!(err.to_string().contains("offsets-decoder"), "{err}");
+
+        opts.offsets_decoder = false;
+        opts.cluster_metadata_decoder = true;
+        let err = validate_options(&opts).expect_err("cluster decoder");
+        assert!(
+            err.to_string().contains("cluster-metadata-decoder"),
+            "{err}"
+        );
+
+        opts.cluster_metadata_decoder = false;
+        opts.key_decoder = Some("com.example.CustomKey".into());
+        let err = validate_options(&opts).expect_err("custom key");
+        assert!(err.to_string().contains("CustomKey"), "{err}");
+
+        opts.key_decoder = Some("kafka.serializer.StringDecoder".into());
+        validate_options(&opts).expect("string decoder ok");
+    }
+
+    #[test]
+    fn dump_log_options_should_enable_print_and_deep_from_decoder_flags() {
+        let mut opts = default_opts(vec![PathBuf::from("x.log")]);
+        assert!(!opts.should_print_data_log());
+        assert!(!opts.is_deep_iteration());
+        opts.print_data_log = true;
+        assert!(opts.should_print_data_log());
+        assert!(opts.is_deep_iteration());
+        opts.print_data_log = false;
+        opts.deep_iteration = true;
+        assert!(opts.is_deep_iteration());
+        opts.deep_iteration = false;
+        opts.value_decoder = Some("string".into());
+        assert!(opts.should_print_data_log());
+        assert!(opts.is_deep_iteration());
+    }
+
+    #[test]
+    fn format_control_record_should_handle_missing_key_and_unknown_type() {
+        assert!(format_control_record(None, None).contains("missing-key"));
+        let short = Bytes::from_static(&[0, 1]);
+        assert!(format_control_record(Some(&short), None).contains("invalid-key-len"));
+        let mut key = Vec::new();
+        key.extend_from_slice(&0_i16.to_be_bytes());
+        key.extend_from_slice(&99_i16.to_be_bytes());
+        let text = format_control_record(Some(&Bytes::from(key)), None);
+        assert!(text.contains("UNKNOWN") || text.contains("99"), "{text}");
+    }
+
+    #[test]
+    fn format_named_control_should_decode_snapshot_header_and_kraft_version() {
+        // SNAPSHOT_HEADER: version + lastContainedLogTimestamp
+        let mut value = Vec::new();
+        value.extend_from_slice(&0_i16.to_be_bytes());
+        value.extend_from_slice(&1_700_000_000_000_i64.to_be_bytes());
+        let mut key = Vec::new();
+        key.extend_from_slice(&0_i16.to_be_bytes());
+        key.extend_from_slice(&3_i16.to_be_bytes());
+        let text = format_control_record(Some(&Bytes::from(key)), Some(&Bytes::from(value)));
+        assert!(text.contains("SnapshotHeader"), "{text}");
+        assert!(text.contains("lastContainedLogTimestamp"), "{text}");
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&0_i16.to_be_bytes());
+        value.extend_from_slice(&1_i16.to_be_bytes());
+        let mut key = Vec::new();
+        key.extend_from_slice(&0_i16.to_be_bytes());
+        key.extend_from_slice(&5_i16.to_be_bytes());
+        let text = format_control_record(Some(&Bytes::from(key)), Some(&Bytes::from(value)));
+        assert!(text.contains("KRaftVersion"), "{text}");
+        assert!(text.contains("kRaftVersion: 1"), "{text}");
+    }
+
+    #[test]
+    fn dump_offset_index_should_print_entries_and_empty_file() {
+        let dir = TempDir::new().expect("temp");
+        let empty = dir.path().join("00000000000000000000.index");
+        std::fs::write(&empty, []).expect("empty");
+        let mut out = Vec::new();
+        let mut mismatches = BTreeMap::new();
+        dump_offset_index(
+            &empty,
+            false,
+            false,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            &mut mismatches,
+            &mut out,
+        )
+        .expect("empty dump");
+        assert!(
+            String::from_utf8_lossy(&out).contains("is empty"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let path = dir.path().join("00000000000000000010.index");
+        let mut bytes = Vec::new();
+        // relative offset 0, position 0
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        // relative offset 2, position 100
+        bytes.extend_from_slice(&2_i32.to_be_bytes());
+        bytes.extend_from_slice(&100_i32.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("write index");
+        let mut out = Vec::new();
+        dump_offset_index(
+            &path,
+            false,
+            false,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            &mut mismatches,
+            &mut out,
+        )
+        .expect("index dump");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("offset: 10"), "{text}");
+        assert!(text.contains("offset: 12"), "{text}");
+        assert!(text.contains("position: 100"), "{text}");
+    }
+
+    #[test]
+    fn dump_offset_index_should_fail_sanity_on_decreasing_offsets() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("00000000000000000000.index");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&3_i32.to_be_bytes()); // decreasing relative
+        bytes.extend_from_slice(&8_i32.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("write");
+        let mut out = Vec::new();
+        let mut mismatches = BTreeMap::new();
+        let err = dump_offset_index(
+            &path,
+            true,
+            false,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            &mut mismatches,
+            &mut out,
+        )
+        .expect_err("sanity");
+        assert!(err.to_string().contains("sanity"), "{err}");
+    }
+
+    #[test]
+    fn dump_time_index_should_print_timestamp_and_offset() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("00000000000000000020.timeindex");
+        let mut bytes = Vec::new();
+        // timestamp, relative offset
+        bytes.extend_from_slice(&1_700_000_000_000_i64.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&1_700_000_000_100_i64.to_be_bytes());
+        bytes.extend_from_slice(&5_i32.to_be_bytes());
+        std::fs::write(&path, &bytes).expect("write");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        dump_time_index(&path, false, false, &mut out, &mut err).expect("timeindex");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("timestamp: 1700000000000"), "{text}");
+        assert!(
+            text.contains("offset: 20") || text.contains("offset: 25"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn dump_log_segments_entry_should_reject_missing_files_arg() {
+        let err = dump_log_segments(&default_opts(vec![])).expect_err("usage");
+        assert!(matches!(err, Error::Usage(_)), "{err}");
+    }
+
+    #[test]
+    fn base_offset_and_residual_name_helpers() {
+        let path = PathBuf::from("/tmp/00000000000000000123.index");
+        assert_eq!(base_offset_from_name(&path).expect("base"), 123);
+        assert!(is_native_bootstrap_residual(
+            "kafka-cli-bootstrap.residual.json"
+        ));
+        assert!(!is_native_bootstrap_residual("bootstrap.checkpoint"));
+        assert!(is_kraft_snapshot_name(
+            "00000000000000000000-0000000001.snapshot"
+        ));
+    }
 }

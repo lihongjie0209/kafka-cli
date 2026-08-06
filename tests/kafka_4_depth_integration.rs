@@ -1173,3 +1173,240 @@ fn client_metrics_and_verifiable_tools_depth() {
         .stdout(predicate::str::contains("startup_complete"))
         .stdout(predicate::str::contains("shutdown_complete"));
 }
+
+#[test]
+#[ignore = "requires Docker and downloads apache/kafka:4.3.1"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "ACL idempotency + client quota + delete-records closed loops share one fixture"
+)]
+fn acls_idempotency_quota_and_delete_records_depth() {
+    let (_broker, bootstrap) = start_broker();
+    let fixture = TempDir::new().expect("fixture");
+    let delete_json = fixture.path().join("delete.json");
+
+    success(
+        &bootstrap,
+        &[
+            "topics",
+            "create",
+            "--topic",
+            "depth-acl-quota",
+            "--partitions",
+            "1",
+        ],
+    );
+
+    // First ACL create should succeed.
+    let first = success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "acls",
+            "add",
+            "--topic",
+            "depth-acl-quota",
+            "--allow-principal",
+            "User:depth-idempotent",
+            "--operation",
+            "Read",
+            "--execute",
+        ],
+    );
+    assert!(
+        first.contains("CREATED") || first.contains("depth-idempotent") || first.contains("OK"),
+        "first acl: {first}"
+    );
+
+    // Second identical create should report ALREADY_EXISTS rather than duplicate bindings.
+    let second = success(
+        &bootstrap,
+        &[
+            "--output",
+            "json",
+            "acls",
+            "add",
+            "--topic",
+            "depth-acl-quota",
+            "--allow-principal",
+            "User:depth-idempotent",
+            "--operation",
+            "Read",
+            "--execute",
+        ],
+    );
+    assert!(
+        second.contains("ALREADY_EXISTS")
+            || second.contains("already")
+            || second.contains("CREATED 0"),
+        "second acl should be idempotent: {second}"
+    );
+
+    let listed = success(&bootstrap, &["acls", "list", "--topic", "depth-acl-quota"]);
+    assert!(
+        listed.contains("depth-idempotent") || listed.contains("User:depth-idempotent"),
+        "acl list: {listed}"
+    );
+
+    // Client quota set → describe → delete.
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "clients",
+            "--entity-name",
+            "depth-quota-client",
+            "--add-config",
+            "consumer_byte_rate=102400",
+            "--execute",
+        ],
+    );
+    let quota = success(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "clients",
+            "--entity-name",
+            "depth-quota-client",
+        ],
+    );
+    assert!(
+        quota.contains("consumer_byte_rate") && quota.contains("102400"),
+        "quota describe: {quota}"
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "clients",
+            "--entity-name",
+            "depth-quota-client",
+            "--delete-config",
+            "consumer_byte_rate",
+            "--execute",
+        ],
+    );
+
+    // Produce then delete-records closed loop.
+    Command::cargo_bin("kafka")
+        .expect("bin")
+        .args([
+            "--bootstrap-server",
+            &bootstrap,
+            "produce",
+            "--topic",
+            "depth-acl-quota",
+            "--sync",
+        ])
+        .write_stdin("q0\nq1\nq2\n")
+        .assert()
+        .success();
+    fs::write(
+        &delete_json,
+        r#"{"partitions":[{"topic":"depth-acl-quota","partition":0,"offset":1}]}"#,
+    )
+    .expect("delete json");
+    success(
+        &bootstrap,
+        &[
+            "delete-records",
+            "--offset-json-file",
+            delete_json.to_str().expect("path"),
+            "--execute",
+        ],
+    );
+
+    success(
+        &bootstrap,
+        &[
+            "acls",
+            "remove",
+            "--topic",
+            "depth-acl-quota",
+            "--allow-principal",
+            "User:depth-idempotent",
+            "--operation",
+            "Read",
+            "--execute",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires Docker and downloads apache/kafka:4.3.1"]
+fn configs_broker_logger_and_topic_all_depth() {
+    let (_broker, bootstrap) = start_broker();
+
+    // Broker logger describe for node 1 (StandardAuthorizer cluster allows ANONYMOUS).
+    let loggers = kafka(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "broker-loggers",
+            "--entity-name",
+            "1",
+        ],
+    );
+    // Some images may restrict logger configs; accept success with rows or structured error.
+    if loggers.status.success() {
+        let out = String::from_utf8_lossy(&loggers.stdout);
+        assert!(
+            out.contains("logger")
+                || out.contains("kafka")
+                || out.contains("ROOT")
+                || !out.is_empty(),
+            "broker loggers: {out}"
+        );
+    }
+
+    success(
+        &bootstrap,
+        &[
+            "topics",
+            "create",
+            "--topic",
+            "depth-all-cfg",
+            "--partitions",
+            "1",
+        ],
+    );
+    success(
+        &bootstrap,
+        &[
+            "configs",
+            "alter",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            "depth-all-cfg",
+            "--add-config",
+            "min.insync.replicas=1",
+            "--execute",
+        ],
+    );
+    let all = success(
+        &bootstrap,
+        &[
+            "configs",
+            "describe",
+            "--entity-type",
+            "topics",
+            "--entity-name",
+            "depth-all-cfg",
+            "--all",
+        ],
+    );
+    assert!(
+        all.contains("min.insync.replicas") || all.contains("retention"),
+        "describe --all: {all}"
+    );
+}

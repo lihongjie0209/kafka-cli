@@ -90,7 +90,7 @@ jobs:
           else
             runner=("$binary")
           fi
-          "${runner[@]}" --version | grep --fixed-strings "kafka 0.1.0"
+          "${runner[@]}" --version | grep --fixed-strings "kafka 0.1.1"
           "${runner[@]}" --help >/dev/null
       - uses: actions/upload-artifact@v7
         with:
@@ -108,6 +108,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libcurl4-openssl-dev pkg-config
       - run: cargo test --locked --features bundled --test kafka_4_integration -- --ignored --nocapture
+      - name: Full command-matrix integration (testcontainers)
+        run: cargo test --locked --features bundled --test kafka_full_integration -- --ignored --nocapture --test-threads=1
 
   kafka-3-integration:
     runs-on: ubuntu-latest

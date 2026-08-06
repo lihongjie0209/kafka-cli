@@ -104,6 +104,49 @@ fn storage_format_should_not_create_binary_bootstrap_checkpoint_name() {
     );
 }
 
+#[test]
+fn storage_format_residual_json_should_be_valid_with_special_cluster_id() {
+    let dir = TempDir::new().expect("dir");
+    let props = write_minimal_server_props(dir.path());
+    // Special characters must not produce invalid residual JSON in the shipped binary path.
+    let cluster_id = r#"cluster-"special"\id"#;
+    kafka_bin()
+        .args([
+            "storage",
+            "format",
+            "--cluster-id",
+            cluster_id,
+            "--config",
+            props.to_str().expect("path"),
+            "--feature",
+            r#"metadata.version=1"quoted""#,
+        ])
+        .assert()
+        .success();
+
+    let log_dir = dir.path().join("kafka-logs");
+    let residuals = find_named(&log_dir, "kafka-cli-bootstrap.residual.json");
+    assert_eq!(
+        residuals.len(),
+        1,
+        "expected one residual marker: {residuals:?}"
+    );
+    let body = fs::read_to_string(&residuals[0]).expect("read residual");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("residual from binary must be valid JSON");
+    assert_eq!(parsed["cluster.id"].as_str(), Some(cluster_id), "{body}");
+    assert_eq!(
+        parsed["format"].as_str(),
+        Some("partial-native-bootstrap-v1")
+    );
+    assert!(
+        parsed["features"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "features should be present: {parsed}"
+    );
+}
+
 fn find_named(root: &std::path::Path, name: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -235,6 +278,126 @@ fn dump_log_should_diagnose_text_bootstrap_checkpoint_via_binary() {
         "unexpected dump-log output: {stdout}"
     );
     assert!(!stdout.contains("Found invalid bytes at the end"));
+}
+
+#[test]
+fn dump_log_should_print_index_and_timeindex_via_binary() {
+    let dir = TempDir::new().expect("dir");
+    let index = dir.path().join("00000000000000000005.index");
+    let mut index_bytes = Vec::new();
+    index_bytes.extend_from_slice(&0_i32.to_be_bytes());
+    index_bytes.extend_from_slice(&0_i32.to_be_bytes());
+    index_bytes.extend_from_slice(&3_i32.to_be_bytes());
+    index_bytes.extend_from_slice(&42_i32.to_be_bytes());
+    fs::write(&index, &index_bytes).expect("index");
+
+    kafka_bin()
+        .args(["dump-log", "--files", index.to_str().expect("p")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("offset: 5"))
+        .stdout(predicate::str::contains("position: 42"));
+
+    let timeindex = dir.path().join("00000000000000000005.timeindex");
+    let mut ti = Vec::new();
+    ti.extend_from_slice(&1_700_000_000_000_i64.to_be_bytes());
+    ti.extend_from_slice(&0_i32.to_be_bytes());
+    fs::write(&timeindex, &ti).expect("timeindex");
+    kafka_bin()
+        .args(["dump-log", "--files", timeindex.to_str().expect("p")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("timestamp: 1700000000000"))
+        .stdout(predicate::str::contains("offset: 5"));
+}
+
+#[test]
+fn dump_log_should_reject_custom_decoder_and_missing_files_via_binary() {
+    kafka_bin()
+        .args(["dump-log", "--files", "/no/such/file.log"])
+        .assert()
+        .failure();
+
+    let dir = TempDir::new().expect("dir");
+    let log_path = dir.path().join("00000000000000000000.log");
+    fs::write(&log_path, sample_log_bytes()).expect("log");
+    kafka_bin()
+        .args([
+            "dump-log",
+            "--files",
+            log_path.to_str().expect("p"),
+            "--key-decoder-class",
+            "com.example.Custom",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Custom")
+                .or(predicate::str::contains("decoder"))
+                .or(predicate::str::contains("unsupported")),
+        );
+}
+
+#[test]
+fn storage_version_mapping_and_feature_dependencies_via_binary() {
+    kafka_bin()
+        .args(["storage", "version-mapping", "--release-version", "3.7-IV0"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("version-mapping").or(predicate::str::contains("3.7")));
+
+    kafka_bin()
+        .args([
+            "storage",
+            "feature-dependencies",
+            "--feature",
+            "metadata.version=20",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("feature-dependencies")
+                .or(predicate::str::contains("metadata.version")),
+        );
+}
+
+#[test]
+fn features_offline_version_mapping_via_binary() {
+    kafka_bin()
+        .args(["features", "version-mapping"])
+        .assert()
+        .success();
+    kafka_bin()
+        .args([
+            "features",
+            "feature-dependencies",
+            "--feature",
+            "metadata.version=20",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn dump_log_index_sanity_check_via_binary() {
+    let dir = TempDir::new().expect("dir");
+    let path = dir.path().join("00000000000000000000.index");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0_i32.to_be_bytes());
+    bytes.extend_from_slice(&0_i32.to_be_bytes());
+    bytes.extend_from_slice(&1_i32.to_be_bytes());
+    bytes.extend_from_slice(&8_i32.to_be_bytes());
+    fs::write(&path, &bytes).expect("write");
+    kafka_bin()
+        .args([
+            "dump-log",
+            "--files",
+            path.to_str().expect("p"),
+            "--index-sanity-check",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sanity check"));
 }
 
 fn sample_log_bytes() -> Vec<u8> {

@@ -317,51 +317,61 @@ fn write_controller_bootstrap_artifacts(
     let cluster_meta = metadata_dir.join(CLUSTER_METADATA_DIR);
     fs::create_dir_all(&cluster_meta)?;
 
-    let mut residual = File::create(metadata_dir.join(NATIVE_BOOTSTRAP_RESIDUAL))?;
-    writeln!(residual, "{{")?;
-    writeln!(residual, "  \"source\": \"kafka-cli storage format\",")?;
-    writeln!(residual, "  \"format\": \"partial-native-bootstrap-v1\",")?;
-    writeln!(
-        residual,
-        "  \"kafka.reserved.bootstrap.checkpoint\": \"not written (binary BatchFileReader format only)\","
-    )?;
-    writeln!(residual, "  \"cluster.id\": \"{cluster_id}\",")?;
-    writeln!(residual, "  \"node.id\": {node_id},")?;
-    writeln!(
-        residual,
-        "  \"standalone\": {},",
-        if standalone { "true" } else { "false" }
-    )?;
-    writeln!(
-        residual,
-        "  \"no.initial.controllers\": {},",
-        if no_initial_controllers {
-            "true"
-        } else {
-            "false"
-        }
-    )?;
+    // Emit real JSON so special characters in cluster-id / features cannot corrupt the marker.
+    let mut residual = serde_json::Map::new();
+    residual.insert(
+        "source".into(),
+        serde_json::Value::String("kafka-cli storage format".into()),
+    );
+    residual.insert(
+        "format".into(),
+        serde_json::Value::String("partial-native-bootstrap-v1".into()),
+    );
+    residual.insert(
+        "kafka.reserved.bootstrap.checkpoint".into(),
+        serde_json::Value::String("not written (binary BatchFileReader format only)".into()),
+    );
+    residual.insert(
+        "cluster.id".into(),
+        serde_json::Value::String(cluster_id.to_owned()),
+    );
+    residual.insert("node.id".into(), serde_json::json!(node_id));
+    residual.insert("standalone".into(), serde_json::json!(standalone));
+    residual.insert(
+        "no.initial.controllers".into(),
+        serde_json::json!(no_initial_controllers),
+    );
     if let Some(version) = release_version {
-        writeln!(residual, "  \"release.version\": \"{version}\",")?;
+        residual.insert(
+            "release.version".into(),
+            serde_json::Value::String(version.to_owned()),
+        );
     }
     if let Some(controllers) = initial_controllers {
-        writeln!(
-            residual,
-            "  \"initial.controllers\": \"{}\",",
-            controllers.replace('"', "\\\"")
-        )?;
+        residual.insert(
+            "initial.controllers".into(),
+            serde_json::Value::String(controllers.to_owned()),
+        );
     }
-    writeln!(residual, "  \"features\": [")?;
-    for (index, item) in feature.iter().enumerate() {
-        let comma = if index + 1 == feature.len() { "" } else { "," };
-        writeln!(residual, "    \"{item}\"{comma}")?;
-    }
-    writeln!(residual, "  ],")?;
-    writeln!(
-        residual,
-        "  \"residual\": \"full KRaft RecordsSnapshotWriter bootstrap snapshot is not written; Kafka will use default bootstrap metadata when {KAFKA_BOOTSTRAP_CHECKPOINT} is absent\""
-    )?;
-    writeln!(residual, "}}")?;
+    residual.insert(
+        "features".into(),
+        serde_json::Value::Array(
+            feature
+                .iter()
+                .map(|item| serde_json::Value::String(item.clone()))
+                .collect(),
+        ),
+    );
+    residual.insert(
+        "residual".into(),
+        serde_json::Value::String(format!(
+            "full KRaft RecordsSnapshotWriter bootstrap snapshot is not written; Kafka will use default bootstrap metadata when {KAFKA_BOOTSTRAP_CHECKPOINT} is absent"
+        )),
+    );
+
+    let mut file = File::create(metadata_dir.join(NATIVE_BOOTSTRAP_RESIDUAL))?;
+    serde_json::to_writer_pretty(&mut file, &serde_json::Value::Object(residual))?;
+    writeln!(file)?;
     Ok(())
 }
 
@@ -575,6 +585,18 @@ mod tests {
         assert!(body.contains("test-cluster"));
         assert!(body.contains("not written"));
         assert!(body.contains("RecordsSnapshotWriter"));
+        // Residual must be valid JSON (not hand-escaped text).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("residual must be valid JSON");
+        assert_eq!(
+            parsed["cluster.id"].as_str(),
+            Some("test-cluster"),
+            "{parsed}"
+        );
+        assert_eq!(
+            parsed["format"].as_str(),
+            Some("partial-native-bootstrap-v1")
+        );
         assert!(
             log_dir.join(CLUSTER_METADATA_DIR).is_dir(),
             "__cluster_metadata-0 directory must exist"
@@ -653,5 +675,245 @@ mod tests {
             error.to_string().contains("bootstrap.checkpoint"),
             "error: {error}"
         );
+    }
+
+    #[test]
+    fn looks_like_text_or_json_should_detect_common_markers() {
+        assert!(looks_like_text_or_json(b"  {\"a\":1}"));
+        assert!(looks_like_text_or_json(b"[1,2]"));
+        assert!(looks_like_text_or_json(b"# comment"));
+        assert!(looks_like_text_or_json(b"partial-native"));
+        assert!(!looks_like_text_or_json(&[0x00, 0x01, 0x02, 0xff]));
+    }
+
+    #[test]
+    fn process_roles_and_log_directories_should_parse_server_properties() {
+        let mut props = HashMap::new();
+        assert!(process_roles(&props).is_empty());
+        props.insert("process.roles".into(), " broker , controller , ".into());
+        assert_eq!(
+            process_roles(&props),
+            vec!["broker".to_owned(), "controller".to_owned()]
+        );
+
+        props.insert("log.dirs".into(), "/a,/b".into());
+        props.insert("metadata.log.dir".into(), "/meta".into());
+        let dirs = log_directories(&props);
+        assert!(dirs.contains(&"/a".to_owned()));
+        assert!(dirs.contains(&"/b".to_owned()));
+        assert!(dirs.contains(&"/meta".to_owned()));
+        assert_eq!(dirs.len(), 3);
+    }
+
+    #[test]
+    fn format_should_reject_legacy_non_kraft_config() {
+        let dir = TempDir::new().expect("temp");
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).expect("mkdir");
+        let config_path = dir.path().join("server.properties");
+        let mut config = File::create(&config_path).expect("config");
+        // No process.roles => legacy ZK mode
+        writeln!(config, "broker.id=1").unwrap();
+        writeln!(config, "log.dirs={}", log_dir.display()).unwrap();
+        drop(config);
+        let err = storage(StorageAction::Format {
+            config: config_path,
+            cluster_id: "legacy".into(),
+            ignore_formatted: false,
+            release_version: None,
+            feature: vec![],
+            standalone: false,
+            no_initial_controllers: false,
+            initial_controllers: None,
+            add_scram: vec![],
+        })
+        .expect_err("legacy");
+        assert!(
+            err.to_string().contains("KRaft") || err.to_string().contains("legacy"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn format_should_reject_add_scram_and_missing_controller_flags() {
+        let dir = TempDir::new().expect("temp");
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).expect("mkdir");
+        let config_path = dir.path().join("server.properties");
+        let mut config = File::create(&config_path).expect("config");
+        writeln!(config, "process.roles=controller").unwrap();
+        writeln!(config, "node.id=1").unwrap();
+        writeln!(config, "log.dirs={}", log_dir.display()).unwrap();
+        writeln!(config, "metadata.log.dir={}", log_dir.display()).unwrap();
+        // no controller.quorum.voters
+        drop(config);
+
+        let err = storage(StorageAction::Format {
+            config: config_path.clone(),
+            cluster_id: "c".into(),
+            ignore_formatted: false,
+            release_version: None,
+            feature: vec![],
+            standalone: false,
+            no_initial_controllers: false,
+            initial_controllers: None,
+            add_scram: vec!["SCRAM-SHA-256=[password=x]".into()],
+        })
+        .expect_err("scram");
+        assert!(
+            err.to_string().contains("SCRAM") || err.to_string().contains("add-scram"),
+            "{err}"
+        );
+
+        let err = storage(StorageAction::Format {
+            config: config_path,
+            cluster_id: "c".into(),
+            ignore_formatted: false,
+            release_version: None,
+            feature: vec![],
+            standalone: false,
+            no_initial_controllers: false,
+            initial_controllers: None,
+            add_scram: vec![],
+        })
+        .expect_err("voters required");
+        assert!(
+            err.to_string().contains("standalone")
+                || err.to_string().contains("initial-controllers")
+                || err.to_string().contains("voters"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn version_mapping_and_feature_dependencies_actions_should_succeed() {
+        storage(StorageAction::VersionMapping {
+            release_version: Some("3.7-IV0".into()),
+        })
+        .expect("version-mapping");
+        storage(StorageAction::FeatureDependencies {
+            feature: vec!["metadata.version=20".into()],
+        })
+        .expect("feature-dependencies");
+        let err = storage(StorageAction::FeatureDependencies { feature: vec![] })
+            .expect_err("feature required");
+        assert!(err.to_string().contains("feature"), "{err}");
+    }
+
+    #[test]
+    fn info_should_report_unformatted_directory() {
+        let dir = TempDir::new().expect("temp");
+        let log_dir = dir.path().join("empty-logs");
+        fs::create_dir_all(&log_dir).expect("mkdir");
+        let config_path = dir.path().join("server.properties");
+        let mut config = File::create(&config_path).expect("config");
+        writeln!(config, "process.roles=broker").unwrap();
+        writeln!(config, "node.id=1").unwrap();
+        writeln!(config, "log.dirs={}", log_dir.display()).unwrap();
+        drop(config);
+        let err = storage(StorageAction::Info {
+            config: config_path,
+        })
+        .expect_err("unformatted");
+        assert!(
+            err.to_string().contains("problem") || err.to_string().contains("formatted"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn format_ignore_formatted_should_skip_existing_meta() {
+        let dir = TempDir::new().expect("temp");
+        let log_dir = dir.path().join("data");
+        fs::create_dir_all(&log_dir).expect("mkdir");
+        let config_path = dir.path().join("server.properties");
+        let mut config = File::create(&config_path).expect("config");
+        writeln!(config, "process.roles=broker").unwrap();
+        writeln!(config, "node.id=9").unwrap();
+        writeln!(config, "log.dirs={}", log_dir.display()).unwrap();
+        drop(config);
+
+        storage(StorageAction::Format {
+            config: config_path.clone(),
+            cluster_id: "first".into(),
+            ignore_formatted: false,
+            release_version: None,
+            feature: vec![],
+            standalone: false,
+            no_initial_controllers: false,
+            initial_controllers: None,
+            add_scram: vec![],
+        })
+        .expect("first format");
+        storage(StorageAction::Format {
+            config: config_path,
+            cluster_id: "second".into(),
+            ignore_formatted: true,
+            release_version: None,
+            feature: vec![],
+            standalone: false,
+            no_initial_controllers: false,
+            initial_controllers: None,
+            add_scram: vec![],
+        })
+        .expect("ignore formatted");
+        let meta = read_meta_properties(&log_dir.join(META_PROPERTIES)).expect("meta");
+        assert_eq!(meta.cluster_id.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn residual_json_should_escape_special_characters_in_cluster_id_and_features() {
+        let dir = TempDir::new().expect("temp");
+        let log_dir = dir.path().join("kafka-logs");
+        fs::create_dir_all(&log_dir).expect("mkdir");
+        let config_path = dir.path().join("server.properties");
+        let mut config = File::create(&config_path).expect("config");
+        writeln!(config, "process.roles=broker,controller").unwrap();
+        writeln!(config, "node.id=1").unwrap();
+        writeln!(config, "log.dirs={}", log_dir.display()).unwrap();
+        writeln!(config, "metadata.log.dir={}", log_dir.display()).unwrap();
+        writeln!(config, "controller.quorum.voters=1@localhost:9093").unwrap();
+        drop(config);
+
+        let cluster_id = r#"id-with-"quotes"-and\backslash"#;
+        storage(StorageAction::Format {
+            config: config_path,
+            cluster_id: cluster_id.into(),
+            ignore_formatted: false,
+            release_version: Some(r#"3.7-"IV0""#.into()),
+            feature: vec![r#"feat:"a""#.into(), "plain".into()],
+            standalone: true,
+            no_initial_controllers: false,
+            initial_controllers: Some(r#"1@host:9093:"x""#.into()),
+            add_scram: vec![],
+        })
+        .expect("format with special chars");
+
+        let body = fs::read_to_string(log_dir.join(NATIVE_BOOTSTRAP_RESIDUAL)).expect("residual");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("special-char residual must parse as JSON");
+        assert_eq!(parsed["cluster.id"].as_str(), Some(cluster_id));
+        assert_eq!(parsed["release.version"].as_str(), Some(r#"3.7-"IV0""#));
+        assert_eq!(
+            parsed["features"].as_array().map(|items| items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()),
+            Some(vec![r#"feat:"a""#, "plain"])
+        );
+        assert_eq!(
+            parsed["initial.controllers"].as_str(),
+            Some(r#"1@host:9093:"x""#)
+        );
+        assert_eq!(parsed["standalone"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn read_meta_properties_should_require_cluster_and_node_for_v1() {
+        let dir = TempDir::new().expect("temp");
+        let path = dir.path().join("meta.properties");
+        fs::write(&path, "version=1\n").expect("write");
+        let err = read_meta_properties(&path).expect_err("missing fields");
+        assert!(err.to_string().contains("cluster.id"), "{err}");
     }
 }

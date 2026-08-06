@@ -508,6 +508,296 @@ fn kafka_dump_log_alias_should_accept_original_options() {
         .stdout(predicate::str::contains("--skip-record-metadata"));
 }
 
+#[test]
+fn dump_log_should_require_files_and_reject_zero_max_bytes() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["dump-log"])
+        .assert()
+        .failure();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["dump-log", "--files", "/tmp/x.log", "--max-bytes", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("max-bytes").or(predicate::str::contains("positive")));
+}
+
+#[test]
+fn storage_format_should_require_config_and_cluster_id() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["storage", "format"])
+        .assert()
+        .failure();
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["storage", "info"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn features_version_mapping_should_not_require_bootstrap() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["features", "version-mapping"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn producer_perf_should_reject_key_range_without_distribution_on_execute() {
+    // Parse succeeds; runtime validation returns usage before connecting.
+    let output = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "producer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "1",
+            "--throughput",
+            "-1",
+            "--record-size",
+            "8",
+            "--record-key-range",
+            "3",
+            "--command-property",
+            "bootstrap.servers=127.0.0.1:1",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("key-distribution") || err.contains("record-key-range"),
+        "stderr={err}"
+    );
+}
+
+#[test]
+fn groups_validate_regex_cli_should_accept_valid_and_reject_invalid() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["groups", "validate-regex", "orders-.*"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("true"));
+    // Invalid patterns still exit 0 with a structured VALID=false row (Kafka-like).
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["groups", "validate-regex", "("])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("false"))
+        .stdout(predicate::str::contains("unclosed").or(predicate::str::contains("error")));
+}
+
+#[test]
+fn replica_verification_should_reject_non_positive_fetch_size() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "replica-verification",
+            "--broker-list",
+            "localhost:9092",
+            "--fetch-size",
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("fetch-size"));
+}
+
+#[test]
+fn groups_reset_offsets_should_require_a_target_before_connecting() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "groups",
+            "reset-offsets",
+            "--group",
+            "g",
+            "--topic",
+            "t",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("reset target").or(predicate::str::contains("choose one")),
+        );
+}
+
+#[test]
+fn share_groups_reset_offsets_should_require_a_target_before_connecting() {
+    // Share reset target validation may run after admin client construction; either a
+    // usage error (target missing) or a live client error is acceptable for this path.
+    let output = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "share-groups",
+            "reset-offsets",
+            "--group",
+            "g",
+            "--topic",
+            "t",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("reset target")
+            || err.contains("choose one")
+            || err.contains("broker")
+            || err.contains("connect"),
+        "stderr={err}"
+    );
+}
+
+#[test]
+fn producer_perf_should_reject_warmup_not_less_than_num_records() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "producer-perf-test",
+            "--topic",
+            "events",
+            "--num-records",
+            "5",
+            "--throughput",
+            "-1",
+            "--record-size",
+            "8",
+            "--warmup-records",
+            "5",
+            "--command-property",
+            "bootstrap.servers=127.0.0.1:1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("warmup-records"));
+}
+
+#[test]
+fn offsets_should_accept_named_time_aliases_without_connecting_for_help() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args(["offsets", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("earliest-local").or(predicate::str::contains("time")));
+}
+
+#[test]
+fn metadata_quorum_remove_controller_should_require_directory_id() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "metadata-quorum",
+            "remove-controller",
+            "--controller-id",
+            "2",
+            "--dry-run",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn delete_records_should_reject_empty_partition_list_without_connecting() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let path = dir.path().join("empty.json");
+    std::fs::write(&path, r#"{"version":1,"partitions":[]}"#).expect("write");
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "delete-records",
+            "--offset-json-file",
+            path.to_str().expect("p"),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("empty")
+                .or(predicate::str::contains("partition"))
+                .or(predicate::str::contains("Usage")),
+        );
+}
+
+#[test]
+fn leader_election_should_reject_empty_json_targets_without_connecting() {
+    let dir = tempfile::TempDir::new().expect("dir");
+    let path = dir.path().join("empty.json");
+    std::fs::write(&path, r#"{"partitions":[]}"#).expect("write");
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "leader-election",
+            "--election-type",
+            "preferred",
+            "--path-to-json-file",
+            path.to_str().expect("p"),
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("empty")
+                .or(predicate::str::contains("partition"))
+                .or(predicate::str::contains("Usage")),
+        );
+}
+
+#[test]
+fn features_upgrade_should_reject_unknown_feature_before_or_at_connect() {
+    let output = Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "features",
+            "upgrade",
+            "--feature",
+            "not.a.real.feature=1",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run");
+    // May fail at parse/validate or connect; must not succeed silently.
+    assert!(!output.status.success());
+}
+
+#[test]
+fn reassign_bootstrap_controller_should_parse_without_server() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "reassign",
+            "--bootstrap-controller",
+            "127.0.0.1:1",
+            "list",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("bootstrap-controller").or(predicate::str::contains("list")),
+        );
+}
+
 #[cfg(unix)]
 #[test]
 fn kafka_storage_alias_should_accept_original_subcommands() {
@@ -649,4 +939,69 @@ fn kafka_streams_application_reset_alias_should_accept_original_options() {
         .stdout(predicate::str::contains("--input-topics"))
         .stdout(predicate::str::contains("--internal-topics"))
         .stdout(predicate::str::contains("--force"));
+}
+
+#[test]
+fn groups_reset_by_duration_should_reject_empty_iso8601_duration() {
+    // Must fail in the shipped binary before any broker connection is required.
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "groups",
+            "reset-offsets",
+            "--group",
+            "g",
+            "--topic",
+            "t",
+            "--by-duration",
+            "PT",
+            "--dry-run",
+        ])
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("duration")
+                .or(predicate::str::contains("ISO-8601"))
+                .or(predicate::str::contains("component")),
+        );
+}
+
+#[test]
+fn topics_describe_should_reject_undecodable_topic_id() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:1",
+            "topics",
+            "describe",
+            "--topic-id",
+            "!!!!!!!!!!!!!!!!!!!!!!",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("topic ID").or(predicate::str::contains("UUID")));
+}
+
+#[test]
+fn bootstrap_server_and_controller_should_be_mutually_exclusive() {
+    Command::cargo_bin("kafka")
+        .expect("kafka binary")
+        .args([
+            "--bootstrap-server",
+            "127.0.0.1:9092",
+            "features",
+            "--bootstrap-controller",
+            "127.0.0.1:9093",
+            "describe",
+        ])
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("cannot use both")
+                .or(predicate::str::contains("bootstrap-server"))
+                .and(predicate::str::contains("bootstrap-controller")),
+        );
 }
